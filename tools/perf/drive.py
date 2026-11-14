@@ -453,34 +453,40 @@ class App:
         self.x.move(*PARK)
         if s.opts.cold:
             drop_caches()
-        self.caps = None
+        self.caps, self.proc, self.out = None, None, None
         if area:
             self.caps = Captures(s.display, area)
             self.caps.start()
             while not self.caps.shots:
                 time.sleep(0.001)
-        env = {k: v for k, v in os.environ.items() if k not in ("WAYLAND_DISPLAY", "XAUTHORITY")}
-        env.update(
-            DISPLAY=s.display,
-            PATH=f"{s.folder / 'standin'}:{os.environ.get('PATH', '/usr/bin:/bin')}",
-            CUPS_SERVER=str(self.run / "no-such-cups.sock"),
-            DBUS_SESSION_BUS_ADDRESS=f"unix:path={self.run / 'no-such-bus'}",
-            XDG_CONFIG_HOME=str(self.run / "config"),
-            XDG_STATE_HOME=str(self.run / "state"),
-            XDG_DATA_HOME=str(self.run / "data"),
-            WINIT_X11_SCALE_FACTOR="1",
-            LIMAREPDF_TIMING=str(self.run / "timing.tsv"),
-        )
-        self.out = open(self.run / "app.log", "wb")
-        self.started = self.sent = us()
-        self.proc = subprocess.Popen([str(s.opts.bin), *map(str, self.args)], env=env, cwd=self.run,
-                                     stdin=subprocess.DEVNULL, stdout=self.out, stderr=subprocess.STDOUT)
-        self.wait(lambda: self.log.find("frame built"), "the first frame", 60)
-        found = self.wait(lambda: self.placed(), "a 1200 x 850 window", 10)
-        if found[1][:2] != (0, 0):
-            raise Failed(f"the window is at {found[1][:2]}, not 0,0")
-        self.window = found[0]
-        self.x.focus(self.window)
+        # A launch that fails stops its pictures first: left taking them, they'd end the driver
+        # with "X connection broken" when the session's Xvfb stops, hiding why it failed.
+        try:
+            env = {k: v for k, v in os.environ.items() if k not in ("WAYLAND_DISPLAY", "XAUTHORITY")}
+            env.update(
+                DISPLAY=s.display,
+                PATH=f"{s.folder / 'standin'}:{os.environ.get('PATH', '/usr/bin:/bin')}",
+                CUPS_SERVER=str(self.run / "no-such-cups.sock"),
+                DBUS_SESSION_BUS_ADDRESS=f"unix:path={self.run / 'no-such-bus'}",
+                XDG_CONFIG_HOME=str(self.run / "config"),
+                XDG_STATE_HOME=str(self.run / "state"),
+                XDG_DATA_HOME=str(self.run / "data"),
+                WINIT_X11_SCALE_FACTOR="1",
+                LIMAREPDF_TIMING=str(self.run / "timing.tsv"),
+            )
+            self.out = open(self.run / "app.log", "wb")
+            self.started = self.sent = us()
+            self.proc = subprocess.Popen([str(s.opts.bin), *map(str, self.args)], env=env, cwd=self.run,
+                                         stdin=subprocess.DEVNULL, stdout=self.out, stderr=subprocess.STDOUT)
+            self.wait(lambda: self.log.find("frame built"), "the first frame", 60)
+            found = self.wait(lambda: self.placed(), "a 1200 x 850 window", 10)
+            if found[1][:2] != (0, 0):
+                raise Failed(f"the window is at {found[1][:2]}, not 0,0")
+            self.window = found[0]
+            self.x.focus(self.window)
+        except BaseException:
+            self.close()
+            raise
 
     def placed(self):
         found = self.x.window()
@@ -640,7 +646,7 @@ class App:
     def close(self):
         if self.caps and not self.caps.done.is_set():
             self.caps.stop()
-        if self.proc.poll() is None:
+        if self.proc and self.proc.poll() is None:
             self.s.drivers.update(self.drivers())
             self.proc.terminate()
             try:
@@ -648,7 +654,8 @@ class App:
             except subprocess.TimeoutExpired:
                 self.proc.kill()
                 self.proc.wait()
-        self.out.close()
+        if self.out:
+            self.out.close()
         if self.log.file:
             self.log.file.close()
 
@@ -782,7 +789,7 @@ class Session:
 
     def doc(self, name, copy=False):
         """A document of the set by name, or any by its path."""
-        path = Path(name) if "/" in str(name) else self.opts.set / name
+        path = Path(name).resolve() if "/" in str(name) else self.opts.set / name
         if not path.is_file():
             raise Failed(f"no {path}: make the set with crates/limarepdf-core/tools/measure.py --refset")
         return Copy(path) if copy else path
@@ -1354,6 +1361,8 @@ def main(argv):
     p.add_argument("--cold", action="store_true")
     p.add_argument("--check", action="store_true")
     opts = p.parse_args(argv)
+    # The app starts in its launch's folder: paths given relative to this one wouldn't reach it.
+    opts.bin, opts.set, opts.out = opts.bin.resolve(), opts.set.resolve(), opts.out.resolve()
     run, count = MODES[opts.mode]
     if count is not None and len(opts.args) != count:
         p.error(f"{opts.mode} takes {count} argument{'s' if count != 1 else ''}")
