@@ -2653,7 +2653,13 @@ impl App {
     fn save_all_images(&mut self, ctx: &egui::Context) {
         let t = &self.tabs[self.active];
         let stem = t.stem("document");
-        let names = t.pdf.picture_names(&stem);
+        let names = match t.pdf.picture_names(&stem) {
+            Ok(names) => names,
+            Err(e) => {
+                self.dialog = Dialog::Message("Save all images".into(), format!("{e:#}"));
+                return;
+            }
+        };
         if names.is_empty() {
             self.dialog = Dialog::Message(
                 "Save all images".into(),
@@ -2682,8 +2688,10 @@ impl App {
 
     /// Write every picture of the document to `to` on a background thread.
     fn start_save_pictures(&mut self, ctx: &egui::Context, to: PicturesTo) {
+        // Found once already, before asking for the folder; were they refused now, the save
+        // below is refused the same way.
         let names = self.tabs[self.active].pdf.picture_names(&to.stem);
-        let files = names.iter().map(|n| to.dir.join(n)).collect();
+        let files = names.iter().flatten().map(|n| to.dir.join(n)).collect();
         self.spawn_job(ctx, "Save all images", files, move |p| {
             match p.save_all_pictures(&to.dir, &to.stem) {
                 Ok(done) => {

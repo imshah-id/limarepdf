@@ -1,6 +1,7 @@
 //! Reading a page has a budget (S1-06, H-07): a page whose drawings draw each other over and
 //! over is refused quickly with a typed reason, and what relies on reading it (editing,
-//! redacting, search) says so and changes nothing. A drawing that draws itself is read once.
+//! redacting, search, finding its pictures) says so and changes nothing. A drawing that draws
+//! itself is read once.
 
 mod common;
 
@@ -309,4 +310,67 @@ fn search_names_the_pages_it_can_t_read() {
     assert_eq!(found.unread, [(1, "it is too complex to read".to_string())]);
     // Only the pages looked in are named.
     assert!(index.find(&Query::new("zebra"), 2..3, 0).unread.is_empty());
+}
+
+/// Finding the pictures, which follows every drawing every page draws, has the same budget:
+/// naming, saving or reducing the pictures of a document with a page too complex to follow
+/// is refused, with nothing written or changed. Failed on the old code: named, not refused.
+#[test]
+fn pictures_on_a_page_too_complex_to_follow_are_refused() {
+    use limarepdf_core::{budget_seam, ReduceOptions, TooComplex};
+    let mut p = zebras(2);
+    draw_tree(&mut p, 1, 3, 4);
+    let scratch = common::tool::Scratch::new("too-complex");
+    let dir = scratch.join("pictures");
+    let before = p.state_before();
+    let ((), _) = budget_seam::with_limit(40, || {
+        let e = p.picture_names("zebras").unwrap_err();
+        let too = e.downcast_ref::<TooComplex>().expect("too complex");
+        assert_eq!(too.what, "finding the pictures", "{e:#}");
+        let e = p.save_all_pictures(&dir, "zebras").unwrap_err();
+        assert!(e.downcast_ref::<TooComplex>().is_some(), "{e:#}");
+        let opts = ReduceOptions::default();
+        let e = p.reduce_pictures(&[0], &opts).unwrap_err();
+        assert!(e.downcast_ref::<TooComplex>().is_some(), "{e:#}");
+    });
+    assert!(!dir.exists());
+    assert_eq!(p.state_since(&before), []);
+    // Within the steps it needs, the tree is followed: it draws no pictures.
+    assert!(p.picture_names("zebras").unwrap().is_empty());
+}
+
+/// The child process of the next test: names the pictures of a page drawing a tree of
+/// forms ten wide and eight deep, which unchecked is followed 10⁸ times.
+#[test]
+#[ignore = "started by pictures_of_a_page_drawing_forms_over_and_over_are_refused_at_once"]
+fn too_complex_pictures_child() {
+    if std::env::var("TOO_COMPLEX_PICTURES_CHILD").is_err() {
+        return;
+    }
+    let mut p = zebras(1);
+    draw_tree(&mut p, 0, 10, 8);
+    match p.picture_names("zebras") {
+        Ok(names) => println!("pictures|named|{}", names.len()),
+        Err(e) => println!("pictures|refused|{e:#}"),
+    }
+}
+
+/// Failed on the old code: not named within 30 s.
+#[test]
+fn pictures_of_a_page_drawing_forms_over_and_over_are_refused_at_once() {
+    let start = Instant::now();
+    let env = [("TOO_COMPLEX_PICTURES_CHILD", "1".to_string())];
+    let ran = apart::run("too_complex_pictures_child", &env, Duration::from_secs(30));
+    let Ran::Ended(text, status) = ran else {
+        panic!("not named within 30 s");
+    };
+    let said = apart::reports(&text, "pictures|");
+    assert_eq!(said.len(), 1, "{}", apart::why_stopped(status));
+    assert!(said[0].starts_with("refused|"), "{}", said[0]);
+    assert!(said[0].contains("finding the pictures"), "{}", said[0]);
+    assert!(
+        start.elapsed() < Duration::from_secs(10),
+        "{:?}",
+        start.elapsed()
+    );
 }

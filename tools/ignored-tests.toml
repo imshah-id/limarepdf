@@ -129,6 +129,13 @@ file = "crates/limarepdf-core/tests/too_complex.rs"
 group = "G2"
 
 [[test]]
+name = "too_complex_pictures_child"
+crate = "limarepdf-core"
+target = "--test too_complex"
+file = "crates/limarepdf-core/tests/too_complex.rs"
+group = "G2"
+
+[[test]]
 name = "app::tests::booklet_with_stand_in_cups"
 crate = "limarepdf-gui"
 target = "--bin limarepdf"

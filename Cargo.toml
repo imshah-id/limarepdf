@@ -76,6 +76,12 @@ opt-level = 3
 opt-level = 3
 [profile.dev.package.rc2]
 opt-level = 3
+# Reading content is about 13x slower unoptimised: following a page's drawings to the end of its
+# budget (tests/too_complex.rs) took 54 s, not 4 s.
+[profile.dev.package.lopdf]
+opt-level = 3
+[profile.dev.package.nom]
+opt-level = 3
 
 [profile.release]
 opt-level = 3

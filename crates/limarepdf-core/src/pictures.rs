@@ -95,11 +95,12 @@ impl Pdf {
     /// The file names [`Pdf::save_all_pictures`] gives every picture the pages draw, in page
     /// order: `<stem>-page-<page>-image-<n>.<ext>`, `n` its place among the pictures its page
     /// draws, numbers padded so the files sort in order. A picture drawn on several pages is
-    /// saved once, with the first.
-    pub fn picture_names(&self, stem: &str) -> Vec<String> {
-        let seen = self.walk_pages().seen;
+    /// saved once, with the first. Refused ([`crate::TooComplex`]) when a page's drawings
+    /// draw each other too often to follow.
+    pub fn picture_names(&self, stem: &str) -> Result<Vec<String>> {
+        let seen = self.walk_pages()?.seen;
         let found = self.found(&seen);
-        names(&found, stem, self.page_count())
+        let names = names(&found, stem, self.page_count())
             .into_iter()
             .zip(&found)
             .map(|(n, f)| {
@@ -108,17 +109,19 @@ impl Pdf {
                     format_of(&self.doc, f.picture, f.shown).extension()
                 )
             })
-            .collect()
+            .collect();
+        Ok(names)
     }
 
     /// Save every picture the pages draw, in their content and the drawings it uses, to
     /// `dir` with the names [`Pdf::picture_names`] gives, each whole or not at all, replacing
     /// files of the same name. A picture that can't be saved is reported and the others go
     /// on. When every file was written but one wasn't confirmed on disk, the error is that
-    /// file's [`crate::NotConfirmed`].
+    /// file's [`crate::NotConfirmed`]. Refused, with nothing written, when a page's drawings
+    /// draw each other too often to follow ([`crate::TooComplex`]).
     pub fn save_all_pictures(&self, dir: &Path, stem: &str) -> Result<SavedPictures> {
+        let seen = self.walk_pages()?.seen;
         std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
-        let seen = self.walk_pages().seen;
         let found = self.found(&seen);
         let stems = names(&found, stem, self.page_count());
         let mut out = SavedPictures::default();

@@ -4465,7 +4465,7 @@ fn run(cmd: Cmd) -> Result<()> {
                 .and_then(|s| s.to_str())
                 .unwrap_or("document")
                 .to_string();
-            let names = pdf.picture_names(&stem);
+            let names = pdf.picture_names(&stem)?;
             if names.is_empty() {
                 out!("no pictures to save");
                 return Ok(());
