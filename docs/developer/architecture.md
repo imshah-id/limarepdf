@@ -134,6 +134,15 @@ how many entries there are; clippy.toml refuses `page_iter` and `get_pages` anyw
 overflow, as the app is built), overflowed itself, or, as the pages were collected for drawing, asked for more
 memory than a computer has, which ended the app (PB-173, found by the `readers` fuzz target).
 
+Finding a page by its number (`Pdf::page_id_at`, and `parse_page`, which goes through it) walks the tree up to it,
+so an operation over many pages finds them once (`Pdf::page_ids`) and passes each page's object on
+(`parse_page_of`, `text_matches_of`, `scan_target`), and removing a page's links finds the page once for them all
+(PB-29). Before, finding redaction marks, redacting, applying the marks, removing hidden information, listing and
+flattening the form's fields, reading the document's words, recognising text, optimising scans, removing links and
+signing found pages by their number inside their loops, so their time grew with the square of the page count.
+`tests/page_walks.rs` counts the tree's entries read (`doc::pages_seam`, built only for tests) by 25 operations on
+2,000 pages, and holds each to 20 walks.
+
 hayro (0.9) sets aside memory for a picture from its stated width and height, not from its data: an inline image of
 78 bytes stating 255,555,555 × 2 pixels made it ask for about 4 GB (PB-81, found by REL-12's `draw` fuzz target). So
 every copy pages are drawn from leaves out a picture whose data can't come near filling it

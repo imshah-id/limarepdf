@@ -124,12 +124,13 @@ impl Pdf {
         pages: &[usize],
         opts: &ScanOptions,
     ) -> Result<Vec<(usize, ScanResult)>> {
+        let ids = self.page_ids();
         let mut found: Vec<(usize, std::result::Result<Target, String>)> = Vec::new();
         for &p in pages {
-            if p >= self.page_count() {
+            if p >= ids.len() {
                 anyhow::bail!("no page {}", p + 1);
             }
-            found.push((p, self.scan_target(p)));
+            found.push((p, self.scan_target(ids[p])));
         }
         // One job per distinct image, for the first page showing it (and its colour
         // spaces), with the lowest resolution and any text among the pages that do.
@@ -177,7 +178,7 @@ impl Pdf {
         for (p, t) in &found {
             if let Ok(t) = t {
                 if let Some(&to) = new.get(&t.id) {
-                    self.point_image(*p, &t.name, to)?;
+                    self.point_image(*p, ids[*p], &t.name, to)?;
                 }
             }
         }
@@ -213,10 +214,15 @@ impl Pdf {
         Ok(out)
     }
 
-    /// Make page `page_index` draw the image `to` under `name`, through resources of its
-    /// own, so that no other page that shared them changes.
-    fn point_image(&mut self, page_index: usize, name: &[u8], to: ObjectId) -> Result<()> {
-        let page = self.page_id_at(page_index)?;
+    /// Make page `page_index`, the object `page`, draw the image `to` under `name`, through
+    /// resources of its own, so that no other page that shared them changes.
+    fn point_image(
+        &mut self,
+        page_index: usize,
+        page: ObjectId,
+        name: &[u8],
+        to: ObjectId,
+    ) -> Result<()> {
         let resolve = |o: &Object| -> Result<lopdf::Dictionary> {
             Ok(self.doc.dereference(o)?.1.as_dict()?.clone())
         };
@@ -233,10 +239,9 @@ impl Pdf {
         Ok(())
     }
 
-    /// The image that makes up a scanned page, or why the page does not qualify.
-    fn scan_target(&self, page_index: usize) -> std::result::Result<Target, String> {
-        let page = self.page_id_at(page_index).map_err(|e| e.to_string())?;
-        let parsed = self.parse_page(page_index).map_err(|e| e.to_string())?;
+    /// The image that makes up the scanned page `page`, or why the page does not qualify.
+    fn scan_target(&self, page: ObjectId) -> std::result::Result<Target, String> {
+        let parsed = self.parse_page_of(page).map_err(|e| e.to_string())?;
         if parsed
             .objs
             .iter()

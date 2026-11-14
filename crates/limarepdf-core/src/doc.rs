@@ -53,7 +53,40 @@ pub(crate) fn pages(doc: &Document) -> impl Iterator<Item = ObjectId> + '_ {
 pub(crate) fn page_tree(doc: &Document) -> impl Iterator<Item = ObjectId> + '_ {
     #[allow(clippy::disallowed_methods)] // The one use, its guess hidden.
     let mut tree = doc.page_iter();
-    std::iter::from_fn(move || tree.next())
+    std::iter::from_fn(move || {
+        let id = tree.next();
+        #[cfg(any(test, feature = "test-seams"))]
+        if id.is_some() {
+            pages_seam::read();
+        }
+        id
+    })
+}
+
+/// A test seam (PB-29): the page-tree entries read ([`page_tree`]), on every thread, so a
+/// test can show an operation goes through the tree a few times, not once a page. Built
+/// only for tests (core's own, and through the `test-seams` feature).
+#[cfg(any(test, feature = "test-seams"))]
+pub mod pages_seam {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Mutex;
+
+    static READ: AtomicU64 = AtomicU64::new(0);
+    static COUNTING: Mutex<()> = Mutex::new(());
+
+    /// Runs `f`, and returns what it returned and the page-tree entries read meanwhile.
+    /// Entries read on any thread count, so a test binary counting runs only tests that
+    /// count through this (one at a time).
+    pub fn count<T>(f: impl FnOnce() -> T) -> (T, u64) {
+        let _one = COUNTING.lock().unwrap_or_else(|e| e.into_inner());
+        let start = READ.load(Ordering::Relaxed);
+        let out = f();
+        (out, READ.load(Ordering::Relaxed) - start)
+    }
+
+    pub(super) fn read() {
+        READ.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 /// Why a repaired document may read differently in other PDF apps.

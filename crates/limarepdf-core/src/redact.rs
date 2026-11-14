@@ -1227,9 +1227,13 @@ impl Pdf {
     /// Marks covering every match of `query` (as [`Pdf::find_text_matches`] finds them):
     /// (page, box in displayed-page points, y down), one box per line of each match.
     pub fn find_redaction_marks(&self, query: &str) -> Result<Vec<(usize, [f32; 4])>> {
+        let q = crate::Query::new(query);
+        if q.is_empty() {
+            return Ok(Vec::new());
+        }
         let mut out = Vec::new();
-        for p in 0..self.page_count() {
-            for m in self.find_text_matches(p, query)? {
+        for (p, page) in self.page_ids().into_iter().enumerate() {
+            for m in self.text_matches_of(p, page, &q)? {
                 out.extend(m.into_iter().map(|b| (p, b)));
             }
         }
@@ -1256,7 +1260,9 @@ impl Pdf {
     /// [`Pdf::redact`] whatever its check finds ([`RedactReport::left`]), and leaving the
     /// document half changed when it fails: for finding what redacting would do, on a copy.
     pub(crate) fn redact_unchecked(&mut self, marks: &[(usize, [f32; 4])]) -> Result<RedactReport> {
-        let n = self.page_count();
+        // Found once: redacting adds and removes no page.
+        let ids = self.page_ids();
+        let n = ids.len();
         let mut by_page: BTreeMap<usize, Vec<[f32; 4]>> = BTreeMap::new();
         for &(p, b) in marks {
             if p >= n {
@@ -1275,12 +1281,12 @@ impl Pdf {
         let mut texts = HashMap::new();
         let mut widgets = false;
         for (&p, rects) in &by_page {
-            let page = self.page_id_at(p)?;
+            let page = ids[p];
             let (vd, _, _) = self.vis_down(page);
             let areas: Vec<[f32; 4]> = rects.iter().map(|&b| mx::transform_rect(vd, b)).collect();
             widgets |= self.widget_touched(page, &areas);
             struct_parents.insert(p, self.struct_parents(page)?);
-            texts.insert(p, self.text_under(p, &areas)?);
+            texts.insert(p, self.text_under(page, &areas)?);
             page_areas.insert(p, areas);
         }
         if widgets {
@@ -1299,7 +1305,7 @@ impl Pdf {
         };
         let (mut alts, mut unread, mut added_all) = (Vec::new(), Vec::new(), 0);
         for &p in by_page.keys() {
-            let page = self.page_id_at(p)?;
+            let page = ids[p];
             let areas = page_areas.remove(&p).unwrap_or_default();
             let data = self
                 .doc
@@ -1375,7 +1381,7 @@ impl Pdf {
         removed.xobjects.extend(drawn);
         let reach = self.reach(&mut reach::work_after(added_all), &mut uses)?;
         let retained = self.clear_retained(&removed, &reach);
-        report.left = self.check_left(&by_page);
+        report.left = self.check_left(&ids, &by_page);
         unread.extend(retained.unread);
         unread.sort_unstable();
         unread.dedup();
@@ -1386,11 +1392,11 @@ impl Pdf {
         Ok(report)
     }
 
-    /// The text of page `p` under `areas` (page user space), as the page is read (so with
+    /// The text of `page` under `areas` (page user space), as the page is read (so with
     /// the spaces search sees): one entry per run of characters on a line. None for a page
     /// that can't be read; refused for one too complex to read.
-    fn text_under(&self, p: usize, areas: &[[f32; 4]]) -> Result<Vec<String>> {
-        let parsed = match self.parse_page(p) {
+    fn text_under(&self, page: ObjectId, areas: &[[f32; 4]]) -> Result<Vec<String>> {
+        let parsed = match self.parse_page_of(page) {
             Ok(parsed) => parsed,
             Err(e) if crate::objects::refused(&e) => return Err(e),
             Err(_) => return Ok(Vec::new()),
@@ -1556,17 +1562,22 @@ impl Pdf {
         out
     }
 
-    /// Read the redacted pages again: any character or picture still touching a mark.
-    fn check_left(&self, by_page: &BTreeMap<usize, Vec<[f32; 4]>>) -> Vec<String> {
+    /// Read the redacted pages again: any character or picture still touching a mark. `ids`
+    /// are the pages' objects.
+    fn check_left(
+        &self,
+        ids: &[ObjectId],
+        by_page: &BTreeMap<usize, Vec<[f32; 4]>>,
+    ) -> Vec<String> {
         let mut left = Vec::new();
         for (&p, rects) in by_page {
-            let Ok(page) = self.page_id_at(p) else {
+            let Some(&page) = ids.get(p) else {
                 continue;
             };
             let (vd, _, _) = self.vis_down(page);
             let areas: Vec<[f32; 4]> = rects.iter().map(|&b| mx::transform_rect(vd, b)).collect();
             let under = |b: [f32; 4]| areas.iter().any(|&a| touches(norm(b), a));
-            let parsed = match self.parse_page(p) {
+            let parsed = match self.parse_page_of(page) {
                 Ok(x) => x,
                 Err(e) => {
                     left.push(format!(

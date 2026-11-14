@@ -507,6 +507,12 @@
   there; changed, it is saved with the box around it. Redacting where it is drawn removes it, as redacting over its
   box does. Before, it was framed at its box, and redaction kept it, with its comment, unless the marks also
   covered its box; other readers drew it over the black.
+- On long documents, finding a word to redact, redacting many pages, Apply redactions, Remove hidden information,
+  listing and flattening a form's fields, Recognise text, Optimise scanned pages, signing, removing many links from
+  a page, and reading the words that paragraph editing joins hyphens by take time in step with the number of
+  pages. Before, each found every page by counting through the document's pages again, so the time grew with the
+  square of the page count: on 10,000 pages, finding a word to redact (`limarepdf-cli redact --text`) took 14.5
+  seconds; now 0.16.
 
 ### Changed
 

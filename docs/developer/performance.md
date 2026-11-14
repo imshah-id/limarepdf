@@ -291,12 +291,13 @@ What they show:
 
 ## Redaction
 
-A baseline, not yet improved (PB-44). Measured on 11 November 2026 on the machine above with the opt-in test
-`redaction_timings_in_long_documents` (in `crates/limarepdf-core/tests/redact.rs`; `cargo test -p limarepdf-core
---release --test redact -- --ignored --nocapture --exact redaction_timings_in_long_documents`), at d02070d with the
-changes that became S1-24: made-up documents, every page a line of Helvetica text under one page-tree node, the
-middle page holding "Secret". Each step is timed on its own, the median of three runs, release build. The run took
-18 minutes.
+Measured with the opt-in test `redaction_timings_in_long_documents` (in `crates/limarepdf-core/tests/redact.rs`;
+`cargo test -p limarepdf-core --release --test redact -- --ignored --nocapture --exact
+redaction_timings_in_long_documents`): made-up documents, every page a line of Helvetica text under one page-tree
+node, the middle page holding "Secret". Each step is timed on its own, the median of three runs, release build.
+
+The baseline (PB-44), on 11 November 2026 on the machine above, at d02070d with the changes that became S1-24. The
+run took 18 minutes.
 
 | Pages (file size) | Open | Find "Secret" (`find_redaction_marks`) | Redact it (`redact`) | Save |
 | --- | --- | --- | --- | --- |
@@ -304,15 +305,31 @@ middle page holding "Secret". Each step is timed on its own, the median of three
 | 5,000 (1.2 MB) | 0.013 s | 35.5 s | 6.7 s | 0.13 s |
 | 10,000 (2.5 MB) | 0.028 s | 263.7 s | 54.3 s | 0.33 s |
 
-What they show:
+What they showed:
 
-- Opening and saving grow with the page count. Finding the marks and redacting one mark grow much faster: about
+- Opening and saving grow with the page count. Finding the marks and redacting one mark grew much faster: about
   the square of it from 1,000 to 5,000 pages, nearly the cube from 5,000 to 10,000.
 - Finding the marks is what `limarepdf-cli redact --text` does; the app marks its own search's results instead
   (see [Search](#search)), which this doesn't time. Redacting is what the app's Apply and the CLI both do.
-- Not profiled yet. One candidate for finding: `find_redaction_marks` reads each page through
-  `find_text_matches`, which finds the page with `page_id_at`, which collects every page's ID each time, the
-  pattern batch 22 removed from search. What makes redacting one mark grow isn't traced.
+
+S2-05 (WP-04's PB-29), on 13 November 2026, the same machine and test: a12dd63 before the change (the run took 54
+seconds), and with it (3 seconds).
+
+| Pages (file size) | Open | Find "Secret" (`find_redaction_marks`) | Redact it (`redact`) | Save |
+| --- | --- | --- | --- | --- |
+| Before, 1,000 (249 KB) | 0.002 s | 0.097 s | 0.014 s | 0.018 s |
+| Before, 5,000 (1.3 MB) | 0.014 s | 2.63 s | 0.091 s | 0.088 s |
+| Before, 10,000 (2.5 MB) | 0.026 s | 14.5 s | 0.185 s | 0.178 s |
+| After, 1,000 (249 KB) | 0.005 s | 0.014 s | 0.027 s | 0.019 s |
+| After, 5,000 (1.3 MB) | 0.025 s | 0.079 s | 0.125 s | 0.093 s |
+| After, 10,000 (2.5 MB) | 0.032 s | 0.157 s | 0.189 s | 0.180 s |
+
+- Redacting one mark already grew with the page count before the change: it did between the baseline and a12dd63,
+  where lopdf went from 0.46 to 0.47 and the page tree's walk changed (PB-173); which made it so wasn't traced.
+- Finding still grew with the square of it. It found each page by its number (`page_id_at`, which walks the page
+  tree up to the page), and so did redacting each marked page: `tests/page_walks.rs` counted the tree read 1,001
+  times over finding on 2,000 pages, and 6,013 times over redacting every one. Both now find the pages once and
+  pass each page's object on; from 1,000 to 10,000 pages, finding takes 11 times as long.
 
 ## Reading underlines and strike-throughs
 

@@ -328,10 +328,9 @@ impl Pdf {
     /// (in parallel): what [`Pdf::paragraph`] reads line-end hyphens by. A page that can't
     /// be read gives none.
     pub fn document_words(&self) -> DocWords {
-        let pages: Vec<Vec<String>> = (0..self.page_count())
-            .into_par_iter()
-            .map(|i| {
-                let Ok(parsed) = self.parse_page(i) else {
+        let pages: Vec<Vec<String>> = (self.page_ids().into_par_iter())
+            .map(|page| {
+                let Ok(parsed) = self.parse_page_of(page) else {
                     return Vec::new();
                 };
                 (parsed.text_lines().filter(|t| !t.hidden))
@@ -366,7 +365,7 @@ impl Pdf {
         words: &DocWords,
     ) -> Result<Paragraph> {
         let page = self.page_id_at(page_index)?;
-        let parsed = self.parse_page(page_index)?;
+        let parsed = self.parse_page_of(page)?;
         let objs = self.objects_of(page, &parsed)?;
         let (vd, _, _) = self.vis_down(page);
         let to_vis = mx::inv(vd).ok_or_else(|| anyhow!("degenerate page transform"))?;

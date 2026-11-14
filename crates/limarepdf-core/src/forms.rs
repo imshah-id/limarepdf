@@ -161,8 +161,8 @@ pub(crate) enum Reach {
 
 /// State kept while walking the field tree.
 struct Walk {
-    /// Each annotation's page, from the pages' `/Annots`.
-    pages: HashMap<ObjectId, usize>,
+    /// Each annotation's page and its object, from the pages' `/Annots`.
+    pages: HashMap<ObjectId, (usize, ObjectId)>,
     /// Each page's matrix from user space to displayed-page points.
     to_vis: HashMap<usize, Option<M>>,
     seen: HashSet<ObjectId>,
@@ -355,8 +355,8 @@ impl Pdf {
         self.doc.dereference(form).ok()?.1.as_dict().ok()
     }
 
-    /// Each annotation listed on a page, with that page.
-    fn annot_pages(&self) -> HashMap<ObjectId, usize> {
+    /// Each annotation listed on a page, with that page (zero-based) and its object.
+    fn annot_pages(&self) -> HashMap<ObjectId, (usize, ObjectId)> {
         let mut map = HashMap::new();
         for (i, id) in self.page_ids().into_iter().enumerate() {
             let annots = self
@@ -368,7 +368,7 @@ impl Pdf {
                 .and_then(|(_, o)| o.as_array().ok());
             for a in annots.into_iter().flatten() {
                 if let Ok(a) = a.as_reference() {
-                    map.entry(a).or_insert(i);
+                    map.entry(a).or_insert((i, id));
                 }
             }
         }
@@ -540,12 +540,12 @@ impl Pdf {
     /// A widget annotation, if it is on a page.
     fn widget(&self, id: ObjectId, w: &mut Walk) -> Option<Widget> {
         let d = self.doc.get_dictionary(id).ok()?;
-        let page = *w.pages.get(&id)?;
+        let (page, pid) = *w.pages.get(&id)?;
         let rect = self.rect(d.get(b"Rect").ok()?)?;
-        let to_vis = *w.to_vis.entry(page).or_insert_with(|| {
-            let pid = self.page_id_at(page).ok()?;
-            mx::inv(self.vis_down(pid).0)
-        });
+        let to_vis = *w
+            .to_vis
+            .entry(page)
+            .or_insert_with(|| mx::inv(self.vis_down(pid).0));
         let on_state = self.on_state(id);
         let flags = d
             .get(b"F")

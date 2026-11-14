@@ -408,7 +408,7 @@ impl Pdf {
     ) -> Result<(u32, u16)> {
         let target = self.target_entry(to)?;
         self.atomically(|p| {
-            let id = p.link_object(page_index, link)?;
+            let id = p.link_object(page_index, link, &mut None)?;
             let d = p.doc.get_dictionary_mut(id)?;
             d.remove(b"Dest");
             d.remove(b"A");
@@ -430,7 +430,7 @@ impl Pdf {
         to: [f32; 4],
     ) -> Result<(u32, u16)> {
         self.atomically(|p| {
-            let id = p.link_object(page_index, link)?;
+            let id = p.link_object(page_index, link, &mut None)?;
             p.move_annotation(page_index, id, to)?;
             let underline = p.link_underlined(p.doc.get_dictionary(id)?);
             p.draw_link(id, underline)?;
@@ -442,23 +442,36 @@ impl Pdf {
     pub fn remove_links(&mut self, page_index: usize, links: &[LinkId]) -> Result<usize> {
         self.atomically(|p| {
             let mut gone = HashSet::new();
+            let mut page = None;
             for &l in links {
-                gone.insert(p.link_object(page_index, l)?);
+                gone.insert(p.link_object(page_index, l, &mut page)?);
             }
             p.drop_annotations(gone)
         })
     }
 
-    /// The object of a link, made one first if it is written inside its page's list.
-    fn link_object(&mut self, page_index: usize, link: LinkId) -> Result<ObjectId> {
+    /// The object of a link, made one first if it is written inside its page's list. `found`
+    /// keeps page `page_index`'s object once a link written inside the list needed it, so a
+    /// loop over one page's links finds the page and owns the lists once (PB-29).
+    fn link_object(
+        &mut self,
+        page_index: usize,
+        link: LinkId,
+        found: &mut Option<ObjectId>,
+    ) -> Result<ObjectId> {
         let id = match link {
             LinkId::Object(id) => id,
             LinkId::Inline { page, at } => {
                 if page != page_index {
                     bail!("the link isn't on page {}", page_index + 1);
                 }
-                self.own_direct_annots()?;
-                let page = self.page_id_at(page)?;
+                let page = match *found {
+                    Some(page) => page,
+                    None => {
+                        self.own_direct_annots()?;
+                        *found.insert(self.page_id_at(page)?)
+                    }
+                };
                 self.annots_array(page)
                     .and_then(|a| a.get(at)?.as_reference().ok())
                     .ok_or_else(|| anyhow!("the link is no longer there"))?
