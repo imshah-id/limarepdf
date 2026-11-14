@@ -5,7 +5,7 @@
 mod common;
 
 use common::apart::{self, Ran};
-use limarepdf_core::{FontChoice, Pdf, Query, TextIndex};
+use limarepdf_core::{render, FontChoice, Pdf, Query, TextIndex};
 use lopdf::{dictionary, Dictionary, Object, ObjectId, Stream};
 use std::time::{Duration, Instant};
 
@@ -262,6 +262,36 @@ fn a_redaction_over_a_page_too_complex_to_read_changes_nothing() {
     let too = e.downcast_ref::<TooComplex>().expect("too complex");
     assert_eq!(too.what, "reading the page", "{e:#}");
     assert_eq!(p.state_since(&before), []);
+}
+
+/// Page 1 of `p`, saved, drawn at 72 dpi.
+fn drawn(p: &mut Pdf) -> render::Bitmap {
+    let doc = render::load(p.snapshot().unwrap(), None).unwrap();
+    render::Renderer::new(&doc).render(0, 1.0).unwrap()
+}
+
+/// A redaction over a form that draws itself twice follows the form once: drawn again
+/// inside itself, it goes whole, twice, not once for each copy down to the nesting limit
+/// (PB-104), and the page outside the mark draws as before.
+#[test]
+fn a_redaction_over_a_form_drawing_itself_follows_it_once() {
+    let mut p = zebras(1);
+    draw_itself(&mut p, 0, 2);
+    let before = drawn(&mut p);
+    // Over the form, clear of "Zebra": 300 to 400 points (and pixels) each way.
+    let rep = p.redact(&[(0, [300.0, 300.0, 400.0, 400.0])]).unwrap();
+    assert_eq!(rep.pages[0].images, 2, "{rep:?}");
+    assert_eq!(p.page_text(0).trim(), "Zebra");
+    let after = drawn(&mut p);
+    let outside = |i: usize| {
+        let (x, y) = (i % after.width, i / after.width);
+        !(299..=401).contains(&x) || !(299..=401).contains(&y)
+    };
+    let px = |b: &render::Bitmap, i: usize| b.rgba[i * 4..i * 4 + 4].to_vec();
+    let changed = (0..after.width * after.height)
+        .filter(|&i| outside(i) && px(&before, i) != px(&after, i))
+        .count();
+    assert_eq!(changed, 0);
 }
 
 /// Search reads the pages it can and names those it can't, with why.

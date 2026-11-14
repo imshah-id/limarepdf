@@ -27,9 +27,10 @@
 //! The drawings are followed once before anything changes ([`Pdf::reach`]), so a document
 //! too complex to follow within the budget is refused unchanged.
 
+use crate::budget::{self, Work};
 use crate::fonts::FontCtx;
 use crate::matrix::{self as mx, apply, mul, M};
-use crate::objects::span_boxes;
+use crate::objects::{refused, span_boxes, STEPS};
 use crate::reach::{self, Decoded, Reach, Uses};
 use crate::redact_img::{black_out, inline_stream, is_clear};
 use crate::retained::{alt_refs, references_in, unread_said, Removed};
@@ -317,6 +318,11 @@ struct Redactor<'a> {
     /// keeps every name, the removed ones' too.
     unread: bool,
     out: PageRedaction,
+    /// The page's budget: a step for each operator and each form followed, and for each
+    /// kilobyte of a form's content (PB-104).
+    work: Work,
+    /// The forms being redacted inside, outermost first (`None` for one held in place).
+    forms: Vec<Option<ObjectId>>,
 }
 
 impl<'a> Redactor<'a> {
@@ -334,6 +340,8 @@ impl<'a> Redactor<'a> {
             uses,
             unread: false,
             out: PageRedaction::default(),
+            work: Work::new("redacting the page", budget::limit(STEPS)),
+            forms: Vec::new(),
         }
     }
 
@@ -437,6 +445,7 @@ impl<'a> Redactor<'a> {
         let mut xobjs_changed = false;
 
         for o in ops {
+            self.work.take(1)?;
             let v = nums(&o);
             let name = o.operator.clone();
             let is_path = matches!(name.as_str(), "m" | "l" | "c" | "v" | "y" | "re" | "h");
@@ -606,14 +615,21 @@ impl<'a> Redactor<'a> {
                             let fctm = mul(fm, gs.ctm);
                             if self.hit(mx::transform_rect(fctm, bbox)) {
                                 // Redacted inside as deep as drawings are followed; deeper
-                                // ones under a mark go whole.
-                                let redone = if nesting < crate::MAX_FORM_NESTING {
-                                    self.form(s, &res, fctm, nesting + 1)?
+                                // ones under a mark go whole, and so does one drawn again
+                                // inside itself, which hayro doesn't draw there and other
+                                // viewers might (PB-104).
+                                let again = id.is_some() && self.forms.contains(&id);
+                                let redone = if nesting < crate::MAX_FORM_NESTING && !again {
+                                    self.forms.push(id);
+                                    let redone = self.form(s, &res, fctm, nesting + 1);
+                                    self.forms.pop();
+                                    redone?
                                 } else {
                                     None
                                 };
                                 let Some(new) = redone.map(|f| f.map(Object::Reference)) else {
-                                    // Too deep, or unreadable: the whole form goes.
+                                    // Too deep, drawn again, or unreadable: the whole form
+                                    // goes.
                                     self.out.images += 1;
                                     self.dropped.extend(id);
                                     changed = true;
@@ -710,7 +726,7 @@ impl<'a> Redactor<'a> {
 
     /// Redact inside a form XObject drawn with `ctm`. `Ok(None)`: the form can't be read
     /// (so it has to go whole); `Ok(Some(None))`: nothing in it was under a mark;
-    /// `Ok(Some(Some(id)))`: the redacted copy.
+    /// `Ok(Some(Some(id)))`: the redacted copy. Refused past the page's budget.
     fn form(
         &mut self,
         s: &Stream,
@@ -718,9 +734,11 @@ impl<'a> Redactor<'a> {
         ctm: M,
         nesting: usize,
     ) -> Result<Option<Option<ObjectId>>> {
+        self.work.take(1)?;
         let Ok(data) = s.get_plain_content_with_limit(crate::MAX_CONTENT) else {
             return Ok(None);
         };
+        self.work.take(data.len() as u64 / 1024)?;
         let own = s
             .dict
             .get(b"Resources")
@@ -728,6 +746,7 @@ impl<'a> Redactor<'a> {
             .map(|o| self.pdf.resolved_dict(Some(o)));
         let inner = match self.content(&data, own.as_ref().unwrap_or(res), ctm, nesting) {
             Ok(r) => r,
+            Err(e) if refused(&e) => return Err(e),
             Err(_) => return Ok(None),
         };
         if !inner.changed {
