@@ -312,24 +312,47 @@ What they showed:
 - Finding the marks is what `limarepdf-cli redact --text` does; the app marks its own search's results instead
   (see [Search](#search)), which this doesn't time. Redacting is what the app's Apply and the CLI both do.
 
-S2-05 (WP-04's PB-29), on 13 November 2026, the same machine and test: a12dd63 before the change (the run took 54
-seconds), and with it (3 seconds).
+S2-05 (WP-04's PB-29, PB-104 and the picture walk's budget), on 14 November 2026, the same machine and test, two
+rounds of each run in turn: a12dd63 before WP-04 (about a minute a round), and 875242e with it (3 seconds). Where
+the rounds differed, both are shown.
 
 | Pages (file size) | Open | Find "Secret" (`find_redaction_marks`) | Redact it (`redact`) | Save |
 | --- | --- | --- | --- | --- |
-| Before, 1,000 (249 KB) | 0.002 s | 0.097 s | 0.014 s | 0.018 s |
-| Before, 5,000 (1.3 MB) | 0.014 s | 2.63 s | 0.091 s | 0.088 s |
-| Before, 10,000 (2.5 MB) | 0.026 s | 14.5 s | 0.185 s | 0.178 s |
-| After, 1,000 (249 KB) | 0.005 s | 0.014 s | 0.027 s | 0.019 s |
-| After, 5,000 (1.3 MB) | 0.025 s | 0.079 s | 0.125 s | 0.093 s |
-| After, 10,000 (2.5 MB) | 0.032 s | 0.157 s | 0.189 s | 0.180 s |
+| Before, 1,000 (249 KB) | 0.002 s | 0.100–0.105 s | 0.016–0.017 s | 0.017 s |
+| Before, 5,000 (1.3 MB) | 0.013–0.014 s | 2.75–2.99 s | 0.088–0.093 s | 0.088–0.089 s |
+| Before, 10,000 (2.5 MB) | 0.026–0.027 s | 15.9–17.0 s | 0.190–0.191 s | 0.176 s |
+| After, 1,000 (249 KB) | 0.003 s | 0.012 s | 0.015–0.016 s | 0.018 s |
+| After, 5,000 (1.3 MB) | 0.013–0.014 s | 0.069–0.073 s | 0.089–0.106 s | 0.088–0.089 s |
+| After, 10,000 (2.5 MB) | 0.027–0.029 s | 0.134–0.153 s | 0.181–0.183 s | 0.176–0.178 s |
 
 - Redacting one mark already grew with the page count before the change: it did between the baseline and a12dd63,
   where lopdf went from 0.46 to 0.47 and the page tree's walk changed (PB-173); which made it so wasn't traced.
 - Finding still grew with the square of it. It found each page by its number (`page_id_at`, which walks the page
   tree up to the page), and so did redacting each marked page: `tests/page_walks.rs` counted the tree read 1,001
   times over finding on 2,000 pages, and 6,013 times over redacting every one. Both now find the pages once and
-  pass each page's object on; from 1,000 to 10,000 pages, finding takes 11 times as long.
+  pass each page's object on; from 1,000 to 10,000 pages, finding takes 11 to 13 times as long, and redacting 12.
+
+In the app, PB-44's case with `tools/perf/drive.py redact` (one line marked on page 1 of the reference set's
+text-10000.pdf and applied; release build of 875242e, warm, 10 runs after one discarded; set up as in
+[The release check, 12 November 2026](#the-release-check-12-november-2026)): **4,307.4 / 4,798.4 ms built, 4,399.3
+/ 4,892.6 ms shown** (median / worst), from S2-16's 87.9 / 89.5 s and 88.3 / 89.9 s. It is still one frame, with
+no busy sign first (PB-163), so it still fails the 100 ms.
+
+Where the time goes, traced with a throwaway test of the tab's steps (not kept; a `ci-test` build, where the
+whole edit took 5.1 s): nearly all of it is core's `apply_redactions`, as redrawing, the copy for undo and
+comparing with it come to under 0.15 s. Inside it, three passes over the whole document take the time: the walk of
+what every page draws, before redacting (1.1 s) and after it (1.1 s), and looking for the removed text elsewhere
+(2.7 s), which reads every page's text. These are the checks the report rests on. Each costs about the same a page
+at every length (one line marked on page 1):
+
+| Reference file | Walk before | Walk after | Text elsewhere | Whole apply |
+| --- | --- | --- | --- | --- |
+| text-120.pdf | 13.7 ms | 14.1 ms | 35.5 ms | 69.3 ms |
+| text-300.pdf | 33.2 ms | 33.6 ms | 67.3 ms | 143.4 ms |
+| text-10000.pdf | 1,104.4 ms | 1,126.0 ms | 2,651.1 ms | 5,133.8 ms |
+
+A made-up document's page holds one line, against the reference files' 48, which is why `redact` takes 0.18 s
+there.
 
 ## Reading underlines and strike-throughs
 
@@ -979,6 +1002,10 @@ ed9e789c4a7daaea6d39d464ccac068b2c5f8376aca8c9de4d5f0cd1bbf63075  scan-20.pdf
 ```
 
 Made twice, the same both times.
+
+On 14 November 2026 (S2-05), `--refset` made scan-20.pdf as
+`e11e271597f02a1902debeda43df4aa774778985e838b21bb5727d44034c75ad`, at a12dd63 as at 875242e; the other six as
+above. Which change between 11d899c and a12dd63 made the difference wasn't traced.
 
 #### Against the accepted thresholds
 
