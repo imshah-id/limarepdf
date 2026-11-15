@@ -27,6 +27,7 @@
 //! The drawings are followed once before anything changes ([`Pdf::reach`]), so a document
 //! too complex to follow within the budget is refused unchanged.
 
+use crate::annot_ap::{self, Place};
 use crate::budget::{self, Work};
 use crate::fonts::FontCtx;
 use crate::matrix::{self as mx, apply, mul, M};
@@ -35,7 +36,7 @@ use crate::reach::{self, Decoded, Reach, Uses};
 use crate::redact_img::{black_out, inline_stream, is_clear};
 use crate::retained::{alt_refs, references_in, unread_said, Removed};
 use crate::trees::{self, Lookup};
-use crate::{Pdf, Result};
+use crate::{Annot, Pdf, Result};
 use anyhow::{anyhow, bail};
 use lopdf::content::{Content, Operation};
 use lopdf::{Dictionary, Object, ObjectId, Stream};
@@ -238,6 +239,21 @@ fn nums(op: &Operation) -> Vec<f32> {
     op.operands
         .iter()
         .filter_map(|o| o.as_float().ok())
+        .collect()
+}
+
+/// The areas the redaction marks among `all` cover ([`Pdf::redaction_marks`]).
+fn marks_of(all: Vec<Annot>) -> Vec<(usize, [f32; 4])> {
+    all.into_iter()
+        .filter(|a| a.kind == crate::AnnotKind::Redact)
+        .flat_map(|a| {
+            let boxes = if a.quads.is_empty() {
+                vec![a.bbox]
+            } else {
+                a.quads
+            };
+            boxes.into_iter().map(move |b| (a.page, b))
+        })
         .collect()
 }
 
@@ -1207,34 +1223,27 @@ impl Pdf {
     }
 
     /// The areas the document's redaction marks cover: (page, box in displayed-page
-    /// points, y down), one per marked area. Every mark counts, not only those shown.
+    /// points, y down), one per marked area. Every mark counts, not only those shown. Marks
+    /// are placed as [`Pdf::annotations`] places them.
     pub fn redaction_marks(&self) -> Vec<(usize, [f32; 4])> {
-        self.every_annotation()
-            .into_iter()
-            .filter(|a| a.kind == crate::AnnotKind::Redact)
-            .flat_map(|a| {
-                let boxes = if a.quads.is_empty() {
-                    vec![a.bbox]
-                } else {
-                    a.quads
-                };
-                boxes.into_iter().map(move |b| (a.page, b))
-            })
-            .collect()
+        marks_of(self.every_annotation(&mut Place::drawn()))
     }
 
     /// Apply the document's redaction marks: remove everything under them as
     /// [`Pdf::redact`] does, then remove the marks. Refused, with nothing changed, as
-    /// [`Pdf::redact`] is.
+    /// [`Pdf::redact`] is, and when placing the marks is too complex
+    /// ([`crate::TooComplex`]), rather than apply one elsewhere than it is shown.
     pub fn apply_redactions(&mut self) -> Result<RedactReport> {
         self.atomically(|p| {
             p.own_direct_annots()?;
-            let marks = p.redaction_marks();
+            let mut place = Place::drawn();
+            let marks = marks_of(p.every_annotation(&mut place));
+            place.whole()?;
             if marks.is_empty() {
                 bail!("the document has no redaction marks");
             }
             let report = p.redact(&marks)?;
-            let ids = (p.every_annotation().into_iter())
+            let ids = (p.every_annotation(&mut Place::own()).into_iter())
                 .filter(|a| a.kind == crate::AnnotKind::Redact)
                 .map(|a| a.id)
                 .collect();
@@ -1323,6 +1332,9 @@ impl Pdf {
             ..Removed::default()
         };
         let (mut alts, mut unread, mut added_all) = (Vec::new(), Vec::new(), 0);
+        // Annotations placed where they are drawn (PB-114) are drawn to find those the marks
+        // touch, with one budget for all the pages.
+        let mut drawing = annot_ap::work();
         for &p in by_page.keys() {
             let page = ids[p];
             let areas = page_areas.remove(&p).unwrap_or_default();
@@ -1383,7 +1395,7 @@ impl Pdf {
                     .extend(pd.remove(k).iter().flat_map(references_in));
             }
             (removed.texts).extend(self.strip_struct_alt(&struct_parents[&p], &mcids));
-            let (annots, annots_gone) = self.redact_annots(page, &areas)?;
+            let (annots, annots_gone) = self.redact_annots(page, &areas, &mut drawing)?;
             removed.annots.extend(annots_gone);
             out.annots = annots;
             out.page = p;
@@ -1447,12 +1459,14 @@ impl Pdf {
         Ok(out)
     }
 
-    /// Remove the annotations on `page` touching any of `areas` (page user space).
-    /// Returns how many went, replies included, and the annotations removed, popups too.
+    /// Remove the annotations on `page` touching any of `areas` (page user space), those
+    /// placed where they are drawn drawn within `work`. Returns how many went, replies
+    /// included, and the annotations removed, popups too.
     fn redact_annots(
         &mut self,
         page: ObjectId,
         areas: &[[f32; 4]],
+        work: &mut Work,
     ) -> Result<(usize, HashSet<ObjectId>)> {
         let mut gone = HashSet::new();
         let mut widgets = HashSet::new();
@@ -1467,7 +1481,7 @@ impl Pdf {
             // Its `/Rect`, and for one placed by its points, where it is drawn (PB-114).
             let boxes = [
                 d.get(b"Rect").ok().and_then(|o| self.rect(o)),
-                self.annot_rect(d),
+                self.annot_rect(d, work)?,
             ];
             let hit = |b: &[f32; 4]| areas.iter().any(|&a| touches(norm(*b), a));
             if boxes.iter().flatten().any(hit) {
@@ -1707,7 +1721,7 @@ impl Pdf {
                 fold(&b.title),
             ));
         }
-        for a in self.every_annotation() {
+        for a in self.every_annotation(&mut Place::own()) {
             let all = format!("{} {} {}", a.contents, a.author, a.subject);
             other.push((format!("a comment on page {}", a.page + 1), fold(&all)));
         }

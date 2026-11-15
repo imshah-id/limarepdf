@@ -1348,9 +1348,29 @@ A drawing is placed by the annotation's `/Rect`, which flattening and every rend
 links, lines, polygons, polylines and ink (`BY_POINTS`) are drawn from their own points instead, so one whose
 `/Rect` has no area (a point, or a line away from it, as `pdfjs/issue14203.pdf` has them) is given the box around
 what it draws (`extent`: the paths' points, a curve's control points, past them by the widest line plus a point)
-as its drawing's box and its `/Rect` (PB-114). `annot_rect` gives that box without drawing: `Pdf::annotations`
-and `page_links` list it, `move_annotation` moves from it as the app does, and redaction removes the annotation
-when a mark touches it or its `/Rect`.
+as its drawing's box and its `/Rect` (PB-114). `annot_rect` gives that box without putting the drawing in the
+file: `Pdf::annotations` and `page_links` list it, `move_annotation` moves from it as the app does, and redaction
+removes the annotation when a mark touches it or its `/Rect`.
+
+Drawing annotations has a budget (`annot_ap::STEPS`, `work`; WP-04): 256 steps for each annotation, one for each
+point read, each byte of other text read (a stamp's name, `/DA`, `/DS`, a text checked for characters its font
+can't write) and each byte the drawing writes, and two for each byte of a text box's text set (`SETTING`).
+Annotations can share their points and text, which each reads again, so it counts everything drawn, however
+often. One budget covers what a change draws, and everything is drawn before anything is put in the file,
+so a refusal (`TooComplex`, "drawing the annotations") changes nothing: flattening, printing (`print_planned`),
+redacting, and adding, changing or moving a comment or link refuse. Showing the document (`render_snapshot`,
+`app_snapshot`, the page under text being edited; `draw_shown`) draws as far as the budget goes and leaves the
+rest without a drawing, as other readers show them, rather than not open it; the listings (`Pdf::annotations`,
+`page_annotations`, `page_links`) place those past it at their own `/Rect`, and removing comments and sanitising
+read each at its own `/Rect`, drawing none. `STEPS` is 2²⁴ (16,777,216): 200 times the corpus maximum, 83,771
+steps (`pdfjs/issue15292.pdf`, 9 annotations; the 1,086 files that open, every annotation's own drawing taken
+away, measured 2026-11-14 with the budget lifted). Timed in an optimised build on made-up pages of each kind just
+under the limit, short text boxes are the dearest: shown (`app_snapshot`) in 2.9 s and flattened in 2.4 s
+(0.14 µs a step, most of it setting their text), refused at twice the limit in 1.2 s. Every other case takes at
+most 2.1 s (long text boxes shown), the drawings save in at most 2 s, and the most memory used is 0.9 GiB, showing
+61,000 tiny text boxes, the document and its copy included. Counting each operator drawn first let cloudy borders write about 1 GB of drawing within
+the limit (13 s to draw, 109 s to compress when saved); 64 steps an annotation let 207,000 tiny text boxes take
+1.5 GiB; and one step a byte of text set let short ones take 4.5 s to show.
 
 Links (ENH-17) are `links.rs`, kept apart from comments: `AnnotKind::of` leaves them out, so they are never in
 the Comments view or `Pdf::annotations`. `Pdf::page_links` reads every link of a page with an area: its id

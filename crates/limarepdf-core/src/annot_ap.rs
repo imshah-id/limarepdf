@@ -4,6 +4,7 @@
 //! the annotation's `/Rect`; text boxes are laid out from their own corner like form
 //! fields.
 
+use crate::budget::{self, TooComplex, Work};
 use crate::embed;
 use crate::form_ap::{
     self, encode, fill_color, nums, op, stroke_color, Body, Border, BoxSetting, Look, Metrics,
@@ -13,7 +14,7 @@ use crate::layout::Setter;
 use crate::links::LINK_BLUE;
 use crate::matrix as mx;
 use crate::stamps::{rounded, StampColor, StampKind, CAP};
-use crate::{Family, FontChoice, Pdf, Result};
+use crate::{Family, FontChoice, Pdf};
 use anyhow::bail;
 use lopdf::content::Operation;
 use lopdf::{dictionary, Dictionary, Object, ObjectId, Stream};
@@ -82,6 +83,75 @@ const TEXT_SIZE: f32 = 12.0;
 /// Most points read from one geometry entry, and drawn in an Ink drawing or a Squiggly
 /// one's wavy lines, against hostile files.
 const MAX_POINTS: usize = 100_000;
+/// Most numbers read from a dash pattern (`/BS /D`), against hostile files.
+const MAX_DASH: usize = 16;
+
+/// What drawing annotations is called when its budget refuses it.
+const WHAT: &str = "drawing the annotations";
+
+/// The steps drawing annotations may take ([`Work`]): 256 for each annotation, one for each
+/// point read, each byte of other text read (a stamp's name, `/DA`, `/DS`, a text checked
+/// for what its font can't write) and each byte drawn, and two for each byte of a text
+/// box's text set. Annotations can share their points and text, which each draws again, so
+/// the steps count everything drawn, however often. 2²⁴: 200 times the most the render
+/// corpus's annotations take with their own drawings taken away (83,771,
+/// `pdfjs/issue15292.pdf`), drawn in at most about 3 s (architecture.md, after `annot_rect`).
+const STEPS: u64 = 1 << 24;
+/// The steps an annotation takes before its points and text.
+const EACH: u64 = 256;
+/// The steps setting a byte of a text box's text takes.
+const SETTING: u64 = 2;
+
+/// A budget for drawing annotations.
+pub(crate) fn work() -> Work {
+    Work::new(WHAT, budget::limit(STEPS))
+}
+
+/// Where listed annotations are ([`Pdf::annot_rect`]): those placed by what is drawn for
+/// them, drawn within one budget, and once it is spent each at its own `/Rect`; or none
+/// drawn, each at its own `/Rect`.
+pub(crate) struct Place {
+    work: Option<Work>,
+    /// The budget's refusal, once it is spent.
+    spent: Option<TooComplex>,
+}
+
+impl Place {
+    /// Drawing those placed by what is drawn for them, within a budget ([`work`]).
+    pub(crate) fn drawn() -> Place {
+        Place {
+            work: Some(work()),
+            spent: None,
+        }
+    }
+
+    /// Drawing none, for what needs only what each annotation is.
+    pub(crate) fn own() -> Place {
+        Place {
+            work: None,
+            spent: None,
+        }
+    }
+
+    /// Where annotation `d` is: `None` without a `/Rect`.
+    pub(crate) fn rect(&mut self, pdf: &Pdf, d: &Dictionary) -> Option<[f32; 4]> {
+        if let Some(work) = &mut self.work {
+            match pdf.annot_rect(d, work) {
+                Ok(r) => return r,
+                Err(e) => {
+                    self.work = None;
+                    self.spent = Some(e);
+                }
+            }
+        }
+        pdf.rect(d.get(b"Rect").ok()?)
+    }
+
+    /// Refused when any was placed at its own `/Rect` because the budget was spent.
+    pub(crate) fn whole(self) -> Result<(), TooComplex> {
+        self.spent.map_or(Ok(()), Err)
+    }
+}
 
 /// A drawn appearance, before it is put in the file.
 struct Drawing {
@@ -140,6 +210,9 @@ pub(crate) struct BoxGeometry {
     pub text_rgb: Vec<f32>,
     /// Alignment (`/Q`).
     pub q: i64,
+    /// The bytes of `/DA` and `/DS` read, which drawing the box is charged
+    /// ([`Pdf::free_text`]).
+    pub read: usize,
 }
 
 impl BoxGeometry {
@@ -182,19 +255,55 @@ enum Words {
 
 impl Pdf {
     /// Give each of `ids` an appearance (`/AP /N`) drawn from its entries. Annotations
-    /// LimarePDF can't draw are left alone. Returns how many were drawn.
-    pub(crate) fn draw_annotations(&mut self, ids: &[ObjectId]) -> usize {
-        let mut standard: Vec<(FontChoice, ObjectId)> = Vec::new();
-        let mut n = 0;
+    /// LimarePDF can't draw are left alone. Returns how many were drawn; refused, with
+    /// nothing changed, past the budget for drawing them ([`work`]).
+    pub(crate) fn draw_annotations(&mut self, ids: &[ObjectId]) -> Result<usize, TooComplex> {
+        self.draw_within(ids, &mut work())
+    }
+
+    /// [`Pdf::draw_annotations`] within `work`. All are drawn before any is put in the file,
+    /// so a refusal changes nothing.
+    pub(crate) fn draw_within(
+        &mut self,
+        ids: &[ObjectId],
+        work: &mut Work,
+    ) -> Result<usize, TooComplex> {
+        let mut drawn = Vec::new();
         for &id in ids {
-            let Some(d) = self
-                .doc
-                .get_dictionary(id)
-                .ok()
-                .and_then(|a| self.annotation_drawing(a))
-            else {
+            let Ok(a) = self.doc.get_dictionary(id) else {
                 continue;
             };
+            if let Some(d) = self.annotation_drawing(a, work)? {
+                drawn.push((id, d));
+            }
+        }
+        Ok(self.put_drawings(drawn))
+    }
+
+    /// [`Pdf::draw_annotations`] for showing the document: those past the budget are left
+    /// without a drawing, as other readers show them, rather than none shown. Returns how
+    /// many were drawn.
+    pub(crate) fn draw_shown(&mut self, ids: &[ObjectId]) -> usize {
+        let mut work = work();
+        let mut drawn = Vec::new();
+        for &id in ids {
+            let Ok(a) = self.doc.get_dictionary(id) else {
+                continue;
+            };
+            match self.annotation_drawing(a, &mut work) {
+                Ok(Some(d)) => drawn.push((id, d)),
+                Ok(None) => {}
+                Err(_) => break,
+            }
+        }
+        self.put_drawings(drawn)
+    }
+
+    /// Puts `drawn` in the file, each as its annotation's drawing. Returns how many were put.
+    fn put_drawings(&mut self, drawn: Vec<(ObjectId, Drawing)>) -> usize {
+        let mut standard: Vec<(FontChoice, ObjectId)> = Vec::new();
+        let mut n = 0;
+        for (id, d) in drawn {
             let mut res = Dictionary::new();
             let mut content = d.content;
             if let Some(t) = d.text {
@@ -232,22 +341,29 @@ impl Pdf {
     /// The characters of a text box's text that its font (Helvetica, or its embedded face)
     /// can't write, when it has any: drawn, they would show as `?`. LimarePDF's own text
     /// boxes never have them ([`Pdf::add_text_box`]); one another app wrote can. `None`
-    /// for other annotations.
-    pub(crate) fn box_unwritable(&self, id: ObjectId) -> Option<String> {
-        let d = self.doc.get_dictionary(id).ok()?;
-        if d.get(b"Subtype").and_then(Object::as_name).ok()? != b"FreeText" {
-            return None;
+    /// for other annotations. The text is charged to `work`, as drawing it is.
+    pub(crate) fn box_unwritable(
+        &self,
+        id: ObjectId,
+        work: &mut Work,
+    ) -> Result<Option<String>, TooComplex> {
+        let Ok(d) = self.doc.get_dictionary(id) else {
+            return Ok(None);
+        };
+        if d.get(b"Subtype").and_then(Object::as_name).ok() != Some(b"FreeText") {
+            return Ok(None);
         }
         let text = self.box_text(d);
+        work.take(text.len() as u64)?;
         let text: String = text.chars().filter(|c| !c.is_control()).collect();
-        Some(embed::unwritable(FontChoice::default(), &text)).filter(|m| !m.is_empty())
+        Ok(Some(embed::unwritable(FontChoice::default(), &text)).filter(|m| !m.is_empty()))
     }
 
     /// Refuses, naming the characters, to draw again a text box another app wrote whose
     /// text its font can't write ([`Pdf::box_unwritable`]), rather than draw them as `?`
     /// (BUG-39). Its own drawing stays.
-    pub(crate) fn check_box_drawable(&self, id: ObjectId) -> Result<()> {
-        match self.box_unwritable(id) {
+    pub(crate) fn check_box_drawable(&self, id: ObjectId) -> crate::Result<()> {
+        match self.box_unwritable(id, &mut work())? {
             Some(missing) => bail!(
                 "LimarePDF can't draw this text box again: {}",
                 embed::box_refusal(&missing)
@@ -329,28 +445,44 @@ impl Pdf {
 
     /// Where annotation `d` is on the page: its `/Rect`, or for one placed by its points whose
     /// `/Rect` has no area, the box around what LimarePDF draws for it, which drawing it
-    /// gives it as its `/Rect` (PB-114). `None` without a `/Rect`.
-    pub(crate) fn annot_rect(&self, d: &Dictionary) -> Option<[f32; 4]> {
-        let rect = self.rect(d.get(b"Rect").ok()?)?;
+    /// gives it as its `/Rect` (PB-114), drawn within `work`. `None` without a `/Rect`.
+    pub(crate) fn annot_rect(
+        &self,
+        d: &Dictionary,
+        work: &mut Work,
+    ) -> Result<Option<[f32; 4]>, TooComplex> {
+        let Some(rect) = d.get(b"Rect").ok().and_then(|o| self.rect(o)) else {
+            return Ok(None);
+        };
         let sub = d.get(b"Subtype").and_then(|o| o.as_name()).unwrap_or(b"");
         if !no_area(rect) || !BY_POINTS.contains(&sub) {
-            return Some(rect);
+            return Ok(Some(rect));
         }
-        let drawn = self.annotation_drawing(d).and_then(|a| a.rect);
-        Some(drawn.unwrap_or(rect))
+        let drawn = self.annotation_drawing(d, work)?.and_then(|a| a.rect);
+        Ok(Some(drawn.unwrap_or(rect)))
     }
 
-    /// The appearance for annotation `d`, or `None` for a type LimarePDF doesn't draw.
-    fn annotation_drawing(&self, d: &Dictionary) -> Option<Drawing> {
-        let rect = self.rect(d.get(b"Rect").ok()?)?;
-        let sub = d.get(b"Subtype").ok()?.as_name().ok()?;
+    /// The appearance for annotation `d`, or `None` for a type LimarePDF doesn't draw,
+    /// charged to `work`: refused past it.
+    fn annotation_drawing(
+        &self,
+        d: &Dictionary,
+        work: &mut Work,
+    ) -> Result<Option<Drawing>, TooComplex> {
+        work.take(EACH)?;
+        let Some(rect) = d.get(b"Rect").ok().and_then(|o| self.rect(o)) else {
+            return Ok(None);
+        };
+        let Ok(sub) = d.get(b"Subtype").and_then(Object::as_name) else {
+            return Ok(None);
+        };
         let has_ap = d
             .get(b"AP")
             .ok()
             .and_then(|o| self.dict_of(o))
             .is_some_and(|ap| ap.has(b"N"));
         if ICONS.contains(&sub) && has_ap {
-            return None;
+            return Ok(None);
         }
         let c = self.colour(d, b"C");
         let ic = self.colour(d, b"IC");
@@ -363,15 +495,19 @@ impl Pdf {
         let line = Pen { c, ic, w: bw, dash };
         let mut ops = Vec::new();
         let mut blend = false;
-        let quads = || -> Vec<[(f32, f32); 4]> {
-            self.points(d.get(b"QuadPoints").ok())
+        let corners = |work: &mut Work| -> Result<Vec<[(f32, f32); 4]>, TooComplex> {
+            Ok(self
+                .points_charged(d.get(b"QuadPoints").ok(), MAX_POINTS, work)?
                 .filter(|p| p.len() >= 4)
-                .map(|p| p.as_chunks::<4>().0.iter().map(orient).collect())
-                .unwrap_or_else(|| vec![orient(&rect_corners(rect))])
+                .map(|p| p.as_chunks::<4>().0.to_vec())
+                .unwrap_or_else(|| vec![rect_corners(rect)]))
+        };
+        let quads = |work: &mut Work| -> Result<Vec<[(f32, f32); 4]>, TooComplex> {
+            Ok(corners(work)?.iter().map(orient).collect())
         };
         match sub {
             b"Highlight" | b"Underline" | b"StrikeOut" | b"Squiggly" => {
-                let quads = quads();
+                let quads = quads(work)?;
                 let default = if sub == b"Highlight" {
                     [1.0, 1.0, 0.0]
                 } else {
@@ -385,7 +521,7 @@ impl Pdf {
             // drawn; a link's other borders are left to the viewer.
             b"Link" if self.link_underlined(d) => {
                 let c = line.c.unwrap_or_else(|| LINK_BLUE.to_vec());
-                markup(&mut ops, b"Underline", &quads(), &c);
+                markup(&mut ops, b"Underline", &quads(work)?, &c);
             }
             b"Square" | b"Circle" => {
                 let r = self.inner(d, rect);
@@ -415,7 +551,12 @@ impl Pdf {
                 }
             }
             b"Line" => {
-                let p = self.points(d.get(b"L").ok()).filter(|p| p.len() >= 2)?;
+                let Some(p) = self
+                    .points_upto(d.get(b"L").ok(), 2)
+                    .filter(|p| p.len() == 2)
+                else {
+                    return Ok(None);
+                };
                 let ends = self.line_ends(d);
                 let get = |k: &[u8]| d.get(k).ok().and_then(|o| self.num(o)).unwrap_or(0.0);
                 let ll = get(b"LL");
@@ -452,9 +593,12 @@ impl Pdf {
                 }
             }
             b"Polygon" | b"PolyLine" => {
-                let p = self
-                    .points(d.get(b"Vertices").ok())
-                    .filter(|p| !p.is_empty())?;
+                let Some(p) = self
+                    .points_charged(d.get(b"Vertices").ok(), MAX_POINTS, work)?
+                    .filter(|p| !p.is_empty())
+                else {
+                    return Ok(None);
+                };
                 let closed = sub == b"Polygon";
                 match self.cloud_radius(d) {
                     Some(c) if closed && p.len() >= 3 => cloud_path(&mut ops, &p, c),
@@ -468,11 +612,14 @@ impl Pdf {
                 line.paint(&mut ops, closed);
             }
             b"Ink" => {
-                let list = d
+                let Some(list) = d
                     .get(b"InkList")
                     .ok()
                     .and_then(|o| self.doc.dereference(o).ok())
-                    .and_then(|(_, o)| o.as_array().ok())?;
+                    .and_then(|(_, o)| o.as_array().ok())
+                else {
+                    return Ok(None);
+                };
                 ops.push(op("J", vec![1.into()]));
                 ops.push(op("j", vec![1.into()]));
                 // The strokes share the points, so one listed many times is read and drawn
@@ -482,7 +629,9 @@ impl Pdf {
                     if left == 0 {
                         break;
                     }
-                    if let Some(p) = self.points_upto(Some(s), left).filter(|p| !p.is_empty()) {
+                    work.take(1)?;
+                    let p = self.points_charged(Some(s), left, work)?;
+                    if let Some(p) = p.filter(|p| !p.is_empty()) {
                         left -= p.len();
                         polyline(&mut ops, &p);
                         if p.len() == 1 {
@@ -494,11 +643,7 @@ impl Pdf {
             }
             b"Redact" => {
                 // A red outline around each marked area.
-                let quads = self
-                    .points(d.get(b"QuadPoints").ok())
-                    .filter(|p| p.len() >= 4)
-                    .map(|p| p.as_chunks::<4>().0.to_vec())
-                    .unwrap_or_else(|| vec![rect_corners(rect)]);
+                let quads = corners(work)?;
                 let c = line.c.clone().unwrap_or_else(|| REDACT_COLOR.to_vec());
                 ops.extend(stroke_color(&c));
                 ops.push(op("w", nums(&[REDACT_LINE])));
@@ -513,8 +658,13 @@ impl Pdf {
                 ops.push(op("S", vec![]));
             }
             b"Text" => note(&mut ops, rect, line.c.as_deref(), name(d)),
-            b"FreeText" => return Some(self.free_text(d, rect, alpha)),
-            b"Stamp" => return Some(stamp(rect, name(d), alpha)),
+            b"FreeText" => return self.free_text(d, rect, alpha, work).map(Some),
+            b"Stamp" => {
+                work.take(name(d).len() as u64)?;
+                let s = stamp(rect, name(d), alpha);
+                work.take(s.content.len() as u64)?;
+                return Ok(Some(s));
+            }
             b"Caret" => {
                 let r = self.inner(d, rect);
                 caret(&mut ops, r, line.c.as_deref().unwrap_or(&CARET_COLOR));
@@ -522,20 +672,22 @@ impl Pdf {
             b"FileAttachment" => {
                 attachment(&mut ops, rect, line.c.as_deref(), name(d));
             }
-            _ => return None,
+            _ => return Ok(None),
         }
         // One placed by its points whose `/Rect` has no area, so nothing could be placed in
         // it, gets the box around what it draws as its `/Rect`, where other readers draw it.
         let placed = no_area(rect) && BY_POINTS.contains(&sub);
         let new_rect = placed.then(|| extent(&ops)).flatten();
-        Some(Drawing {
-            content: with_gs(encode(ops), alpha, blend),
+        let content = encode(ops);
+        work.take(content.len() as u64)?;
+        Ok(Some(Drawing {
+            content: with_gs(content, alpha, blend),
             bbox: new_rect.unwrap_or(rect),
             gs: gs_dict(alpha, blend),
             text: None,
             matrix: None,
             rect: new_rect,
-        })
+        }))
     }
 
     /// The bump radius of a cloudy border (`/BE` with style `/C`), when it has one.
@@ -636,6 +788,7 @@ impl Pdf {
                 .ok()
                 .and_then(|o| self.int_value(o))
                 .unwrap_or(0),
+            read: da.len() + style.len(),
         }
     }
 
@@ -666,17 +819,26 @@ impl Pdf {
     /// A text box: its `/Contents` in Helvetica (or its embedded face, and the fonts it falls
     /// back to), with the size and colour from `/DA` (or the `/DS` style string), on the
     /// `/C` background with a border, which may be cloudy. A callout (`/CL`) is a line from
-    /// what the box points at to the box, whose place in `/Rect` `/RD` then gives.
-    fn free_text(&self, d: &Dictionary, rect: [f32; 4], alpha: f32) -> Drawing {
+    /// what the box points at to the box, whose place in `/Rect` `/RD` then gives. Its text,
+    /// `/DA`, `/DS` and what it draws are charged to `work`.
+    fn free_text(
+        &self,
+        d: &Dictionary,
+        rect: [f32; 4],
+        alpha: f32,
+        work: &mut Work,
+    ) -> Result<Drawing, TooComplex> {
         let g = self.box_geometry(d, rect);
+        work.take(g.read as u64)?;
+        let text = self.box_text(d);
+        work.take(SETTING * text.len() as u64)?;
         let bg = self.colour(d, b"C");
         let mut ops = Vec::new();
-        if let Some(p) = self.points(d.get(b"CL").ok()).filter(|p| p.len() >= 2) {
-            let p: Vec<(f32, f32)> = p
-                .iter()
-                .take(3)
-                .map(|&(x, y)| mx::apply(g.to_own, x, y))
-                .collect();
+        if let Some(p) = self
+            .points_upto(d.get(b"CL").ok(), 3)
+            .filter(|p| p.len() >= 2)
+        {
+            let p: Vec<(f32, f32)> = p.iter().map(|&(x, y)| mx::apply(g.to_own, x, y)).collect();
             let pen = Pen {
                 c: Some(g.text_rgb.clone()),
                 ic: self.colour(d, b"IC"),
@@ -706,16 +868,16 @@ impl Pdf {
             };
             pen.paint(&mut ops, true);
         }
+        let mut content = encode(ops);
+        work.take(content.len() as u64)?;
         let look = g.look(bg);
-        let text = self.box_text(d);
         let m = Metrics::Set(self.setter(FontChoice::default(), &text));
         let drawn = form_ap::draw(&look, &Body::Lines(&text), &m);
         let Metrics::Set(setter) = m else {
             unreachable!("made as a setter")
         };
-        let mut content = encode(ops);
         content.extend(format!("\nq 1 0 0 1 {} {} cm\n", tb[0], tb[1]).into_bytes());
-        Drawing {
+        Ok(Drawing {
             content: with_gs(content, alpha, false),
             bbox: [0.0, 0.0, g.w, g.h],
             gs: gs_dict(alpha, false),
@@ -726,18 +888,13 @@ impl Pdf {
             }),
             matrix: g.matrix,
             rect: None,
-        }
+        })
     }
 
     /// A colour entry: 1 (grey), 3 (RGB) or 4 (CMYK) numbers. An empty array means none.
     pub(crate) fn colour(&self, d: &Dictionary, key: &[u8]) -> Option<Vec<f32>> {
-        let (_, o) = self.doc.dereference(d.get(key).ok()?).ok()?;
-        let v: Vec<f32> = o
-            .as_array()
-            .ok()?
-            .iter()
-            .map(|x| self.num(x))
-            .collect::<Option<_>>()?;
+        // A fifth number is enough to know it is none.
+        let v = self.numbers_upto(d.get(key).ok(), 5)?;
         matches!(v.len(), 1 | 3 | 4).then_some(v)
     }
 
@@ -747,14 +904,15 @@ impl Pdf {
             let w = bs.get(b"W").ok().and_then(|o| self.num(o)).unwrap_or(1.0);
             let dashed = bs.get(b"S").and_then(|o| o.as_name()).ok() == Some(b"D");
             let dash = dashed.then(|| {
-                self.numbers(bs.get(b"D").ok())
+                self.numbers_upto(bs.get(b"D").ok(), MAX_DASH)
                     .filter(|v| !v.is_empty() && v.iter().any(|&x| x > 0.0))
                     .unwrap_or_else(|| vec![3.0])
             });
             return (w.max(0.0), dash);
         }
+        // The width is the third number; a dash pattern may follow it.
         let w = self
-            .numbers(d.get(b"Border").ok())
+            .numbers_upto(d.get(b"Border").ok(), 3)
             .and_then(|v| v.get(2).copied())
             .unwrap_or(1.0);
         (w.max(0.0), None)
@@ -762,7 +920,7 @@ impl Pdf {
 
     /// The rectangle less the `/RD` differences, when they leave something.
     fn inner(&self, d: &Dictionary, r: [f32; 4]) -> [f32; 4] {
-        match self.numbers(d.get(b"RD").ok()).as_deref() {
+        match self.numbers_upto(d.get(b"RD").ok(), 4).as_deref() {
             Some(&[l, b, rt, t, ..]) if l + rt < r[2] - r[0] && b + t < r[3] - r[1] => {
                 [r[0] + l, r[1] + b, r[2] - rt, r[3] - t]
             }
@@ -804,15 +962,26 @@ impl Pdf {
             .collect()
     }
 
-    /// An array of numbers as points.
-    fn points(&self, o: Option<&Object>) -> Option<Vec<(f32, f32)>> {
-        self.points_upto(o, MAX_POINTS)
-    }
-
     /// The first `n` points of an array of numbers.
     fn points_upto(&self, o: Option<&Object>, n: usize) -> Option<Vec<(f32, f32)>> {
         let v = self.numbers_upto(o, 2 * n)?;
         Some(v.as_chunks::<2>().0.iter().map(|&[x, y]| (x, y)).collect())
+    }
+
+    /// [`Pdf::points_upto`], charged to `work` a step for each point before it is read:
+    /// annotations can share an array, which each reads again.
+    fn points_charged(
+        &self,
+        o: Option<&Object>,
+        n: usize,
+        work: &mut Work,
+    ) -> Result<Option<Vec<(f32, f32)>>, TooComplex> {
+        let Some((_, o)) = o.and_then(|o| self.doc.dereference(o).ok()) else {
+            return Ok(None);
+        };
+        let len = o.as_array().map_or(0, Vec::len).min(2 * n);
+        work.take(len.div_ceil(2) as u64)?;
+        Ok(self.points_upto(Some(o), n))
     }
 }
 
@@ -1644,7 +1813,22 @@ mod tests {
         let squiggly = dictionary! {
             "Subtype" => "Squiggly", "Rect" => rect(), "QuadPoints" => vec![line; 5].concat(),
         };
-        let drawn = [ink, squiggly].map(|d| points_drawn(&p.annotation_drawing(&d).unwrap()));
+        let drawn = [ink, squiggly]
+            .map(|d| points_drawn(&p.annotation_drawing(&d, &mut work()).unwrap().unwrap()));
         assert_eq!(drawn, [MAX_POINTS; 2]);
+    }
+
+    /// `/Border`'s width is its third number, whether a dash pattern follows it or not: with
+    /// one, it was taken as 1.
+    #[test]
+    fn a_border_s_width_is_read_before_its_dash_pattern() {
+        let p = Pdf::new();
+        let dash = Object::Array(vec![3.into(), 2.into()]);
+        for border in [
+            vec![0.into(), 0.into(), 2.into()],
+            vec![0.into(), 0.into(), 2.into(), dash],
+        ] {
+            assert_eq!(p.border(&dictionary! { "Border" => border }), (2.0, None));
+        }
     }
 }

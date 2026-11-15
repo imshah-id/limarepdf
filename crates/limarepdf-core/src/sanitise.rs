@@ -3,6 +3,7 @@
 //! private application data), and optionally comments, form values, bookmarks and what
 //! lies outside the visible page area.
 
+use crate::annot_ap::Place;
 use crate::budget::{self, TooComplex, Work};
 use crate::fonts::FontCtx;
 use crate::inline::Inline;
@@ -985,9 +986,10 @@ impl Pdf {
     }
 
     /// The annotations removing comments takes (all but redaction marks), or removing
-    /// attached files (those holding one).
+    /// attached files (those holding one). Only what each is matters, so none is drawn to
+    /// place it.
     fn annots_of(&self, h: Hidden) -> HashSet<ObjectId> {
-        (self.every_annotation().into_iter())
+        (self.every_annotation(&mut Place::own()).into_iter())
             .filter(|a| match h {
                 Hidden::Comments => a.kind != crate::AnnotKind::Redact,
                 _ => matches!(&a.kind, crate::AnnotKind::Other(s) if s == "FileAttachment"),

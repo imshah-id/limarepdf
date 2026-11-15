@@ -1,7 +1,9 @@
 //! Reading a page has a budget (S1-06, H-07): a page whose drawings draw each other over and
 //! over is refused quickly with a typed reason, and what relies on reading it (editing,
 //! redacting, search, finding its pictures) says so and changes nothing. A drawing that draws
-//! itself is read once.
+//! itself is read once. Drawing annotations has a budget too: flattening and redacting
+//! annotations too complex to draw are refused, and listing them places those past it at
+//! their own `/Rect`.
 
 mod common;
 
@@ -520,4 +522,176 @@ fn pictures_of_a_page_drawing_forms_over_and_over_are_refused_at_once() {
         "{:?}",
         start.elapsed()
     );
+}
+
+/// Adds `d` to the end of page 1's annotations.
+fn annotate(p: &mut Pdf, d: Dictionary) -> ObjectId {
+    let id = p.doc.add_object(d);
+    let page = p.page_ids()[0];
+    let pd = p.doc.get_dictionary_mut(page).unwrap();
+    let mut list = (pd.get(b"Annots")).map_or(Vec::new(), |a| a.as_array().unwrap().clone());
+    list.push(id.into());
+    pd.set("Annots", list);
+    id
+}
+
+/// `n` freehand drawings on page 1 of `p`, without drawings of their own, sharing one
+/// 10,000-point stroke zigzagging from (100, 200) to (299, 250). Their `/Rect` has no area
+/// (at 100, 200), so each is placed where it is drawn (PB-114).
+fn shared_strokes(p: &mut Pdf, n: usize) -> Vec<ObjectId> {
+    let stroke: Vec<Object> = (0..10_000i64)
+        .flat_map(|i| [100 + i % 200, 200 + i % 2 * 50].map(Object::from))
+        .collect();
+    let stroke = p.doc.add_object(stroke);
+    let rect = [100i64, 200, 100, 200].map(Object::from).to_vec();
+    (0..n)
+        .map(|_| {
+            let d = dictionary! {
+                "Type" => "Annot", "Subtype" => "Ink", "Rect" => rect.clone(),
+                "InkList" => vec![Object::Reference(stroke)], "C" => vec![Object::from(0i64)],
+            };
+            annotate(p, d)
+        })
+        .collect()
+}
+
+/// Drawing annotations has a budget (WP-04 step 5): 20 drawings sharing one 10,000-point
+/// stroke draw it 20 times, and flattening them past the budget is refused, with nothing
+/// changed; within it, they are drawn. Each was drawn, however many shared the stroke.
+#[test]
+fn annotations_too_complex_to_draw_aren_t_flattened() {
+    use limarepdf_core::{budget_seam, TooComplex};
+    let mut p = zebras(1);
+    shared_strokes(&mut p, 20);
+    common::seeds::pdf(&p);
+    let before = p.state_before();
+    let (e, _) = budget_seam::with_limit(100_000, || p.flatten_annotations(None));
+    let e = e.expect_err("refused");
+    let too = e.downcast_ref::<TooComplex>().expect("too complex");
+    assert_eq!(too.what, "drawing the annotations", "{e:#}");
+    assert_eq!(p.state_since(&before), []);
+    let (done, _) = budget_seam::with_limit(4_000_000, || p.flatten_annotations(None));
+    assert_eq!(done.unwrap().drawn, 20);
+}
+
+/// Listing annotations draws those placed where they are drawn (PB-114) within one budget,
+/// and lists those past it at their own `/Rect` rather than leave them out: the first are
+/// placed where they are drawn, the rest at (100, 200), 592 down the page.
+#[test]
+fn annotations_past_the_drawing_budget_are_listed_at_their_own_box() {
+    use limarepdf_core::{budget_seam, Annot};
+    let mut p = zebras(1);
+    shared_strokes(&mut p, 20);
+    let own = |a: &Annot| a.bbox == [100.0, 592.0, 100.0, 592.0];
+    for limit in [u64::MAX, 500_000] {
+        let (all, _) = budget_seam::with_limit(limit, || p.annotations());
+        let (page, _) = budget_seam::with_limit(limit, || p.page_annotations(0).unwrap());
+        for listed in [all, page] {
+            assert_eq!(listed.len(), 20);
+            let drawn = listed.iter().take_while(|a| !own(a)).count();
+            assert!(listed[drawn..].iter().all(own), "{limit}");
+            if limit == u64::MAX {
+                assert_eq!(drawn, 20);
+            } else {
+                assert!((1..20).contains(&drawn), "{drawn} drawn within {limit}");
+            }
+        }
+    }
+}
+
+/// A text box's text is charged to drawing it: 20 text boxes sharing one 20,004-character
+/// text set it 20 times, and flattening them past the budget is refused, with nothing
+/// changed. Each was set, however many shared the text.
+#[test]
+fn text_boxes_sharing_a_long_text_are_charged_it_each() {
+    use limarepdf_core::{budget_seam, TooComplex};
+    let mut p = zebras(1);
+    let text = p
+        .doc
+        .add_object(Object::string_literal("zebra ".repeat(3_334)));
+    let rect = [72i64, 400, 300, 500].map(Object::from).to_vec();
+    for _ in 0..20 {
+        let d = dictionary! {
+            "Type" => "Annot", "Subtype" => "FreeText", "Rect" => rect.clone(),
+            "Contents" => text, "DA" => Object::string_literal("/Helv 12 Tf 0 g"),
+        };
+        annotate(&mut p, d);
+    }
+    let before = p.state_before();
+    let (e, _) = budget_seam::with_limit(200_000, || p.flatten_annotations(None));
+    let e = e.expect_err("refused");
+    let too = e.downcast_ref::<TooComplex>().expect("too complex");
+    assert_eq!(too.what, "drawing the annotations", "{e:#}");
+    assert_eq!(p.state_since(&before), []);
+    let (done, _) = budget_seam::with_limit(2_000_000, || p.flatten_annotations(None));
+    assert_eq!(done.unwrap().drawn, 20);
+}
+
+/// How many annotations of the one-page `bytes` have a drawing.
+fn with_drawings(bytes: &[u8]) -> usize {
+    let p = Pdf::from_bytes(bytes, None).unwrap();
+    let page = p.doc.get_dictionary(p.page_ids()[0]).unwrap();
+    let list = page.get(b"Annots").and_then(Object::as_array).unwrap();
+    let drawn = |id| p.doc.get_dictionary(id).unwrap().has(b"AP");
+    (list.iter())
+        .filter(|a| drawn(a.as_reference().unwrap()))
+        .count()
+}
+
+/// Showing a document draws the annotations without drawings of their own within the
+/// budget and leaves those past it without one, as other readers show them, rather than
+/// not show it: the app's pages, and the page under text being edited, draw the first
+/// and not the rest.
+#[test]
+fn a_document_with_annotations_past_the_drawing_budget_is_still_shown() {
+    use limarepdf_core::budget_seam;
+    let mut p = zebras(1);
+    shared_strokes(&mut p, 20);
+    for limit in [u64::MAX, 500_000] {
+        let (app, _) = budget_seam::with_limit(limit, || p.app_snapshot());
+        let (page, _) = budget_seam::with_limit(limit, || p.page_without(0, &[]));
+        for shown in [app, page] {
+            let drawn = with_drawings(&shown.unwrap());
+            if limit == u64::MAX {
+                assert_eq!(drawn, 20);
+            } else {
+                assert!((1..20).contains(&drawn), "{drawn} drawn within {limit}");
+            }
+        }
+    }
+}
+
+/// Redacting draws the annotations placed where they are drawn (PB-114) to find those the
+/// marks cover, within the budget; past it the redaction is refused, with nothing changed,
+/// rather than miss one.
+#[test]
+fn a_redaction_over_annotations_too_complex_to_draw_changes_nothing() {
+    use limarepdf_core::{budget_seam, TooComplex};
+    let mut p = zebras(1);
+    shared_strokes(&mut p, 20);
+    let before = p.state_before();
+    let mark = [(0, [150.0, 500.0, 160.0, 600.0])];
+    let (e, _) = budget_seam::with_limit(100_000, || p.redact(&mark));
+    let e = e.expect_err("refused");
+    let too = e.downcast_ref::<TooComplex>().expect("too complex");
+    assert_eq!(too.what, "drawing the annotations", "{e:#}");
+    assert_eq!(p.state_since(&before), []);
+    let (done, _) = budget_seam::with_limit(4_000_000, || p.redact(&mark));
+    assert_eq!(done.unwrap().pages[0].annots, 20);
+}
+
+/// An annotation placed where it is drawn (PB-114) is moved from there; past the budget
+/// moving it is refused, with nothing changed.
+#[test]
+fn moving_an_annotation_too_complex_to_draw_is_refused() {
+    use limarepdf_core::{budget_seam, TooComplex};
+    let mut p = zebras(1);
+    let id = shared_strokes(&mut p, 1)[0];
+    let before = p.state_before();
+    let to = [10.0, 10.0, 50.0, 50.0];
+    let (e, _) = budget_seam::with_limit(1_000, || p.move_annotation(0, id, to));
+    let e = e.expect_err("refused");
+    let too = e.downcast_ref::<TooComplex>().expect("too complex");
+    assert_eq!(too.what, "drawing the annotations", "{e:#}");
+    assert_eq!(p.state_since(&before), []);
 }

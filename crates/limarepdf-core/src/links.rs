@@ -8,6 +8,7 @@
 //! [`LinkTarget::Unfollowed`], so it can be shown, removed or pointed elsewhere; it is
 //! never followed.
 
+use crate::annot_ap::Place;
 use crate::doc::decode_text;
 use crate::form_ap::nums;
 use crate::matrix as mx;
@@ -194,6 +195,7 @@ impl Pdf {
         };
         let pages = self.page_index();
         let count = pages.len();
+        let mut place = Place::drawn();
         let mut out = Vec::new();
         for (at, a) in annots.iter().enumerate().take(MAX_LINKS) {
             let id = match a.as_reference() {
@@ -214,7 +216,7 @@ impl Pdf {
             if a.get(b"Subtype").and_then(|o| o.as_name()).ok() != Some(b"Link") {
                 continue;
             }
-            let Some(rect) = self.annot_rect(a) else {
+            let Some(rect) = place.rect(self, a) else {
                 continue;
             };
             let bbox = mx::transform_rect(to_vis, rect);
@@ -525,7 +527,7 @@ impl Pdf {
     /// drawing away from one that isn't, so nothing shows.
     fn draw_link(&mut self, id: ObjectId, underline: bool) -> Result<()> {
         if underline {
-            self.draw_annotations(&[id]);
+            self.draw_annotations(&[id])?;
         } else {
             self.doc.get_dictionary_mut(id)?.remove(b"AP");
         }

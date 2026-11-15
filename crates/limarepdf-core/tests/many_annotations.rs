@@ -514,9 +514,9 @@ fn flattening_looks_once_at_a_kept_mark_listed_many_times() {
     common::seeds::pdf(&p);
 
     let (done, taken) = budget_seam::with_limit(u64::MAX, || p.flatten_annotations(None));
-    // The check before anything changes, then the page's own walk.
+    // The check before anything changes, nothing to draw, then the page's own walk.
     let steps = 1 + 2 * K as u64;
-    assert_eq!(taken, [steps, steps]);
+    assert_eq!(taken, [steps, 0, steps]);
     let done = done.unwrap();
     assert_eq!((done.drawn, done.kept), (0, vec![0; N]));
     let s = Saved::of(&mut p);
@@ -563,7 +563,7 @@ fn flattening_looks_once_at_a_reply_listed_many_times() {
 
     let (done, taken) = budget_seam::with_limit(u64::MAX, || p.flatten_annotations(None));
     let steps = 5 + 2 * (K + J) as u64;
-    assert_eq!(taken, [steps, steps]);
+    assert_eq!(taken, [steps, 0, steps]);
     let done = done.unwrap();
     assert_eq!((done.drawn, done.kept), (0, vec![0]));
     let s = Saved::of(&mut p);
@@ -606,7 +606,8 @@ fn three_pages() -> Pdf {
 
 /// A-06: the walk is charged before anything changes, for every page being flattened, so
 /// running out anywhere, on page 3 too, refuses with nothing changed: page 1's comment not
-/// given a drawing, pages 1 and 2 not flattened. With exactly the steps the walk takes,
+/// given a drawing, pages 1 and 2 not flattened. Drawing the comment is charged to its own
+/// budget, after the walk, and refuses as nothing changed too. With the steps each takes,
 /// every page is flattened, and each page's own walk then takes no more.
 #[test]
 fn flattening_too_complex_on_a_later_page_changes_nothing() {
@@ -631,10 +632,21 @@ fn flattening_too_complex_on_a_later_page_changes_nothing() {
         assert_eq!(taken, [limit]);
     }
 
-    let (got, taken) = budget_seam::with_limit(needed, || p.flatten_annotations(None));
+    // What drawing the comment takes.
+    let (_, taken) = budget_seam::with_limit(u64::MAX, || three_pages().flatten_annotations(None));
+    let drawing = taken[1];
+    assert!(drawing > needed, "{taken:?}");
+    let (got, taken) = budget_seam::with_limit(drawing - 1, || p.flatten_annotations(None));
+    let e = got.map(|d| (d.drawn, d.kept)).unwrap_err();
+    let too = e.downcast_ref::<TooComplex>().expect("too complex");
+    assert_eq!(too.what, "drawing the annotations", "{e:#}");
+    assert_eq!(p.state_since(&before), []);
+    assert_eq!((taken.len(), taken[0]), (2, needed));
+
+    let (got, taken) = budget_seam::with_limit(drawing, || p.flatten_annotations(None));
     let done = got.unwrap();
     // Page 1's comment has its drawing by then: its walk is the kept mark's alone.
-    assert_eq!(taken, [needed, 3, 0, 21]);
+    assert_eq!(taken, [needed, drawing, 3, 0, 21]);
     assert_eq!((done.drawn, done.kept), (3, vec![0, 2]));
 
     // The control: with the usual budget, the same.

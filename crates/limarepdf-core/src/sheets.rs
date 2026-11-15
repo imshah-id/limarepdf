@@ -537,7 +537,7 @@ impl Pdf {
         out.flatten_form_for_print()?;
         let ids = out.page_ids();
         let missing = out.missing_appearances(&ids);
-        out.draw_annotations(&missing);
+        out.draw_annotations(&missing)?;
         let mut drawings = Vec::with_capacity(ids.len());
         for &page in &ids {
             out.flatten_page(

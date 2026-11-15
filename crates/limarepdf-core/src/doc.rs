@@ -516,7 +516,8 @@ impl Pdf {
     /// A snapshot in which annotations whose subtype `hide` picks, and those in a layer
     /// that's off (which the renderer would draw, PB-181), are marked Hidden, and
     /// annotations without a drawing get LimarePDF's (the document itself keeps
-    /// none). In a signed document, or in any with `all_fields`, form fields are drawn this
+    /// none) as far as its budget goes, the rest shown without, as other readers show them
+    /// ([`Pdf::draw_shown`]). In a signed document, or in any with `all_fields`, form fields are drawn this
     /// way too, as [`Pdf::refresh_appearances`] would draw them (every field with
     /// `all_fields`, those LimarePDF lists for the app's): the app doesn't draw a signed
     /// document's fields into it when opening it, so that saving adds only the edits made to
@@ -547,7 +548,7 @@ impl Pdf {
         if fields {
             copy.refresh_reaching(reach);
         }
-        copy.draw_annotations(&missing);
+        copy.draw_shown(&missing);
         copy.mark_hidden(ids);
         let mut out = Vec::new();
         copy.doc.save_to(&mut out)?;

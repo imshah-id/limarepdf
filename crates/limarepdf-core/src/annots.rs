@@ -2,7 +2,7 @@
 //! flattening them into the page content. Links, form widgets and popups have their own
 //! code and are not listed here.
 
-use crate::annot_ap::{drawable, DRAWN};
+use crate::annot_ap::{self, drawable, Place, DRAWN};
 use crate::doc::decode_text;
 use crate::form_flatten::{self, Flat};
 use crate::form_write::parse_da;
@@ -278,55 +278,61 @@ impl Annot {
 }
 
 impl Pdf {
-    /// The annotations on every page, page by page in the file's order.
+    /// The annotations on every page, page by page in the file's order. Those placed where
+    /// they are drawn (PB-114) are drawn within one budget ([`crate::TooComplex`]); past it,
+    /// each is placed at its own `/Rect`.
     pub fn annotations(&self) -> Vec<Annot> {
-        let ids = self.page_ids();
-        let mut layers = self.layers_off();
-        (0..ids.len())
-            .flat_map(|i| {
-                self.annotations_in(i, ids[i], self.annot_refs(ids[i]), &mut layers)
-                    .unwrap_or_default()
-            })
-            .collect()
+        self.every_annotation_in(&mut Place::drawn(), |p, page| p.annot_refs(page))
     }
 
     /// The annotations on one page (zero-based), in the file's order (the order they are
-    /// drawn in).
+    /// drawn in), placed as [`Pdf::annotations`] places them.
     pub fn page_annotations(&self, page_index: usize) -> Result<Vec<Annot>> {
         let page = self.page_id_at(page_index)?;
         let mut layers = self.layers_off();
-        self.annotations_in(page_index, page, self.annot_refs(page), &mut layers)
+        let refs = self.annot_refs(page);
+        self.annotations_in(page_index, page, refs, &mut layers, &mut Place::drawn())
     }
 
-    /// Every annotation on every page, without [`Pdf::annot_refs`]'s limit: for removing
-    /// information, where one left out could keep what should go.
-    pub(crate) fn every_annotation(&self) -> Vec<Annot> {
+    /// Every annotation on every page, without [`Pdf::annot_refs`]'s limit, placed by
+    /// `place`: for removing information, where one left out could keep what should go.
+    pub(crate) fn every_annotation(&self, place: &mut Place) -> Vec<Annot> {
+        self.every_annotation_in(place, |p, page| p.all_annot_refs(page))
+    }
+
+    /// The annotations `refs` gives for each page, on every page, placed by `place`.
+    fn every_annotation_in(
+        &self,
+        place: &mut Place,
+        refs: impl Fn(&Pdf, ObjectId) -> Vec<ObjectId>,
+    ) -> Vec<Annot> {
         let ids = self.page_ids();
         let mut layers = self.layers_off();
         (0..ids.len())
             .flat_map(|i| {
-                self.annotations_in(i, ids[i], self.all_annot_refs(ids[i]), &mut layers)
+                self.annotations_in(i, ids[i], refs(self, ids[i]), &mut layers, place)
                     .unwrap_or_default()
             })
             .collect()
     }
 
-    /// The annotations `refs` of page `page`, number `page_index` (zero-based), and whether
-    /// each is in a layer `layers` hide. The page is given, not looked up by number: listing
-    /// every page's annotations would otherwise go through the page tree once a page
-    /// (ENH-35: 63 ms on 300 pages).
+    /// The annotations `refs` of page `page`, number `page_index` (zero-based), placed by
+    /// `place`, and whether each is in a layer `layers` hide. The page is given, not looked
+    /// up by number: listing every page's annotations would otherwise go through the page
+    /// tree once a page (ENH-35: 63 ms on 300 pages).
     fn annotations_in(
         &self,
         page_index: usize,
         page: ObjectId,
         refs: Vec<ObjectId>,
         layers: &mut Option<Layers>,
+        place: &mut Place,
     ) -> Result<Vec<Annot>> {
         let (vd, _, _) = self.vis_down(page);
         let to_vis = mx::inv(vd).ok_or_else(|| anyhow!("degenerate page transform"))?;
         Ok(refs
             .into_iter()
-            .filter_map(|id| self.annot(id, page_index, to_vis, layers))
+            .filter_map(|id| self.annot(id, page_index, to_vis, layers, place))
             .collect())
     }
 
@@ -384,12 +390,12 @@ impl Pdf {
 
     /// Remove the annotations `pick` chooses, with the replies to them and their popups.
     /// Locked ones are removed too; the app checks [`Annot::locked`] first. Every
-    /// annotation is offered to `pick`, not only those shown. Returns how many were
-    /// removed, replies included.
+    /// annotation is offered to `pick`, not only those shown, each at its own `/Rect`:
+    /// none is drawn to place it. Returns how many were removed, replies included.
     pub fn remove_annotations(&mut self, pick: impl Fn(&Annot) -> bool) -> Result<usize> {
         self.own_direct_annots()?;
         let gone = self
-            .every_annotation()
+            .every_annotation(&mut Place::own())
             .iter()
             .filter(|a| pick(a))
             .map(|a| a.id)
@@ -409,12 +415,21 @@ impl Pdf {
         &mut self,
         mut gone: HashSet<ObjectId>,
     ) -> Result<(usize, HashSet<ObjectId>)> {
-        let all = self.every_annotation();
+        // Each reply on every page and what it replies to (`/IRT`), from the kinds listed
+        // ([`AnnotKind::of`]), without placing or reading any more of them.
+        let replies: Vec<(ObjectId, ObjectId)> = (self.page_ids().into_iter())
+            .flat_map(|page| self.all_annot_refs(page))
+            .filter_map(|id| {
+                let d = self.doc.get_dictionary(id).ok()?;
+                AnnotKind::of(d.get(b"Subtype").ok()?.as_name().ok()?)?;
+                Some((id, d.get(b"IRT").and_then(Object::as_reference).ok()?))
+            })
+            .collect();
         loop {
             let before = gone.len();
-            for a in &all {
-                if a.reply_to.is_some_and(|r| gone.contains(&r)) {
-                    gone.insert(a.id);
+            for &(id, to) in &replies {
+                if gone.contains(&to) {
+                    gone.insert(id);
                 }
             }
             if gone.len() == before {
@@ -459,21 +474,13 @@ impl Pdf {
     /// text box whose text its font can't write ([`Pdf::box_unwritable`]), rather than draw
     /// `?` into the page for good (BUG-39), and when finding those popups and replies is too
     /// complex ([`crate::TooComplex`]): each is looked at once, however often a page lists
-    /// it, within one budget for all the pages (A-06).
+    /// it, within one budget for all the pages (A-06). Refused too when drawing those without
+    /// a drawing is too complex: within one budget, each is charged what it draws, however
+    /// many share its points or text.
     pub fn flatten_annotations(&mut self, pages: Option<&[usize]>) -> Result<Flattened> {
         let ids = self.page_ids();
         let pages = self.page_list(pages)?;
         let on: Vec<ObjectId> = pages.iter().map(|&i| ids[i]).collect();
-        for (&i, &page) in pages.iter().zip(&on) {
-            let missing = self.missing_appearances(&[page]).into_iter();
-            if let Some(chars) = missing.filter_map(|id| self.box_unwritable(id)).next() {
-                bail!(
-                    "LimarePDF can't draw the text box on page {}: {}; nothing was flattened",
-                    i + 1,
-                    crate::embed::box_refusal(&chars)
-                );
-            }
-        }
         // What goes with the annotations kept, found on every page before anything is
         // changed, with one budget: each page's walk below finds no more.
         {
@@ -484,17 +491,33 @@ impl Pdf {
                 }
             }
         }
-        // File attachments stay annotations, so they keep having no drawing.
-        let missing: Vec<ObjectId> = self
-            .missing_appearances(&on)
-            .into_iter()
-            .filter(|&id| {
-                self.doc.get_dictionary(id).is_ok_and(|d| {
-                    d.get(b"Subtype").and_then(|o| o.as_name()).ok() != Some(b"FileAttachment")
+        // Those without a drawing are drawn, with one budget, before any is put in the file.
+        {
+            let mut work = annot_ap::work();
+            for (&i, &page) in pages.iter().zip(&on) {
+                for id in self.missing_appearances(&[page]) {
+                    if let Some(chars) = self.box_unwritable(id, &mut work)? {
+                        bail!(
+                            "LimarePDF can't draw the text box on page {}: {}; nothing was \
+                             flattened",
+                            i + 1,
+                            crate::embed::box_refusal(&chars)
+                        );
+                    }
+                }
+            }
+            // File attachments stay annotations, so they keep having no drawing.
+            let missing: Vec<ObjectId> = self
+                .missing_appearances(&on)
+                .into_iter()
+                .filter(|&id| {
+                    self.doc.get_dictionary(id).is_ok_and(|d| {
+                        d.get(b"Subtype").and_then(|o| o.as_name()).ok() != Some(b"FileAttachment")
+                    })
                 })
-            })
-            .collect();
-        self.draw_annotations(&missing);
+                .collect();
+            self.draw_within(&missing, &mut work)?;
+        }
         let mut done = Flattened::default();
         for (&i, page) in pages.iter().zip(on) {
             let mut unplaced = Vec::new();
@@ -599,10 +622,11 @@ impl Pdf {
         page: usize,
         to_vis: mx::M,
         layers: &mut Option<Layers>,
+        place: &mut Place,
     ) -> Option<Annot> {
         let d = self.doc.get_dictionary(id).ok()?;
         let kind = AnnotKind::of(d.get(b"Subtype").ok()?.as_name().ok()?)?;
-        let rect = self.annot_rect(d)?;
+        let rect = place.rect(self, d)?;
         let text = |key: &[u8]| {
             d.get(key)
                 .ok()

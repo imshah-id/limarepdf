@@ -3,7 +3,7 @@
 //! comment, and its place on the page. Each gets a drawing of its own straight away, so
 //! other viewers show it as LimarePDF does.
 
-use crate::annot_ap::{arrow_size, DRAWN, NOTE_SIZE};
+use crate::annot_ap::{self, arrow_size, DRAWN, NOTE_SIZE};
 use crate::annots::NO_VIEW;
 use crate::doc::encode_text;
 use crate::embed::check_writable;
@@ -290,12 +290,14 @@ impl Pdf {
         let mut list = self.strokes(d);
         list.push(new);
         let pad = ink_pad(self.border(d).0);
-        let d = self.doc.get_dictionary_mut(id)?;
-        d.set("InkList", ink_list(&list));
-        d.set("Rect", nums(&points_rect(&list, pad)));
-        d.set("M", Object::string_literal(pdf_now()));
-        self.draw_annotations(&[id]);
-        Ok(())
+        self.atomically(|p| {
+            let d = p.doc.get_dictionary_mut(id)?;
+            d.set("InkList", ink_list(&list));
+            d.set("Rect", nums(&points_rect(&list, pad)));
+            d.set("M", Object::string_literal(pdf_now()));
+            p.draw_annotations(&[id])?;
+            Ok(())
+        })
     }
 
     /// Set a rectangle's, ellipse's, line's or drawing's line width, fill and arrowhead,
@@ -313,14 +315,16 @@ impl Pdf {
             b"Ink" => Some(points_rect(&self.strokes(d), ink_pad(look.width))),
             _ => bail!("not a shape, line or drawing"),
         };
-        let d = self.doc.get_dictionary_mut(id)?;
-        shape_entries(d, look, look.arrow != had_arrow);
-        if let Some(r) = rect.filter(|r| r[2] > r[0] && r[3] > r[1]) {
-            d.set("Rect", nums(&r));
-        }
-        d.set("M", Object::string_literal(pdf_now()));
-        self.draw_annotations(&[id]);
-        Ok(())
+        self.atomically(|p| {
+            let d = p.doc.get_dictionary_mut(id)?;
+            shape_entries(d, look, look.arrow != had_arrow);
+            if let Some(r) = rect.filter(|r| r[2] > r[0] && r[3] > r[1]) {
+                d.set("Rect", nums(&r));
+            }
+            d.set("M", Object::string_literal(pdf_now()));
+            p.draw_annotations(&[id])?;
+            Ok(())
+        })
     }
 
     /// Answer the annotation `to` with a comment (`/IRT`). The reply is listed with what
@@ -367,12 +371,14 @@ impl Pdf {
         let width = self.border(d).0;
         let arrow = self.line_ends(d).iter().any(|e| e.as_slice() != b"None");
         let l = [a.0, a.1, b.0, b.1];
-        let d = self.doc.get_dictionary_mut(id)?;
-        d.set("L", nums(&l));
-        d.set("Rect", nums(&line_rect(&l, width, arrow)));
-        d.set("M", Object::string_literal(pdf_now()));
-        self.draw_annotations(&[id]);
-        Ok(())
+        self.atomically(|p| {
+            let d = p.doc.get_dictionary_mut(id)?;
+            d.set("L", nums(&l));
+            d.set("Rect", nums(&line_rect(&l, width, arrow)));
+            d.set("M", Object::string_literal(pdf_now()));
+            p.draw_annotations(&[id])?;
+            Ok(())
+        })
     }
 
     /// Turn the drawing `id` on page `page_index` (zero-based) by `degrees` about the
@@ -395,12 +401,14 @@ impl Pdf {
         let turn = [c, s, -s, c, cx - c * cx + s * cy, cy - s * cx - c * cy];
         let m = mx::mul(mx::mul(to_vis, turn), to_user);
         let list: Vec<Vec<f32>> = strokes.iter().map(|v| map_points(m, v)).collect();
-        let d = self.doc.get_dictionary_mut(id)?;
-        d.set("InkList", ink_list(&list));
-        d.set("Rect", nums(&points_rect(&list, pad)));
-        d.set("M", Object::string_literal(pdf_now()));
-        self.draw_annotations(&[id]);
-        Ok(())
+        self.atomically(|p| {
+            let d = p.doc.get_dictionary_mut(id)?;
+            d.set("InkList", ink_list(&list));
+            d.set("Rect", nums(&points_rect(&list, pad)));
+            d.set("M", Object::string_literal(pdf_now()));
+            p.draw_annotations(&[id])?;
+            Ok(())
+        })
     }
 
     /// A drawing's strokes as numbers, as `/InkList` holds them.
@@ -439,7 +447,7 @@ impl Pdf {
             text_style(d, style);
             d.set("M", Object::string_literal(pdf_now()));
             p.fit_text_box(id)?;
-            p.draw_annotations(&[id]);
+            p.draw_annotations(&[id])?;
             Ok(())
         })
     }
@@ -459,9 +467,10 @@ impl Pdf {
         let (to_user, _, _) = self.vis_down(page);
         let new = mx::transform_rect(to_user, to);
         let d = self.doc.get_dictionary(id)?;
-        // From the box it is listed with, which the app moves.
+        // From the box it is listed with, which the app moves: refused, with nothing
+        // changed, when it can't be drawn to find it.
         let old = self
-            .annot_rect(d)
+            .annot_rect(d, &mut annot_ap::work())?
             .ok_or_else(|| anyhow!("the annotation has no box"))?;
         let (ow, oh) = (old[2] - old[0], old[3] - old[1]);
         let (nw, nh) = (new[2] - new[0], new[3] - new[1]);
@@ -506,15 +515,17 @@ impl Pdf {
                 .collect();
             changed.push((b"InkList", strokes.into()));
         }
-        let d = self.doc.get_dictionary_mut(id)?;
-        for (k, v) in changed {
-            d.set(k, v);
-        }
-        d.set("M", Object::string_literal(pdf_now()));
-        if drawn && resized {
-            self.draw_annotations(&[id]);
-        }
-        Ok(())
+        self.atomically(|p| {
+            let d = p.doc.get_dictionary_mut(id)?;
+            for (k, v) in changed {
+                d.set(k, v);
+            }
+            d.set("M", Object::string_literal(pdf_now()));
+            if drawn && resized {
+                p.draw_annotations(&[id])?;
+            }
+            Ok(())
+        })
     }
 
     /// Make a text box tall enough for its text, as it is set inside the box's `/RD` margins
@@ -587,7 +598,7 @@ impl Pdf {
             }
             // Replies are not shown, so they need no drawing.
             if !reply {
-                p.draw_annotations(&[id]);
+                p.draw_annotations(&[id])?;
             }
             Ok(id)
         })
@@ -651,7 +662,7 @@ impl Pdf {
             self.fit_text_box(id)?;
         }
         if drawn && looks_new {
-            self.draw_annotations(&[id]);
+            self.draw_annotations(&[id])?;
         }
         if old.kind == AnnotKind::Stamp && (old.opacity - opacity).abs() > 1e-3 {
             self.restamp(id)?;
