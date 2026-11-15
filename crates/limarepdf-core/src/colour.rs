@@ -4,7 +4,8 @@
 //! resources: the device spaces, the calibrated and ICC-based ones by their components, Lab,
 //! Indexed, and Separation and DeviceN through their tint transforms (functions of types
 //! 0, 2, 3 and 4). Shown colours are approximate where a profile would decide. Reading a
-//! space is charged to its page's budget ([`Reading`]).
+//! space is charged to its page's budget ([`Reading`]), and so is showing one of its colours,
+//! each time one is set ([`Space::cost`]).
 
 use crate::budget::{TooComplex, Work};
 use lopdf::content::Operation;
@@ -303,6 +304,37 @@ impl Space {
         }
     }
 
+    /// How many values each of its colours has.
+    pub(crate) fn components(&self) -> usize {
+        match self {
+            Space::Gray | Space::Indexed { .. } => 1,
+            Space::Rgb | Space::Lab { .. } => 3,
+            Space::Cmyk => 4,
+            Space::Inks { n, .. } => *n,
+            Space::Other => 0,
+        }
+    }
+
+    /// What showing one of its colours takes, in values read and steps run: its values, and
+    /// what its base, or its tint transform and alternate, take.
+    fn units(&self) -> u64 {
+        let own = self.components() as u64;
+        match self {
+            Space::Indexed { base, .. } => own.saturating_add(base.units()),
+            Space::Inks { alt, tint, .. } => {
+                own.saturating_add(tint.units()).saturating_add(alt.units())
+            }
+            _ => own,
+        }
+    }
+
+    /// The steps showing one of its colours is charged each time one is set, in
+    /// `objects::STEPS`'s units: one for each 1,024 values read and steps run, so the device
+    /// spaces and ordinary spot colours cost nothing beyond their operator.
+    pub(crate) fn cost(&self) -> u64 {
+        self.units() / 1024
+    }
+
     /// Its values when `cs` chooses it: black, or full ink.
     pub(crate) fn first(&self) -> Vec<f32> {
         match self {
@@ -335,7 +367,7 @@ impl Space {
             }),
             Space::Indexed { base, table, last } => {
                 let i = (v.first()?.round().max(0.0) as usize).min(*last);
-                let n = base.first().len();
+                let n = base.components();
                 let bytes = table.get(i * n..(i + 1) * n)?;
                 let values: Vec<f32> = match **base {
                     // Lab's bytes span its ranges.
@@ -418,12 +450,16 @@ pub(crate) enum Function {
         encode: Vec<f32>,
         domain: Vec<f32>,
         range: Vec<f32>,
+        /// What running it takes ([`Function::units`]), worked out once when it is read.
+        units: u64,
     },
     /// Type 4: a program in PDF's PostScript calculator language.
     Calculator {
         program: Vec<Ps>,
         domain: Vec<f32>,
         range: Vec<f32>,
+        /// The most steps a run takes ([`Ps::steps`]).
+        units: u64,
     },
 }
 
@@ -553,7 +589,10 @@ impl Function {
                 let parts: Vec<Arc<Function>> = (fs.iter())
                     .map(|f| Function::of(r, f, depth + 1))
                     .collect::<Option<_>>()?;
+                // Its part found among the bounds, and the dearest part run.
+                let dearest = parts.iter().map(|f| f.units()).max().unwrap_or(0);
                 Function::Stitching {
+                    units: dearest.saturating_add(bounds.len() as u64),
                     parts,
                     bounds,
                     encode,
@@ -566,14 +605,30 @@ impl Function {
                     .get_plain_content_with_limit(crate::MAX_CONTENT)
                     .ok()?;
                 r.take(code.len() as u64 / 1024)?;
+                let program = Ps::program(&code)?;
                 Function::Calculator {
-                    program: Ps::program(&code)?,
+                    units: Ps::steps(&program),
+                    program,
                     domain,
                     range,
                 }
             }
             _ => return None,
         })
+    }
+
+    /// What running it once takes, in values read and steps run ([`Space::cost`]): a sampled
+    /// function reads each corner of the input's cell for each output, an exponential one
+    /// works out each output, a stitching one finds its part and runs it, and a calculator
+    /// runs its program.
+    fn units(&self) -> u64 {
+        match self {
+            Function::Sampled { size, outputs, .. } => {
+                (1u64 << size.len()).saturating_mul(*outputs as u64)
+            }
+            Function::Exponential { c0, .. } => c0.len() as u64,
+            Function::Stitching { units, .. } | Function::Calculator { units, .. } => *units,
+        }
     }
 
     /// The function's outputs for `input`, or `None` when it can't give them.
@@ -650,6 +705,7 @@ impl Function {
                 encode,
                 domain,
                 range,
+                ..
             } => {
                 let mut x = vec![*input.first()?];
                 clip(&mut x, domain);
@@ -666,6 +722,7 @@ impl Function {
                 program,
                 domain,
                 range,
+                ..
             } => {
                 let mut x = input.to_vec();
                 clip(&mut x, domain);
@@ -759,6 +816,18 @@ impl Ps {
                 },
             }
         }
+    }
+
+    /// The most steps a run of `program` takes: each step, and the longer block of each
+    /// `ifelse`.
+    fn steps(program: &[Ps]) -> u64 {
+        (program.iter())
+            .map(|step| match step {
+                Ps::If(then) => 1 + Ps::steps(then),
+                Ps::IfElse(then, otherwise) => 1 + Ps::steps(then).max(Ps::steps(otherwise)),
+                Ps::Num(_) | Ps::Op(_) => 1,
+            })
+            .sum()
     }
 
     /// Run `program` on `stack`; `None` on an error.
@@ -1078,6 +1147,48 @@ mod tests {
         let f = calc("{ pop pop }", 1);
         assert_eq!(f.eval(&[0.5]), None);
         assert!(Ps::program(b"{ 1 { 2 } }").is_none(), "a block no if takes");
+    }
+
+    /// What running a function takes, as showing a colour is charged it ([`Space::cost`]): a
+    /// sampled function reads each corner of the input's cell for each output, a calculator
+    /// runs its steps and the longer block of each `ifelse`, and a stitching function finds
+    /// its part among its bounds and is charged its dearest part.
+    #[test]
+    fn functions_take_what_their_kind_runs() {
+        let mut doc = Document::with_version("1.7");
+        let unit = || vec![Object::from(0), 1.into()];
+        // Three inputs and two outputs: 8 corners, each read for both.
+        let sampled = Stream::new(
+            dictionary! {
+                "FunctionType" => 0, "Domain" => [unit(), unit(), unit()].concat(),
+                "Range" => [unit(), unit()].concat(), "Size" => vec![2.into(); 3],
+                "BitsPerSample" => 8,
+            },
+            vec![0; 16],
+        );
+        assert_eq!(function(&mut doc, sampled.into()).units(), 16);
+        // dup, 0.5 and gt; the ifelse and the four steps of its longer block.
+        let calculator: Object = Stream::new(
+            dictionary! { "FunctionType" => 4, "Domain" => unit(), "Range" => unit() },
+            b"{ dup 0.5 gt { pop 1 } { 2 mul 1 add } ifelse }".to_vec(),
+        )
+        .into();
+        assert_eq!(function(&mut doc, calculator.clone()).units(), 8);
+        let exponential: Object = dictionary! {
+            "FunctionType" => 2, "Domain" => unit(), "C0" => vec![0.into()],
+            "C1" => vec![1.into()], "N" => 1,
+        }
+        .into();
+        assert_eq!(function(&mut doc, exponential.clone()).units(), 1);
+        let parts = [calculator, exponential.clone(), exponential];
+        let stitched = dictionary! {
+            "FunctionType" => 3, "Domain" => unit(),
+            "Functions" => parts.map(|f| Object::Reference(doc.add_object(f))).to_vec(),
+            "Bounds" => vec![0.25.into(), 0.5.into()],
+            "Encode" => [unit(), unit(), unit()].concat(),
+        };
+        // Its two bounds, and the calculator.
+        assert_eq!(function(&mut doc, stitched.into()).units(), 10);
     }
 
     #[test]

@@ -1134,7 +1134,11 @@ each part of the rest of looking for underlines that can grow faster than the pa
 step for each space and each function read, one per part a list of parts names, one per 1,024 numbers of an
 array and one per KiB of sampled data, calculator code and colour tables. A function many parts share is read
 once for each depth it is met at, so three levels listing the same function 20 times read 4 functions, not
-8,421. `objects::STEPS` is 2²³ (8,388,608): 7.5 times the corpus maximum, 1,124,715 steps (`pdfbox/5134.pdf`,
+8,421. Setting a colour (`cs`, `sc`, `scn` and the stroking `CS`, `SC`, `SCN`) is also charged what showing it
+takes (`Space::cost`), each time: one step per 1,024 values read and steps run (the colour's values, a sampled
+function's cell corners for each output, a stitching function's bounds and its dearest part, a calculator's
+steps with the longer block of each `ifelse`), worked out when the space is read; the device spaces and
+ordinary spot colours cost nothing beyond their operator. `objects::STEPS` is 2²³ (8,388,608): 7.5 times the corpus maximum, 1,124,715 steps (`pdfbox/5134.pdf`,
 page 1, 474,984 of them looking for underlines; every page of the 1,080
 files that open, measured 2026-11-06 with the budget lifted; 649,731 before CP-05, 12.9 times, and 588,688
 before the grids' cells were counted, 14 times). A step takes about 0.47 µs in an optimised build, whatever the

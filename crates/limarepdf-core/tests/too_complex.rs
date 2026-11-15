@@ -153,25 +153,22 @@ fn tint_steps(width: u64, depth: u64) -> u64 {
     2 + (depth + 1) + depth * width
 }
 
-/// Reading a colour space is charged to its page's budget, each function read once: a page
-/// choosing a spot colour stitched three levels deep from parts it shares (8,421 functions
-/// read before) is read within the steps it needs, and refused one step short.
-#[test]
-fn a_page_s_colour_spaces_are_charged_to_its_budget() {
-    use limarepdf_core::{budget_seam, TooComplex};
-    let mut p = zebras(1);
-    let space = shared_tint(&mut p, 20, 3);
+/// Page 0 of `p` draws a form with the colour spaces `spaces`, whose content is `content`.
+fn draw_colours(p: &mut Pdf, spaces: Dictionary, content: String) {
     let form = p.doc.add_object(Stream::new(
         dictionary! {
             "Type" => "XObject", "Subtype" => "Form",
             "BBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
-            "Resources" => dictionary! { "ColorSpace" => dictionary! { "CS0" => space } },
+            "Resources" => dictionary! { "ColorSpace" => spaces },
         },
-        b"/CS0 cs".to_vec(),
+        content.into_bytes(),
     ));
-    draw_form(&mut p, 0, form);
-    // q, Do and Q; the form opened; its one operator.
-    let needed = zebra_steps() + 3 + 1 + 1 + tint_steps(20, 3);
+    draw_form(p, 0, form);
+}
+
+/// Page 0 of `p` is read within the `needed` steps, taking them all, and refused one short.
+fn read_within(p: &Pdf, needed: u64) {
+    use limarepdf_core::{budget_seam, TooComplex};
     let (read, taken) = budget_seam::with_limit(needed, || p.page_objects(0).map(|_| ()));
     read.unwrap();
     assert_eq!(taken, [needed]);
@@ -180,6 +177,97 @@ fn a_page_s_colour_spaces_are_charged_to_its_budget() {
     let too = e.downcast_ref::<TooComplex>().expect("too complex");
     assert_eq!(too.limit, needed - 1, "{e:#}");
     assert!(taken.len() == 1 && taken[0] < needed, "{taken:?}");
+}
+
+/// Reading a colour space is charged to its page's budget, each function read once: a page
+/// choosing a spot colour stitched three levels deep from parts it shares (8,421 functions
+/// read before) is read within the steps it needs, and refused one step short.
+#[test]
+fn a_page_s_colour_spaces_are_charged_to_its_budget() {
+    let mut p = zebras(1);
+    let space = shared_tint(&mut p, 20, 3);
+    draw_colours(&mut p, dictionary! { "CS0" => space }, "/CS0 cs".into());
+    // q, Do and Q; the form opened; its one operator.
+    read_within(&p, zebra_steps() + 3 + 1 + 1 + tint_steps(20, 3));
+}
+
+/// A spot colour whose tint transform is a calculator program of `steps` steps, leaving the
+/// tint as it was; and the program's length.
+fn calculated_tint(p: &mut Pdf, steps: usize) -> (Object, u64) {
+    let code = format!("{{ {}}}", "dup pop ".repeat(steps / 2));
+    let len = code.len() as u64;
+    let tint = p.doc.add_object(Stream::new(
+        dictionary! {
+            "FunctionType" => 4, "Domain" => vec![0.into(), 1.into()],
+            "Range" => vec![0.into(), 1.into()],
+        },
+        code.into_bytes(),
+    ));
+    let space = vec![
+        "Separation".into(),
+        "Spot".into(),
+        "DeviceGray".into(),
+        tint.into(),
+    ];
+    (Object::Array(space), len)
+}
+
+/// Setting a colour is charged what showing it takes, each time: a spot colour whose tint
+/// transform runs 8,192 steps, chosen and set 40 times to fill and as many to stroke, is
+/// charged 8 more steps each time (one for each 1,024 values read and steps run: the tint,
+/// the program and the grey it gives). Before, each was charged only as an operator.
+#[test]
+fn a_colour_is_charged_what_showing_it_takes_each_time_it_is_set() {
+    let mut p = zebras(1);
+    let (space, len) = calculated_tint(&mut p, 8192);
+    let times = 40;
+    let fill = " 0.5 scn".repeat(times);
+    let stroke = " 0.5 SCN".repeat(times);
+    let content = format!("/CS0 cs{fill} /CS0 CS{stroke}");
+    draw_colours(&mut p, dictionary! { "CS0" => space }, content);
+    // The space and its alternate read once, the program a step and one for each KiB.
+    let read = 2 + 1 + len / 1024;
+    let each = (1 + 8192 + 1) / 1024;
+    let set = 2 * times as u64 + 2;
+    // q, Do and Q; the form opened (under a KiB).
+    read_within(&p, zebra_steps() + 3 + 1 + read + set * (1 + each));
+}
+
+/// Setting a colour of many inks is charged them each time: 4,096 inks chosen 40 times, and
+/// an indexed colour over them set 40 times, are charged 4 more steps each time. Before,
+/// each was charged only as an operator.
+#[test]
+fn a_colour_of_many_inks_is_charged_them_each_time_it_is_set() {
+    let mut p = zebras(1);
+    let inks: u64 = 4096;
+    let tint = p.doc.add_object(dictionary! {
+        "FunctionType" => 2, "Domain" => vec![0.into(), 1.into()],
+        "C0" => vec![0.into()], "C1" => vec![1.into()], "N" => 1,
+    });
+    let names = (0..inks).map(|i| Object::Name(format!("Ink{i}").into_bytes()));
+    let many = Object::Array(vec![
+        "DeviceN".into(),
+        Object::Array(names.collect()),
+        "DeviceGray".into(),
+        tint.into(),
+    ]);
+    let table = Object::string_literal(vec![255; inks as usize]);
+    let indexed = Object::Array(vec!["Indexed".into(), many.clone(), 0.into(), table]);
+    let times = 40;
+    let fill = "/CS0 cs ".repeat(times);
+    let stroke = " 0 SC".repeat(times);
+    let content = format!("{fill} /CS1 CS{stroke}");
+    let spaces = dictionary! { "CS0" => many, "CS1" => indexed };
+    draw_colours(&mut p, spaces, content);
+    // Each space read once: the inks' space, one more for each 1,024 inks, its tint
+    // transform and its alternate; the indexed space, its table's KiB and the inks under it.
+    let many_read = 1 + inks / 1024 + 1 + 1;
+    let indexed_read = 1 + inks / 1024 + many_read;
+    // The inks, the tint's one output and the grey it gives; and the index over them.
+    let many_each = (inks + 1 + 1) / 1024;
+    let indexed_each = (1 + inks + 1 + 1) / 1024;
+    let set = times as u64 * (1 + many_each) + (1 + times as u64) * (1 + indexed_each);
+    read_within(&p, zebra_steps() + 3 + 1 + many_read + indexed_read + set);
 }
 
 /// A form whose content can't be decoded is passed over, as before: the rest of the page
