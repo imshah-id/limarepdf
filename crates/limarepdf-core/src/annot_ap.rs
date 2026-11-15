@@ -79,7 +79,8 @@ const REDACT_LINE: f32 = 1.5;
 const CLOUD: f32 = 4.75;
 /// Text size for a text box whose `/DA` gives none.
 const TEXT_SIZE: f32 = 12.0;
-/// Most points read from one geometry entry, against hostile files.
+/// Most points read from one geometry entry, and drawn in an Ink drawing or a Squiggly
+/// one's wavy lines, against hostile files.
 const MAX_POINTS: usize = 100_000;
 
 /// A drawn appearance, before it is put in the file.
@@ -474,8 +475,15 @@ impl Pdf {
                     .and_then(|(_, o)| o.as_array().ok())?;
                 ops.push(op("J", vec![1.into()]));
                 ops.push(op("j", vec![1.into()]));
+                // The strokes share the points, so one listed many times is read and drawn
+                // only to the points left.
+                let mut left = MAX_POINTS;
                 for s in list.iter().take(MAX_POINTS) {
-                    if let Some(p) = self.points(Some(s)).filter(|p| !p.is_empty()) {
+                    if left == 0 {
+                        break;
+                    }
+                    if let Some(p) = self.points_upto(Some(s), left).filter(|p| !p.is_empty()) {
+                        left -= p.len();
                         polyline(&mut ops, &p);
                         if p.len() == 1 {
                             ops.push(op("l", nums(&[p[0].0, p[0].1])));
@@ -782,18 +790,28 @@ impl Pdf {
     }
 
     pub(crate) fn numbers(&self, o: Option<&Object>) -> Option<Vec<f32>> {
+        self.numbers_upto(o, 2 * MAX_POINTS)
+    }
+
+    /// The first `n` numbers of an array of them.
+    fn numbers_upto(&self, o: Option<&Object>, n: usize) -> Option<Vec<f32>> {
         let (_, o) = self.doc.dereference(o?).ok()?;
         o.as_array()
             .ok()?
             .iter()
-            .take(2 * MAX_POINTS)
+            .take(n)
             .map(|x| self.num(x))
             .collect()
     }
 
     /// An array of numbers as points.
     fn points(&self, o: Option<&Object>) -> Option<Vec<(f32, f32)>> {
-        let v = self.numbers(o)?;
+        self.points_upto(o, MAX_POINTS)
+    }
+
+    /// The first `n` points of an array of numbers.
+    fn points_upto(&self, o: Option<&Object>, n: usize) -> Option<Vec<(f32, f32)>> {
+        let v = self.numbers_upto(o, 2 * n)?;
         Some(v.as_chunks::<2>().0.iter().map(|&[x, y]| (x, y)).collect())
     }
 }
@@ -867,13 +885,15 @@ fn dist(a: (f32, f32), b: (f32, f32)) -> f32 {
 }
 
 /// Text markup over each line's quadrilateral: a filled highlight, or a line under,
-/// through or wavy under the text, sized to the line's height.
+/// through or wavy under the text, sized to the line's height. The wavy lines share
+/// [`MAX_POINTS`] points.
 fn markup(ops: &mut Vec<Operation>, sub: &[u8], quads: &[[(f32, f32); 4]], c: &[f32]) {
     if sub == b"Highlight" {
         ops.extend(fill_color(c));
     } else {
         ops.extend(stroke_color(c));
     }
+    let mut left = MAX_POINTS;
     for &[tl, tr, bl, br] in quads {
         let h = dist(tl, bl);
         if h < 1e-3 || dist(bl, br) < 1e-3 {
@@ -886,12 +906,16 @@ fn markup(ops: &mut Vec<Operation>, sub: &[u8], quads: &[[(f32, f32); 4]], c: &[
                 ops.push(op("f", vec![]));
             }
             b"Squiggly" => {
+                if left == 0 {
+                    continue;
+                }
                 let w = (h / 20.0).max(0.5);
                 let (len, amp) = (dist(bl, br), h / 12.0);
                 let step = (h / 6.0).max(1.0);
                 let (u, n) = (lerp(bl, br, 1.0 / len), lerp(bl, tl, 1.0 / h));
                 let (u, n) = ((u.0 - bl.0, u.1 - bl.1), (n.0 - bl.0, n.1 - bl.1));
-                let k = (len / step).ceil().min(MAX_POINTS as f32) as usize;
+                let k = (len / step).ceil().min((left - 1) as f32) as usize;
+                left -= k + 1;
                 let pts: Vec<(f32, f32)> = (0..=k)
                     .map(|i| {
                         let along = (i as f32 * step).min(len);
@@ -1590,5 +1614,37 @@ mod tests {
         pen.paint(&mut ops, true);
         let names: Vec<&str> = ops.iter().map(|o| o.operator.as_str()).collect();
         assert_eq!(names, ["rg", "RG", "w", "m", "l", "B"]);
+    }
+
+    /// The points `d`'s paths go through, as its content writes them.
+    fn points_drawn(d: &Drawing) -> usize {
+        let content = lopdf::content::Content::decode(&d.content).unwrap();
+        (content.operations.iter())
+            .filter(|o| o.operator == "m" || o.operator == "l")
+            .count()
+    }
+
+    /// A drawing reads and draws at most [`MAX_POINTS`] points, however its entries repeat
+    /// them: an Ink annotation listing one 10,000-point stroke 50 times, and a Squiggly one
+    /// over 5 lines each long enough for all of them. Each stroke and each line had its own
+    /// 100,000: 500,000 points each.
+    #[test]
+    fn a_drawing_draws_at_most_its_points_however_they_repeat() {
+        let mut p = Pdf::new();
+        let stroke: Vec<Object> = (0..10_000i64)
+            .flat_map(|i| [i.into(), Object::Integer(0)])
+            .collect();
+        let stroke = p.doc.add_object(stroke);
+        let rect = || [0i64, 0, 10, 10].map(Object::from).to_vec();
+        let ink = dictionary! {
+            "Subtype" => "Ink", "Rect" => rect(),
+            "InkList" => vec![Object::Reference(stroke); 50],
+        };
+        let line = [0i64, 6, 1_000_000, 6, 0, 0, 1_000_000, 0].map(Object::from);
+        let squiggly = dictionary! {
+            "Subtype" => "Squiggly", "Rect" => rect(), "QuadPoints" => vec![line; 5].concat(),
+        };
+        let drawn = [ink, squiggly].map(|d| points_drawn(&p.annotation_drawing(&d).unwrap()));
+        assert_eq!(drawn, [MAX_POINTS; 2]);
     }
 }

@@ -1340,7 +1340,9 @@ drawing is what flattening writes into the page. An annotation in a layer (`/OC`
 marked content tagged with it (`/OC /LimareField1 BDC … EMC`, the layer or rule named in the page's
 `/Properties`), so it shows when the layer does, as before (PB-180). That is `flatten_page`, so flattening the
 form or comments, finishing signing and printing all do it; a rule written in place is stored as an object of its
-own, since renderers look a tag's layer up by reference.
+own, since renderers look a tag's layer up by reference. A drawing reads at most 100,000 points (`MAX_POINTS`)
+from each entry, and an Ink drawing's strokes, or a Squiggly one's wavy lines, share 100,000 between them, so a
+stroke listed many times is drawn only to the points left.
 
 A drawing is placed by the annotation's `/Rect`, which flattening and every renderer map its box onto. Markup,
 links, lines, polygons, polylines and ink (`BY_POINTS`) are drawn from their own points instead, so one whose
