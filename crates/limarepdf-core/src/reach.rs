@@ -370,6 +370,9 @@ struct Walk<'a> {
     followed: HashSet<usize>,
     /// The resources read, by where they are written: each is read once.
     read: HashMap<Source, Res>,
+    /// What the pages' content uses, by where it is written: each is read once. Kept for
+    /// this walk only, as Remove hidden information rewrites content in place.
+    contents: HashMap<Contents, Option<Rc<Uses>>>,
     /// The sets of resources read, by their hash ([`weigh`]): each set's dictionary and
     /// number.
     sets: HashMap<u64, Vec<(Rc<Dictionary>, usize)>>,
@@ -395,6 +398,15 @@ enum Source {
     /// In a Type 3 font written in a set of resources ([`Res`]), by the font's name there:
     /// the same set lists the same font by that name.
     Font(usize, Vec<u8>),
+}
+
+/// Where a page's content is written.
+#[derive(PartialEq, Eq, Hash)]
+enum Contents {
+    /// The object the page's `/Contents` refers to: a stream, or an array listing them.
+    Object(ObjectId),
+    /// The streams an array written in the page lists.
+    Streams(Vec<ObjectId>),
 }
 
 /// Feed dictionary `d` to `h` as what decides its equality (`PartialEq`): its entries in any
@@ -527,11 +539,7 @@ impl Pdf {
             };
             let uses = match listed {
                 true => None,
-                false => (self.doc)
-                    .get_page_content_with_limit(page, crate::MAX_CONTENT)
-                    .ok()
-                    .and_then(|d| Uses::of_data(&d))
-                    .map(Rc::new),
+                false => w.page_uses(page),
             };
             w.reach.nodes[i].res = res.0.clone();
             w.todo.push((i, uses, res));
@@ -584,6 +592,7 @@ impl<'a> Walk<'a> {
             listed,
             followed: HashSet::new(),
             read: HashMap::new(),
+            contents: HashMap::new(),
             sets: HashMap::new(),
             made: 0,
             keys: RandomState::new(),
@@ -613,6 +622,26 @@ impl Walk<'_> {
         let res = self.told(self.pdf.resolved_dict(Some(o)))?;
         self.read.insert(at, res.clone());
         Ok(res)
+    }
+
+    /// What the content of page `page` uses, read the first time the walk meets where it is
+    /// written ([`Contents`]), however many pages share it; `None` when it can't be read.
+    fn page_uses(&mut self, page: ObjectId) -> Option<Rc<Uses>> {
+        let doc = &self.pdf.doc;
+        let at = match doc.get_dictionary(page).and_then(|d| d.get(b"Contents")) {
+            Ok(Object::Reference(id)) => Contents::Object(*id),
+            _ => Contents::Streams(doc.get_page_contents(page)),
+        };
+        (self.contents.entry(at))
+            .or_insert_with(|| {
+                #[cfg(test)]
+                tests::PAGES_READ.set(tests::PAGES_READ.get() + 1);
+                doc.get_page_content_with_limit(page, crate::MAX_CONTENT)
+                    .ok()
+                    .and_then(|d| Uses::of_data(&d))
+                    .map(Rc::new)
+            })
+            .clone()
     }
 
     /// Resources `d`, just read, charged a step per KiB of them ([`weigh_dict`]) and told
@@ -803,6 +832,8 @@ mod tests {
     thread_local! {
         /// Sets of resources told apart on this thread.
         pub(super) static TOLD: Cell<usize> = const { Cell::new(0) };
+        /// Pages' content read on this thread.
+        pub(super) static PAGES_READ: Cell<usize> = const { Cell::new(0) };
     }
 
     /// A page drawing `Fm`, a form drawing itself without resources of its own, and `Fm2`,
@@ -1050,6 +1081,53 @@ mod tests {
         let got = [false, true]
             .map(|listed| walked(&marked(16 << 10), listed) - walked(&marked(1), listed));
         assert_eq!(got, [64, 48]);
+    }
+
+    /// `n` pages drawing the same content: a stream each page's `/Contents` names, with `how`
+    /// 0; an array of its own listing the stream, with 1; that array written in each page,
+    /// with 2.
+    fn sharing_content(n: usize, how: usize) -> Pdf {
+        let mut p = Pdf::new();
+        p.insert_blank(0, 300.0, 200.0).unwrap();
+        let page = p.page_ids()[0];
+        let content = p
+            .doc
+            .add_object(Stream::new(Dictionary::new(), b"0 0 9 9 re f".to_vec()));
+        let list = p.doc.add_object(vec![content.into()]);
+        let contents: Object = match how {
+            0 => content.into(),
+            1 => list.into(),
+            _ => vec![content.into()].into(),
+        };
+        let d = p.doc.get_dictionary_mut(page).unwrap();
+        d.set("Contents", contents);
+        let d = d.clone();
+        let tree = d.get(b"Parent").and_then(Object::as_reference).unwrap();
+        let kids: Vec<Object> = std::iter::once(page.into())
+            .chain((1..n).map(|_| p.doc.add_object(d.clone()).into()))
+            .collect();
+        let t = p.doc.get_dictionary_mut(tree).unwrap();
+        t.set("Kids", kids);
+        t.set("Count", n as i64);
+        p
+    }
+
+    /// Pages sharing their content read it once a walk, whether they name its stream, an
+    /// array listing it, or write that array themselves: for each, how many more times
+    /// content is read for 2,000 pages than for one.
+    #[test]
+    fn content_pages_share_is_read_once_a_walk() {
+        let got = [0, 1, 2].map(|how| {
+            let read = |n| {
+                let p = sharing_content(n, how);
+                assert_eq!(p.page_ids().len(), n);
+                PAGES_READ.set(0);
+                walked(&p, false);
+                PAGES_READ.get()
+            };
+            read(2_000) - read(1)
+        });
+        assert_eq!(got, [0, 0, 0]);
     }
 
     #[test]

@@ -1122,10 +1122,12 @@ looked up, page, annotation and holder, one per KiB of resources read, and one p
 content (properties written in the resources, `Node::properties`, and alternative text, `Node::alt`). Resources
 are read once where they are written (`Walk::res`: an object of their own, the dictionary whose `/Resources` they
 are, or a Type 3 font's name in a set), however many drawings share them, and the walk borrows what it reads,
-copying only what it keeps. They are told apart as they are read (`Walk::told`), by what they hold: the same
-entries in any order, compared exactly after a hash with random keys, are one set, numbered, and a drawing
-without resources of its own is followed once for each set it is
-drawn with (WP-04; a form drawn from pages whose resources only printed alike was once followed with the first
+copying only what it keeps. A page's content is read once a walk in the same way (`Walk::page_uses`: the object
+its `/Contents` refers to, or the streams an array written in the page lists), however many pages share it; that
+is kept for the walk only, as Remove hidden information rewrites content in place. Resources are told apart as
+they are read (`Walk::told`), by what they hold: the same entries in any order, compared exactly after a hash with
+random keys, are one set, numbered, and a drawing without resources of its own is followed once for each set it
+is drawn with (WP-04; a form drawn from pages whose resources only printed alike was once followed with the first
 page's, and `scan_layers` skipped the second page's). `reach::STEPS` is 2²² (4,194,304): 32
 times the corpus maximum, 129,066 steps (`pdfjs/issue6692.pdf`, 109 pages; the 1,080 files that open, measured
 2026-11-04 with the budget lifted). The walk runs first as a check, refusing before anything changes; the walk
