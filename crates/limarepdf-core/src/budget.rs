@@ -58,13 +58,23 @@ impl Work {
     /// Take `n` steps; refused, with nothing taken, when fewer are left.
     pub(crate) fn take(&mut self, n: u64) -> Result<(), TooComplex> {
         if n > self.left {
-            return Err(TooComplex {
-                what: self.what,
-                limit: self.limit,
-            });
+            return Err(self.refusal());
         }
         self.left -= n;
         Ok(())
+    }
+
+    /// The steps left.
+    pub(crate) fn left(&self) -> u64 {
+        self.left
+    }
+
+    /// The refusal for taking more steps than are left.
+    pub(crate) fn refusal(&self) -> TooComplex {
+        TooComplex {
+            what: self.what,
+            limit: self.limit,
+        }
     }
 
     /// The steps taken so far.
@@ -106,10 +116,15 @@ impl std::error::Error for TooComplex {}
 
 /// A test seam: operations on this thread get another limit ([`limit`]), and what each
 /// budget took is kept, so a test can show a budget trips one step over what an operation
-/// needs. Built only for tests (core's own, and through the `test-seams` feature).
+/// needs. A program a test runs (the CLI) takes its limit from [`budget_seam::VAR`]. Built
+/// only for tests (core's own, and through the `test-seams` feature).
 #[cfg(any(test, feature = "test-seams"))]
 pub mod budget_seam {
     use std::cell::{Cell, RefCell};
+
+    /// The limit, in steps, of every operation in a program a test runs, on threads with
+    /// none of their own.
+    pub const VAR: &str = "LIMAREPDF_TEST_BUDGET";
 
     thread_local! {
         static LIMIT: Cell<Option<u64>> = const { Cell::new(None) };
@@ -129,7 +144,9 @@ pub mod budget_seam {
     }
 
     pub(super) fn limit() -> Option<u64> {
-        LIMIT.get()
+        LIMIT
+            .get()
+            .or_else(|| std::env::var(VAR).ok()?.parse().ok())
     }
 
     /// Runs `f` with the operations on this thread meanwhile limited to `limit`, another

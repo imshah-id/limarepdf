@@ -374,9 +374,10 @@ fn shown_box(note: bool, b: [f32; 4], zoom: f32) -> [f32; 4] {
     [b[0], b[1], b[2].max(b[0] + s), b[3].max(b[1] + s)]
 }
 
-/// Whether a double-click opens it for typing: a note or a text box that isn't locked.
+/// Whether a double-click opens it for typing: a note or a text box that isn't locked, and
+/// whose text was read ([`Annot::unread`]).
 fn writable(a: &Annot) -> bool {
-    !a.locked() && matches!(a.kind, AnnotKind::Note | AnnotKind::TextBox)
+    !a.locked() && !a.unread && matches!(a.kind, AnnotKind::Note | AnnotKind::TextBox)
 }
 
 /// A line's change as core writes it ([`limarepdf_core::Pdf::edit_texts_decorated`]): the
@@ -519,16 +520,22 @@ impl AnnotEdit {
 }
 
 /// Whether the annotation can be moved: not locked, and not text markup, which stays on
-/// its text. A redaction mark moves, all its areas together (PF-37).
+/// its text, its areas read or not ([`Annot::unread`]). A redaction mark moves, all its
+/// areas together (PF-37).
 pub fn movable(a: &Annot) -> bool {
-    !a.locked() && (a.quads.is_empty() || a.kind == AnnotKind::Redact)
+    let markup = matches!(
+        a.kind,
+        AnnotKind::Highlight | AnnotKind::Underline | AnnotKind::StrikeOut | AnnotKind::Squiggly
+    );
+    !a.locked() && ((a.quads.is_empty() && !(a.unread && markup)) || a.kind == AnnotKind::Redact)
 }
 
 /// Whether it can also be resized by its box: a note's icon keeps its size, a line has
 /// handles on its ends instead, and a redaction mark's areas over several lines follow
-/// their text.
+/// their text, as an unread one's may.
 pub fn resizable(a: &Annot) -> bool {
-    movable(a) && !matches!(a.kind, AnnotKind::Note | AnnotKind::Line) && a.quads.len() <= 1
+    let mark = a.kind == AnnotKind::Redact && (a.quads.len() > 1 || a.unread);
+    movable(a) && !matches!(a.kind, AnnotKind::Note | AnnotKind::Line) && !mark
 }
 
 /// Whether `p` (page points) is in a redaction mark's box, which its outline shows when it
@@ -2012,6 +2019,10 @@ fn constrain(tool: Tool, a: Pos2, b: Pos2) -> Pos2 {
     }
 }
 
+/// What an annotation listed past the budget for reading them shows for its text
+/// ([`Annot::unread`]).
+pub const TOO_LARGE: &str = "Too large to show";
+
 /// Hover text for an annotation: its kind, author and date, then its comment.
 pub fn annot_tip(a: &Annot) -> String {
     let mut tip = a.label();
@@ -2024,7 +2035,10 @@ pub fn annot_tip(a: &Annot) -> String {
     if a.hidden() {
         tip += " · hidden";
     }
-    let contents = limarepdf_core::display_text(&a.contents, 2000);
+    let contents = match a.unread {
+        true => TOO_LARGE.to_string(),
+        false => limarepdf_core::display_text(&a.contents, 2000),
+    };
     if !contents.is_empty() {
         tip += &format!("\n\n{contents}");
     }
@@ -6600,9 +6614,20 @@ impl Editor {
         if a.locked() {
             note(ui, "Locked: can't be changed or deleted.");
         }
+        if a.unread {
+            note(ui, format!("{TOO_LARGE}: can't be changed."));
+        }
         ui.separator();
         let mut done = false;
         ui.add_enabled_ui(!a.locked(), |ui| {
+            // Its text and looks weren't read: it can only be deleted.
+            if a.unread {
+                if theme::glyph_button(ui, icon::TRASH, "Delete").clicked() {
+                    self.actions.push(Action::DeleteAnnot(a.page, a.id));
+                    done = true;
+                }
+                return;
+            }
             match e.text.as_mut() {
                 // A text box's colour is its fill, set with its text.
                 Some(s) => text_style_ui(ui, s),
@@ -6738,7 +6763,10 @@ impl Editor {
                     who.join(" · ")
                 },
             );
-            ui.label(limarepdf_core::display_text(&r.contents, 2000));
+            match r.unread {
+                true => ui.weak(TOO_LARGE),
+                false => ui.label(limarepdf_core::display_text(&r.contents, 2000)),
+            };
             ui.add_space(4.0);
         }
         // The comment's own draft, kept when another is selected (Q1); Ctrl+Enter adds it,

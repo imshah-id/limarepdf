@@ -120,6 +120,9 @@ Some things to know:
 
 - Notes keep their size, and highlights and other text markup stay on their text, so neither can be resized, and
   markup can't be moved. Annotations the file locks can't be moved or deleted.
+- When a document's comments are too many or too long to read (more than 16,777,216 steps of their text and
+  points), those past that say "Too large to show" in the Comments view, the inspector and when you hover over
+  them. They can be selected, moved and deleted, but not changed or typed in.
 - A drag that starts on a highlight still selects the text under it. Hovering over a mark shows its comment.
 - Lines and drawings are picked by clicking near their strokes, not anywhere in their box.
 - A selected line has a round handle on each end instead of a box: drag either end to turn the line, or to point

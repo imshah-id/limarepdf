@@ -2,10 +2,10 @@
 //! flattening them into the page content. Links, form widgets and popups have their own
 //! code and are not listed here.
 
-use crate::annot_ap::{self, drawable, Place, DRAWN};
+use crate::annot_ap::{self, drawable, Place, DRAWN, MAX_POINTS};
+use crate::budget::{TooComplex, Work};
 use crate::doc::decode_text;
 use crate::form_flatten::{self, Flat};
-use crate::form_write::parse_da;
 use crate::matrix as mx;
 use crate::sanitise::Layers;
 use crate::{Align, Pdf, Result};
@@ -16,6 +16,10 @@ use std::collections::HashSet;
 /// How many of a page's annotations are shown, a limit that keeps a malformed or hostile
 /// file from running away. Removing information reads them all.
 pub const MAX_ANNOTS: usize = 10_000;
+
+/// Most bytes of a date (`/M`, `/CreationDate`) read: one written in full as UTF-16 takes
+/// 48.
+const MAX_DATE: usize = 64;
 
 /// What [`Pdf::flatten_annotations`] did.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -201,6 +205,10 @@ pub struct Annot {
     /// For lines, polylines and drawings, their points in displayed-page points, one list
     /// per stroke; empty for other kinds.
     pub paths: Vec<Vec<(f32, f32)>>,
+    /// Listed past the budget for reading the annotations ([`crate::TooComplex`]): its
+    /// text, points and text style weren't read, and are empty (`None` for the style). It
+    /// is shown, and can be selected, moved and deleted, but its text can't be changed.
+    pub unread: bool,
 }
 
 /// How a rectangle, ellipse, line or drawing is painted. Its line's colour is the
@@ -280,9 +288,15 @@ impl Annot {
 impl Pdf {
     /// The annotations on every page, page by page in the file's order. Those placed where
     /// they are drawn (PB-114) are drawn within one budget ([`crate::TooComplex`]); past it,
-    /// each is placed at its own `/Rect`.
+    /// each is placed at its own `/Rect`. Their points and text are read within another;
+    /// past it, each is listed [`Annot::unread`].
     pub fn annotations(&self) -> Vec<Annot> {
-        self.every_annotation_in(&mut Place::drawn(), |p, page| p.annot_refs(page))
+        self.listed(&mut Place::drawn())
+    }
+
+    /// [`Pdf::annotations`], placed and read by `place`.
+    pub(crate) fn listed(&self, place: &mut Place) -> Vec<Annot> {
+        self.every_annotation_in(place, |p, page| p.annot_refs(page))
     }
 
     /// The annotations on one page (zero-based), in the file's order (the order they are
@@ -391,16 +405,25 @@ impl Pdf {
     /// Remove the annotations `pick` chooses, with the replies to them and their popups.
     /// Locked ones are removed too; the app checks [`Annot::locked`] first. Every
     /// annotation is offered to `pick`, not only those shown, each at its own `/Rect`:
-    /// none is drawn to place it. Returns how many were removed, replies included.
+    /// none is drawn to place it. Each is read, for `pick` to choose by what it says:
+    /// refused, with nothing changed, past the budget for reading them
+    /// ([`crate::TooComplex`]). Returns how many were removed, replies included.
     pub fn remove_annotations(&mut self, pick: impl Fn(&Annot) -> bool) -> Result<usize> {
-        self.own_direct_annots()?;
-        let gone = self
-            .every_annotation(&mut Place::own())
-            .iter()
-            .filter(|a| pick(a))
-            .map(|a| a.id)
-            .collect();
-        self.drop_annotations(gone)
+        self.atomically(|p| {
+            p.own_direct_annots()?;
+            let mut place = Place::own();
+            let all = p.every_annotation(&mut place);
+            place.whole()?;
+            let gone = all.iter().filter(|a| pick(a)).map(|a| a.id).collect();
+            p.drop_annotations(gone)
+        })
+    }
+
+    /// Remove annotation `id`, with the replies to it and their popups, reading no other
+    /// annotation; with nothing changed when it fails. Returns how many were removed,
+    /// replies included.
+    pub fn remove_annotation(&mut self, id: (u32, u16)) -> Result<usize> {
+        self.atomically(|p| p.drop_annotations(HashSet::from([id])))
     }
 
     /// Remove the annotations `gone` (of any kind, links and form widgets too), with the
@@ -627,65 +650,19 @@ impl Pdf {
         let d = self.doc.get_dictionary(id).ok()?;
         let kind = AnnotKind::of(d.get(b"Subtype").ok()?.as_name().ok()?)?;
         let rect = place.rect(self, d)?;
-        let text = |key: &[u8]| {
-            d.get(key)
-                .ok()
-                .and_then(|o| self.shown_text_value(o))
-                .unwrap_or_default()
-        };
+        let read = place.read(|work| self.annot_read(d, &kind, rect, to_vis, work));
+        let unread = read.is_none();
+        let read = read.unwrap_or_default();
         let date = |key: &[u8]| {
-            d.get(key)
-                .ok()
-                .and_then(|o| self.string_bytes(o))
-                .and_then(|b| pdf_date(&decode_text(&b)))
+            let (_, o) = self.doc.dereference(d.get(key).ok()?).ok()?;
+            let s = o.as_str().ok()?;
+            pdf_date(&decode_text(&s[..s.len().min(MAX_DATE)]))
         };
-        let markup = matches!(
-            kind,
-            AnnotKind::Highlight
-                | AnnotKind::Underline
-                | AnnotKind::StrikeOut
-                | AnnotKind::Squiggly
-                | AnnotKind::Redact
-        );
-        let quads = if markup {
-            self.numbers(d.get(b"QuadPoints").ok())
-                .unwrap_or_default()
-                .as_chunks::<8>()
-                .0
-                .iter()
-                .map(|q| {
-                    let mut b = [f32::MAX, f32::MAX, f32::MIN, f32::MIN];
-                    for &[x, y] in q.as_chunks::<2>().0 {
-                        let (x, y) = mx::apply(to_vis, x, y);
-                        (b[0], b[1]) = (b[0].min(x), b[1].min(y));
-                        (b[2], b[3]) = (b[2].max(x), b[3].max(y));
-                    }
-                    b
-                })
-                .collect()
-        } else {
-            Vec::new()
-        };
-        let text_style = (kind == AnnotKind::TextBox).then(|| {
-            let da = d
-                .get(b"DA")
-                .ok()
-                .and_then(|o| self.string_bytes(o))
-                .unwrap_or_default();
-            let (_, _, color) = parse_da(&da);
-            let color: Vec<f32> = color
-                .map(|o| {
-                    o.operands
-                        .iter()
-                        .filter_map(|x| x.as_float().ok())
-                        .collect()
-                })
-                .unwrap_or_default();
+        let text_style = read.text.map(|(size, color)| {
             let q = d.get(b"Q").ok().and_then(|o| self.int_value(o));
             TextStyle {
-                // As it is drawn: from `/DA`, else `/DS`.
-                size: self.box_geometry(d, rect).size,
-                color: rgb(&color),
+                size,
+                color,
                 fill: self.colour(d, b"C").map(|c| rgb(&c)),
                 border: self.border(d).0,
                 align: Align::of_q(q.unwrap_or(0)),
@@ -702,53 +679,22 @@ impl Pdf {
             width: self.border(d).0,
             arrow: self.line_ends(d).iter().any(|e| e.as_slice() != b"None"),
         });
-        let to_shown = |v: Vec<f32>| -> Vec<(f32, f32)> {
-            v.as_chunks::<2>()
-                .0
-                .iter()
-                .map(|&[x, y]| mx::apply(to_vis, x, y))
-                .collect()
-        };
-        let paths = match kind {
-            AnnotKind::Line => self.numbers(d.get(b"L").ok()).into_iter().collect(),
-            AnnotKind::PolyLine => self.numbers(d.get(b"Vertices").ok()).into_iter().collect(),
-            AnnotKind::Ink => d
-                .get(b"InkList")
-                .ok()
-                .and_then(|o| self.doc.dereference(o).ok())
-                .and_then(|(_, o)| o.as_array().ok())
-                .map(|list| {
-                    list.iter()
-                        .take(MAX_ANNOTS)
-                        .filter_map(|s| self.numbers(Some(s)))
-                        .collect()
-                })
-                .unwrap_or_default(),
-            _ => Vec::new(),
-        }
-        .into_iter()
-        .map(to_shown)
-        .collect();
         Some(Annot {
             id,
             page,
             kind,
             bbox: mx::transform_rect(to_vis, rect),
-            quads,
+            quads: read.quads,
             color: self.colour(d, b"C").map(|c| rgb(&c)),
             opacity: d
                 .get(b"CA")
                 .ok()
                 .and_then(|o| self.num(o))
                 .map_or(1.0, |a| a.clamp(0.0, 1.0)),
-            contents: text(b"Contents"),
-            author: text(b"T"),
-            subject: text(b"Subj"),
-            name: d
-                .get(b"Name")
-                .and_then(|o| o.as_name())
-                .map(|n| String::from_utf8_lossy(n).into_owned())
-                .unwrap_or_default(),
+            contents: read.contents,
+            author: read.author,
+            subject: read.subject,
+            name: read.name,
             modified: date(b"M")
                 .or_else(|| date(b"CreationDate"))
                 .unwrap_or_default(),
@@ -762,9 +708,111 @@ impl Pdf {
                 .is_some_and(|ap| ap.has(b"N")),
             text_style,
             shape,
-            paths,
+            paths: read.paths,
+            unread,
         })
     }
+
+    /// The points and text of annotation `d`, of kind `kind`, whose box is `rect`: each
+    /// charged to `work` before it is read, its points turned to displayed-page points
+    /// (`to_vis`).
+    fn annot_read(
+        &self,
+        d: &Dictionary,
+        kind: &AnnotKind,
+        rect: [f32; 4],
+        to_vis: mx::M,
+        work: &mut Work,
+    ) -> std::result::Result<Read, TooComplex> {
+        let text = |key: &[u8], work: &mut Work| {
+            let t = self.text_charged(d.get(key).ok(), true, work)?;
+            Ok::<_, TooComplex>(t.unwrap_or_default())
+        };
+        let markup = matches!(
+            kind,
+            AnnotKind::Highlight
+                | AnnotKind::Underline
+                | AnnotKind::StrikeOut
+                | AnnotKind::Squiggly
+                | AnnotKind::Redact
+        );
+        let quads = match markup {
+            true => self.points_charged(d.get(b"QuadPoints").ok(), MAX_POINTS, work)?,
+            false => None,
+        };
+        let quads = (quads.unwrap_or_default().as_chunks::<4>().0.iter())
+            .map(|q| {
+                let mut b = [f32::MAX, f32::MAX, f32::MIN, f32::MIN];
+                for &(x, y) in q {
+                    let (x, y) = mx::apply(to_vis, x, y);
+                    (b[0], b[1]) = (b[0].min(x), b[1].min(y));
+                    (b[2], b[3]) = (b[2].max(x), b[3].max(y));
+                }
+                b
+            })
+            .collect();
+        let style = match *kind == AnnotKind::TextBox {
+            // As it is drawn: from `/DA`, else `/DS`.
+            true => {
+                let g = self.box_geometry(d, rect, work)?;
+                Some((g.size, rgb(&g.text_rgb)))
+            }
+            false => None,
+        };
+        let points = |key: &[u8], n: usize, work: &mut Work| {
+            let p = self.points_charged(d.get(key).ok(), n, work)?;
+            Ok::<_, TooComplex>(p.into_iter().collect())
+        };
+        let ink = || {
+            let (_, o) = self.doc.dereference(d.get(b"InkList").ok()?).ok()?;
+            o.as_array().ok()
+        };
+        let paths: Vec<Vec<(f32, f32)>> = match kind {
+            AnnotKind::Line => points(b"L", 2, work)?,
+            AnnotKind::PolyLine => points(b"Vertices", MAX_POINTS, work)?,
+            AnnotKind::Ink => match ink() {
+                Some(list) => self.ink_strokes(list, work)?,
+                None => Vec::new(),
+            },
+            _ => Vec::new(),
+        };
+        let name = match d.get(b"Name").and_then(|o| o.as_name()) {
+            Ok(n) => {
+                work.take(n.len() as u64)?;
+                String::from_utf8_lossy(n).into_owned()
+            }
+            Err(_) => String::new(),
+        };
+        Ok(Read {
+            quads,
+            paths: (paths.into_iter())
+                .map(|p| {
+                    p.into_iter()
+                        .map(|(x, y)| mx::apply(to_vis, x, y))
+                        .collect()
+                })
+                .collect(),
+            contents: text(b"Contents", work)?,
+            author: text(b"T", work)?,
+            subject: text(b"Subj", work)?,
+            name,
+            text: style,
+        })
+    }
+}
+
+/// What listing an annotation reads within the budget for reading them
+/// ([`Place::read`]): its points and text.
+#[derive(Default)]
+struct Read {
+    quads: Vec<[f32; 4]>,
+    paths: Vec<Vec<(f32, f32)>>,
+    contents: String,
+    author: String,
+    subject: String,
+    name: String,
+    /// A text box's text size and colour, as it is drawn: from `/DA`, else `/DS`.
+    text: Option<(f32, [f32; 3])>,
 }
 
 /// What flattening does with each annotation: draw the marks, drop replies and the

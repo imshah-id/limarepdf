@@ -1243,7 +1243,7 @@ impl Pdf {
                 bail!("the document has no redaction marks");
             }
             let report = p.redact(&marks)?;
-            let ids = (p.every_annotation(&mut Place::own()).into_iter())
+            let ids = (p.every_annotation(&mut Place::kinds()).into_iter())
                 .filter(|a| a.kind == crate::AnnotKind::Redact)
                 .map(|a| a.id)
                 .collect();
@@ -1419,7 +1419,7 @@ impl Pdf {
         report.left.extend(unread.iter().map(|&p| unread_said(p)));
         report.left.extend(retained.left);
         report.pictures_elsewhere = retained.pictures;
-        report.elsewhere = self.find_elsewhere(&report, &alts, &reach);
+        report.elsewhere = self.find_elsewhere(&report, &alts, &reach)?;
         Ok(report)
     }
 
@@ -1680,13 +1680,14 @@ impl Pdf {
 
     /// Look for the removed text, and the alternative text `alts` taken off, elsewhere: on
     /// any page, in the alternative text of what the pages draw (`reach`, a walk after the
-    /// change), in bookmarks, comments, form fields and the document information.
+    /// change), in bookmarks, comments, form fields and the document information. Refused
+    /// when the comments are too many or too long to read ([`crate::TooComplex`]).
     fn find_elsewhere(
         &self,
         report: &RedactReport,
         alts: &[String],
         reach: &Reach,
-    ) -> Vec<(String, Vec<String>)> {
+    ) -> Result<Vec<(String, Vec<String>)>> {
         let mut queries: Vec<String> = Vec::new();
         let mut add = |q: String| {
             if q.chars().filter(|c| !c.is_whitespace()).count() >= 2 && !queries.contains(&q) {
@@ -1706,7 +1707,7 @@ impl Pdf {
             add(q);
         }
         if queries.is_empty() {
-            return Vec::new();
+            return Ok(Vec::new());
         }
         let n = self.page_count();
         let all: Vec<usize> = (0..n).collect();
@@ -1721,10 +1722,12 @@ impl Pdf {
                 fold(&b.title),
             ));
         }
-        for a in self.every_annotation(&mut Place::own()) {
+        let mut place = Place::own();
+        for a in self.every_annotation(&mut place) {
             let all = format!("{} {} {}", a.contents, a.author, a.subject);
             other.push((format!("a comment on page {}", a.page + 1), fold(&all)));
         }
+        place.whole()?;
         for f in self.every_form_field() {
             if let crate::FieldValue::Text(v) = &f.value {
                 other.push((format!("form field \u{201c}{}\u{201d}", f.name), fold(v)));
@@ -1763,7 +1766,7 @@ impl Pdf {
                 out.push((q, places));
             }
         }
-        out
+        Ok(out)
     }
 }
 

@@ -9,7 +9,7 @@
 
 use super::organise::take_keyboard;
 use super::{thread_order, Tab};
-use crate::editor::annot_tip;
+use crate::editor::{annot_tip, TOO_LARGE};
 use crate::icon;
 use crate::selection::Selection;
 use crate::theme;
@@ -317,8 +317,9 @@ impl Tab {
                                 1
                             }
                         }
-                        // Text markup shows the words it marks, on one line.
-                        None if !a.quads.is_empty() => 1,
+                        // Text markup shows the words it marks, on one line, as one unread
+                        // shows that it is too large.
+                        None if !a.quads.is_empty() || a.unread => 1,
                         None => 0,
                     };
                     r.lines.insert(a.id, n);
@@ -516,6 +517,7 @@ impl Tab {
                                     w => format!("“{w}”"),
                                 }
                             }
+                            None if a.unread => TOO_LARGE.to_string(),
                             None => String::new(),
                         };
                         let rows_n = self.review.lines.get(&a.id).copied().unwrap_or(1);
@@ -608,7 +610,7 @@ impl Tab {
             self.show_mark(page, bbox);
         }
         if let Some(id) = delete {
-            if self.edit(&ctx, |p| p.remove_annotations(|a| a.id == id).map(|_| ())) {
+            if self.edit(&ctx, |p| p.remove_annotation(id).map(|_| ())) {
                 self.notice = Some("Deleted the comment".into());
             }
         }

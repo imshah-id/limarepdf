@@ -122,7 +122,9 @@ a form field touching an area belongs to a form nested more than 32 deep (fields
 that leads from a page to its tags is nested more than 32 deep or too large to search (more than 100,000 parts
 looked at), or when the document's drawings lead to one another in too many ways to follow ("the document is too
 complex: checking the drawings would take more than 4194304 steps, so nothing was changed"). The largest of 1,080
-test files takes about 130,000 of those steps.
+test files takes about 130,000 of those steps. It stops too when the comments are too many or too long to read,
+as it reads every mark's areas and looks for the removed text in every comment ("reading the annotations would
+take more than 16777216 steps").
 
 ## The check afterwards
 

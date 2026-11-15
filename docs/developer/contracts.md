@@ -161,6 +161,10 @@ and `settle` (`editor/replace_all.rs`), which hold its copy.
   `reach::STEPS`: 2²² (4,194,304) steps, 32 times the most any of the 1,080 corpus files that open takes
   (129,066, `pdfjs/issue6692.pdf`, measured 2026-11-04 with the budget lifted). It runs before the change; the
   walk after it is allowed twice that, plus the objects added.
+- Applying the marks refuses too, with nothing changed, when the marks can't be placed within the budget for
+  drawing annotations, or the comments are too many or too long to read within `annot_ap::READ_STEPS` (the marks'
+  areas, and the comments searched for the removed text): no mark is applied anywhere but where it is shown, and
+  no comment goes unsearched.
 - Deleting pages and making documents of some (Extract, Split) are held to the same (PB-137, D-22 (a)): what only
   the pages that went drew leaves the resource lists they share with the pages that stay, and the file is followed
   from its trailer for the pages, their content, thumbnails and private data, their comments and fields with what

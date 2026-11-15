@@ -3,7 +3,8 @@
 //! redacting, search, finding its pictures) says so and changes nothing. A drawing that draws
 //! itself is read once. Drawing annotations has a budget too: flattening and redacting
 //! annotations too complex to draw are refused, and listing them places those past it at
-//! their own `/Rect`.
+//! their own `/Rect`. So does reading their points and text: a listing lists those past
+//! it unread, and removing information is refused past it.
 
 mod common;
 
@@ -599,16 +600,16 @@ fn annotations_past_the_drawing_budget_are_listed_at_their_own_box() {
     }
 }
 
-/// A text box's text is charged to drawing it: 20 text boxes sharing one 20,004-character
-/// text set it 20 times, and flattening them past the budget is refused, with nothing
-/// changed. Each was set, however many shared the text.
-#[test]
-fn text_boxes_sharing_a_long_text_are_charged_it_each() {
-    use limarepdf_core::{budget_seam, TooComplex};
+/// The text [`sharing_a_text`]'s text boxes share: 20,004 characters.
+fn long_text() -> String {
+    "zebra ".repeat(3_334)
+}
+
+/// A page of [`zebras`] with 20 text boxes, below "Zebra", sharing one text
+/// ([`long_text`]).
+fn sharing_a_text() -> Pdf {
     let mut p = zebras(1);
-    let text = p
-        .doc
-        .add_object(Object::string_literal("zebra ".repeat(3_334)));
+    let text = p.doc.add_object(Object::string_literal(long_text()));
     let rect = [72i64, 400, 300, 500].map(Object::from).to_vec();
     for _ in 0..20 {
         let d = dictionary! {
@@ -617,6 +618,16 @@ fn text_boxes_sharing_a_long_text_are_charged_it_each() {
         };
         annotate(&mut p, d);
     }
+    p
+}
+
+/// A text box's text is charged to drawing it: 20 text boxes sharing one 20,004-character
+/// text set it 20 times, and flattening them past the budget is refused, with nothing
+/// changed. Each was set, however many shared the text.
+#[test]
+fn text_boxes_sharing_a_long_text_are_charged_it_each() {
+    use limarepdf_core::{budget_seam, TooComplex};
+    let mut p = sharing_a_text();
     let before = p.state_before();
     let (e, _) = budget_seam::with_limit(200_000, || p.flatten_annotations(None));
     let e = e.expect_err("refused");
@@ -693,5 +704,234 @@ fn moving_an_annotation_too_complex_to_draw_is_refused() {
     let e = e.expect_err("refused");
     let too = e.downcast_ref::<TooComplex>().expect("too complex");
     assert_eq!(too.what, "drawing the annotations", "{e:#}");
+    assert_eq!(p.state_since(&before), []);
+}
+
+/// `n` freehand drawings on page 1 of `p`, each with a `/Rect` of its own, listing one
+/// 10,000-point stroke `strokes` times.
+fn drawings(p: &mut Pdf, n: usize, strokes: usize) {
+    let stroke: Vec<Object> = (0..10_000i64)
+        .flat_map(|i| [100 + i % 200, 200 + i % 2 * 50].map(Object::from))
+        .collect();
+    let stroke = p.doc.add_object(stroke);
+    let rect = [100i64, 200, 300, 250].map(Object::from).to_vec();
+    for _ in 0..n {
+        let d = dictionary! {
+            "Type" => "Annot", "Subtype" => "Ink", "Rect" => rect.clone(),
+            "InkList" => vec![Object::Reference(stroke); strokes],
+            "C" => vec![Object::from(0i64)],
+        };
+        annotate(p, d);
+    }
+}
+
+/// The points listed for `a`.
+fn points(a: &limarepdf_core::Annot) -> usize {
+    a.paths.iter().map(Vec::len).sum()
+}
+
+/// A drawing is listed with the 100,000 points it is drawn with, however many its strokes
+/// have: one listing a 10,000-point stroke 1,000 times lists the first ten. Before, it
+/// listed all 10⁷ points.
+#[test]
+fn a_drawing_is_listed_with_the_points_it_is_drawn_with() {
+    let mut p = zebras(1);
+    drawings(&mut p, 1, 1_000);
+    let listed = p.annotations();
+    assert_eq!(listed[0].paths.len(), 10);
+    assert_eq!(points(&listed[0]), 100_000);
+}
+
+/// Listing annotations reads their points within one budget a listing ("reading the
+/// annotations"), and lists those past it unread rather than leave them out: of 20
+/// drawings listing a 10,000-point stroke ten times, the first are listed with their
+/// 100,000 points and the rest with none. Before, each was read in full.
+#[test]
+fn annotations_past_the_reading_budget_are_listed_unread() {
+    use limarepdf_core::budget_seam;
+    let mut p = zebras(1);
+    drawings(&mut p, 20, 10);
+    let (all, _) = budget_seam::with_limit(1_000_000, || p.annotations());
+    let (page, _) = budget_seam::with_limit(1_000_000, || p.page_annotations(0).unwrap());
+    for listed in [all, page] {
+        assert_eq!(listed.len(), 20);
+        let read = listed.iter().take_while(|a| points(a) == 100_000).count();
+        assert!((1..20).contains(&read), "{read} read");
+        assert!(listed[..read].iter().all(|a| !a.unread));
+        assert!(listed[read..]
+            .iter()
+            .all(|a| a.paths.is_empty() && a.unread));
+    }
+}
+
+/// Their text is read within the same budget: of 20 text boxes sharing a 20,004-character
+/// text, the first are listed with it and the rest without. Before, each was read in full.
+#[test]
+fn text_past_the_reading_budget_is_listed_unread() {
+    use limarepdf_core::budget_seam;
+    let p = sharing_a_text();
+    let (all, _) = budget_seam::with_limit(200_000, || p.annotations());
+    let (page, _) = budget_seam::with_limit(200_000, || p.page_annotations(0).unwrap());
+    for listed in [all, page] {
+        assert_eq!(listed.len(), 20);
+        let read = listed
+            .iter()
+            .take_while(|a| a.contents == long_text())
+            .count();
+        assert!((1..20).contains(&read), "{read} read");
+        assert!(listed[..read]
+            .iter()
+            .all(|a| !a.unread && a.text_style.is_some()));
+        let unread = |a: &limarepdf_core::Annot| a.unread && a.text_style.is_none();
+        assert!(listed[read..]
+            .iter()
+            .all(|a| a.contents.is_empty() && unread(a)));
+    }
+}
+
+/// A text box's style is read once when it is listed, and listed as it is drawn: its
+/// 1,000-byte `/DA`, which has no colour, and its `/DS`, which is red, are each charged
+/// once, and its text is listed red. Before, the `/DA` was charged twice and the text
+/// listed black.
+#[test]
+fn a_text_box_s_style_is_read_once_and_listed_as_drawn() {
+    use limarepdf_core::budget_seam;
+    let mut p = zebras(1);
+    let da = format!("/Helv 12 Tf{}", " ".repeat(989));
+    let ds = "font: 12pt Helvetica; color:#FF0000";
+    let rect = [72i64, 400, 300, 500].map(Object::from).to_vec();
+    let d = dictionary! {
+        "Type" => "Annot", "Subtype" => "FreeText", "Rect" => rect,
+        "DA" => Object::string_literal(da), "DS" => Object::string_literal(ds),
+        "Contents" => Object::string_literal("Zebra"),
+    };
+    annotate(&mut p, d);
+    let (listed, taken) = budget_seam::with_limit(u64::MAX, || p.annotations());
+    let colour = listed[0].text_style.map(|s| s.color);
+    // Drawing none; reading 64 for the annotation, then its `/DA`, `/DS` and text.
+    let read = vec![0, 64 + 1_000 + ds.len() as u64 + 5];
+    assert_eq!((colour, taken), (Some([1.0, 0.0, 0.0]), read));
+}
+
+/// Removing annotations, which offers each to be chosen by what it says, is refused past
+/// the budget, with nothing changed, rather than keep one unread: an annotation written
+/// into the page's list directly isn't given an object of its own. Within it, they go.
+#[test]
+fn removing_annotations_past_the_reading_budget_is_refused() {
+    use limarepdf_core::{budget_seam, TooComplex};
+    let mut p = sharing_a_text();
+    let page = p.page_ids()[0];
+    let pd = p.doc.get_dictionary_mut(page).unwrap();
+    let mut list = pd.get(b"Annots").unwrap().as_array().unwrap().clone();
+    let rect = [72i64, 600, 92, 620].map(Object::from).to_vec();
+    let note = dictionary! {
+        "Type" => "Annot", "Subtype" => "Text", "Rect" => rect,
+        "T" => Object::string_literal("Someone"),
+    };
+    list.insert(0, Object::Dictionary(note));
+    pd.set("Annots", list);
+    let before = p.state_before();
+    let (e, _) =
+        budget_seam::with_limit(200_000, || p.remove_annotations(|a| a.author == "Someone"));
+    let e = e.expect_err("refused");
+    let too = e.downcast_ref::<TooComplex>().expect("too complex");
+    assert_eq!(too.what, "reading the annotations", "{e:#}");
+    assert_eq!(p.state_since(&before), []);
+    let (done, _) = budget_seam::with_limit(2_000_000, || {
+        p.remove_annotations(|a| a.contents == long_text())
+    });
+    assert_eq!(done.unwrap(), 20);
+}
+
+/// Deleting one annotation, as the app does, reads no other: one listed unread past the
+/// budget is deleted, with its reply, where removing it by what it is would be refused.
+#[test]
+fn an_annotation_past_the_reading_budget_is_deleted_by_itself() {
+    use limarepdf_core::budget_seam;
+    let mut p = sharing_a_text();
+    let (listed, _) = budget_seam::with_limit(200_000, || p.annotations());
+    let last = listed.last().unwrap();
+    assert!(last.unread);
+    let rect = [72i64, 600, 92, 620].map(Object::from).to_vec();
+    let reply = dictionary! {
+        "Type" => "Annot", "Subtype" => "Text", "Rect" => rect,
+        "IRT" => Object::Reference(last.id),
+    };
+    annotate(&mut p, reply);
+    let (e, _) = budget_seam::with_limit(200_000, || p.remove_annotations(|a| a.id == last.id));
+    assert!(e.is_err());
+    let (done, _) = budget_seam::with_limit(200_000, || p.remove_annotation(last.id));
+    assert_eq!(done.unwrap(), 2);
+    let left = p.annotations();
+    assert_eq!(left.len(), 19);
+    assert!(left.iter().all(|a| a.id != last.id));
+}
+
+/// Redacting looks for the text it removed in every comment, within the budget; past it
+/// the redaction is refused, with nothing changed, rather than miss one. Within it, the
+/// comments repeating "Zebra" are named.
+#[test]
+fn a_redaction_with_comments_past_the_reading_budget_changes_nothing() {
+    use limarepdf_core::{budget_seam, TooComplex};
+    let mut p = sharing_a_text();
+    let before = p.state_before();
+    // Over "Zebra", above the text boxes.
+    let mark = [(0, [0.0, 0.0, 612.0, 200.0])];
+    let (e, _) = budget_seam::with_limit(200_000, || p.redact(&mark));
+    let e = e.expect_err("refused");
+    let too = e.downcast_ref::<TooComplex>().expect("too complex");
+    assert_eq!(too.what, "reading the annotations", "{e:#}");
+    assert_eq!(p.state_since(&before), []);
+    let (done, _) = budget_seam::with_limit(2_000_000, || p.redact(&mark));
+    let elsewhere = done.unwrap().elsewhere;
+    let comments = vec!["a comment on page 1".to_string()];
+    assert_eq!(elsewhere, [("zebra".to_string(), comments)]);
+}
+
+/// Applying the redaction marks reads them, and looks for what they removed in every
+/// comment, within the budget; past it, it is refused, with nothing changed.
+#[test]
+fn applying_redaction_marks_past_the_reading_budget_changes_nothing() {
+    use limarepdf_core::{budget_seam, TooComplex};
+    let mut p = sharing_a_text();
+    // Over "Zebra", above the text boxes, after them.
+    let rect = [0i64, 592, 612, 792].map(Object::from).to_vec();
+    annotate(
+        &mut p,
+        dictionary! { "Type" => "Annot", "Subtype" => "Redact", "Rect" => rect },
+    );
+    let before = p.state_before();
+    let (e, _) = budget_seam::with_limit(200_000, || p.apply_redactions());
+    let e = e.expect_err("refused");
+    let too = e.downcast_ref::<TooComplex>().expect("too complex");
+    assert_eq!(too.what, "reading the annotations", "{e:#}");
+    assert_eq!(p.state_since(&before), []);
+    let (done, _) = budget_seam::with_limit(2_000_000, || p.apply_redactions());
+    assert_eq!(done.unwrap().elsewhere.len(), 1);
+}
+
+/// Removing the comments needs only what each annotation is: it reads nothing more, and
+/// isn't refused however much they say.
+#[test]
+fn removing_the_comments_reads_only_what_each_is() {
+    use limarepdf_core::{budget_seam, Hidden};
+    let mut p = sharing_a_text();
+    let (rep, _) = budget_seam::with_limit(200_000, || p.remove_hidden(&[Hidden::Comments]));
+    assert_eq!(rep.unwrap().count(Hidden::Comments), 20);
+}
+
+/// Changing an annotation listed unread is refused, with nothing changed, rather than
+/// write over what wasn't read.
+#[test]
+fn changing_an_annotation_past_the_reading_budget_is_refused() {
+    use limarepdf_core::{budget_seam, TooComplex};
+    let mut p = sharing_a_text();
+    let last = p.annotations().last().unwrap().id;
+    let before = p.state_before();
+    let (e, _) =
+        budget_seam::with_limit(200_000, || p.set_annotation(last, None, 1.0, &long_text()));
+    let e = e.expect_err("refused");
+    let too = e.downcast_ref::<TooComplex>().expect("too complex");
+    assert_eq!(too.what, "reading the annotations", "{e:#}");
     assert_eq!(p.state_since(&before), []);
 }

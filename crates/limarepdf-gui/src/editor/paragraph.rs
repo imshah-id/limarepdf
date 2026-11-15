@@ -536,12 +536,13 @@ impl Editor {
 
     /// What the alignment commands act on (NEW-15): page text (a paragraph or line being
     /// edited, words selected with the read tool, lines selected with the arrow), new text
-    /// being typed, a text box being typed in or selected, or a form field being typed in,
-    /// which its form aligns. What can't be aligned among page text is said when they act.
+    /// being typed, a text box being typed in or selected (not one whose text wasn't read,
+    /// [`Annot::unread`]), or a form field being typed in, which its form aligns. What can't
+    /// be aligned among page text is said when they act.
     pub fn aligns_text(&self) -> Aligns {
         let held = self.selection.objects().map_or(&[][..], |(_, held)| held);
         let lines = held.iter().any(|h| h.kind == ObjKind::Text);
-        let text_box = |a: &Annot| a.kind == AnnotKind::TextBox && !a.locked();
+        let text_box = |a: &Annot| a.kind == AnnotKind::TextBox && !a.locked() && !a.unread;
         if self.editing_line() {
             Aligns::PageText
         } else if self.adding.is_some() {

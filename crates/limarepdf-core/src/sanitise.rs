@@ -989,7 +989,7 @@ impl Pdf {
     /// attached files (those holding one). Only what each is matters, so none is drawn to
     /// place it.
     fn annots_of(&self, h: Hidden) -> HashSet<ObjectId> {
-        (self.every_annotation(&mut Place::own()).into_iter())
+        (self.every_annotation(&mut Place::kinds()).into_iter())
             .filter(|a| match h {
                 Hidden::Comments => a.kind != crate::AnnotKind::Redact,
                 _ => matches!(&a.kind, crate::AnnotKind::Other(s) if s == "FileAttachment"),

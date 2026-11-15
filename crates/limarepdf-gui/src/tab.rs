@@ -1582,7 +1582,7 @@ impl Tab {
                     }
                 }
                 Action::DeleteAnnot(p, id) => {
-                    let gone = |pdf: &mut Pdf| pdf.remove_annotations(|a| a.id == id).map(|_| ());
+                    let gone = |pdf: &mut Pdf| pdf.remove_annotation(id).map(|_| ());
                     if self.edit_pages(ctx, &[p], gone) {
                         self.ed.selection.clear_annot();
                         self.notice = Some("Deleted the comment".into());
@@ -4069,6 +4069,7 @@ mod tests {
             text_style: None,
             shape: None,
             paths: Vec::new(),
+            unread: false,
         };
         // 3 answers 1, 4 answers 3, 5 answers a comment on another page, 6 and 7 answer
         // each other.

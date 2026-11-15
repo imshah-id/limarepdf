@@ -1245,6 +1245,7 @@ fn annot_list(input: &Path, pages: &Option<String>, json: bool, pw: &Option<Stri
                     "reply_to": a.reply_to.and_then(index).map(|i| i + 1),
                     "hidden": a.hidden(),
                     "locked": a.locked(),
+                    "unread": a.unread,
                 })
             })
             .collect();
@@ -1264,6 +1265,10 @@ fn annot_list(input: &Path, pages: &Option<String>, json: bool, pw: &Option<Stri
         }
         if a.locked() {
             notes.push("locked".into());
+        }
+        // Past the budget for reading the annotations: its author and comment weren't read.
+        if a.unread {
+            notes.push("too large to show".into());
         }
         let dash = |s: &str| {
             if s.is_empty() {

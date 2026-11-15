@@ -1372,6 +1372,28 @@ most 2.1 s (long text boxes shown), the drawings save in at most 2 s, and the mo
 the limit (13 s to draw, 109 s to compress when saved); 64 steps an annotation let 207,000 tiny text boxes take
 1.5 GiB; and one step a byte of text set let short ones take 4.5 s to show.
 
+Reading the listed annotations has a budget of its own (`annot_ap::READ_STEPS`, `Place::read`; WP-04): 64 steps
+for each annotation (`READ_EACH`), one for each point and ink stroke read and each byte of text (its comment,
+author, subject and name, and a text box's `/DA` and `/DS`, read once for its style by `box_geometry`, as it is
+drawn: a text box whose colour is only in `/DS` is listed in that colour, where only `/DA` was read before). Past
+it, the listings list the rest `Annot::unread`: their date, flags, colour, opacity, box and what they reply to are
+read, their text, points and style not (empty, `text_style` `None`). The app shows "Too large to show"
+(`editor::TOO_LARGE`) for their text on the card, the tip, the inspector and the replies, and lets them be
+selected, moved and deleted as if read (text markup still stays on its text; a redaction mark isn't resized, its
+areas unknown), never changed: a double-click doesn't open one for typing (`writable`), its inspector offers only
+Delete, and `change_annotation` refuses for one, rather than write what is shown over its text. Deleting one
+(`Pdf::remove_annotation`, from the Comments view or the page) reads no other annotation. What removes
+information reads every annotation and refuses past the budget (`Place::whole`): `remove_annotations` (`annot
+remove`, choosing by author), applying redaction (the marks' areas) and its search for the removed text in the
+comments (`find_elsewhere`). What needs only what each annotation is reads nothing more (`Place::kinds`):
+sanitising's comments and attachments, and the marks applying redaction removes. `annot list` marks one "too
+large to show" (`"unread": true` in JSON). `READ_STEPS` is 2²⁴: 2,295 times the corpus maximum, 7,310 steps
+(`pdfjs/issue12579.pdf`, 85 annotations; the 1,086 files that open, measured 2026-11-15 with the budget lifted).
+Timed in an optimised build (the `ci-test` profile) on made-up pages just under the limit, ink strokes sharing
+their points are the dearest: listed in 0.8 s and removed in 1.0 s (0.05 µs a step). 262,144 annotations with
+nothing to read are listed in 0.3 s and removed in 0.7 s, and 250,406 short notes use 745 MiB, the document
+included; every other case takes at most 0.5 s.
+
 Links (ENH-17) are `links.rs`, kept apart from comments: `AnnotKind::of` leaves them out, so they are never in
 the Comments view or `Pdf::annotations`. `Pdf::page_links` reads every link of a page with an area: its id
 (`LinkId::Object`, or `LinkId::Inline` for a link written inside the page's `/Annots` rather than as an object,
@@ -1545,7 +1567,9 @@ CLI, run as a separate program). It is built for core's own tests and, through c
 for the app's and the CLI's: their dev-dependencies turn the feature on, so `cargo build --release` never has it,
 and CI's "No test seam" steps check the release programs for the variable's name. The feature has a second seam
 for the CLI, `render::panic_seam`: with `LIMAREPDF_TEST_DRAW_PANICS` set, drawing a page panics, so its tests reach
-the CLI's panic guard now that no file is known to make hayro panic. Writes of LimarePDF's own files say what happened too (BUG-14): `IdStore::create` and `import` return a
+the CLI's panic guard now that no file is known to make hayro panic. A third, `budget::budget_seam`, gives a
+thread's operations another limit; with `LIMAREPDF_TEST_BUDGET` set (`budget_seam::VAR`), every operation the CLI
+does has that limit, so its tests reach a budget's refusal. Writes of LimarePDF's own files say what happened too (BUG-14): `IdStore::create` and `import` return a
 `Stored` (the ID and warnings) once the ID's file is written, so a default that can't be noted, or a sync not
 confirmed, is a warning, never a failure that a second try would repeat; `IdStore::remove` returns its warnings;
 the app's ID window shows them (`Said::Warning`), the CLI prints `warning:` lines and succeeds, and the trust list,

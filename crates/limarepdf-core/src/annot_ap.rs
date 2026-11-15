@@ -5,6 +5,7 @@
 //! fields.
 
 use crate::budget::{self, TooComplex, Work};
+use crate::doc::{decode_shown_text, decode_text};
 use crate::embed;
 use crate::form_ap::{
     self, encode, fill_color, nums, op, stroke_color, Body, Border, BoxSetting, Look, Metrics,
@@ -82,7 +83,7 @@ const CLOUD: f32 = 4.75;
 const TEXT_SIZE: f32 = 12.0;
 /// Most points read from one geometry entry, and drawn in an Ink drawing or a Squiggly
 /// one's wavy lines, against hostile files.
-const MAX_POINTS: usize = 100_000;
+pub(crate) const MAX_POINTS: usize = 100_000;
 /// Most numbers read from a dash pattern (`/BS /D`), against hostile files.
 const MAX_DASH: usize = 16;
 
@@ -107,13 +108,33 @@ pub(crate) fn work() -> Work {
     Work::new(WHAT, budget::limit(STEPS))
 }
 
+/// What reading listed annotations is called when its budget refuses it.
+const READING: &str = "reading the annotations";
+/// The steps reading listed annotations may take ([`Place::read`]): 64 for each
+/// annotation, one for each point and ink stroke read and each byte of text. Annotations
+/// can share their points and text, which each reads again, so the steps count everything
+/// read, however often. 2²⁴: 2,295 times the most the render corpus's annotations take
+/// (7,310, `pdfjs/issue12579.pdf`), read in at most about 1 s (architecture.md, after
+/// `annot_rect`).
+const READ_STEPS: u64 = 1 << 24;
+/// The steps reading an annotation takes before its points and text.
+const READ_EACH: u64 = 64;
+
 /// Where listed annotations are ([`Pdf::annot_rect`]): those placed by what is drawn for
 /// them, drawn within one budget, and once it is spent each at its own `/Rect`; or none
-/// drawn, each at its own `/Rect`.
+/// drawn, each at its own `/Rect`. Their points and text are read within another, and
+/// once it is spent not at all ([`Place::read`]); or none are read, for what needs only
+/// what each annotation is.
 pub(crate) struct Place {
     work: Option<Work>,
     /// The budget's refusal, once it is spent.
     spent: Option<TooComplex>,
+    /// Whether their points and text are read.
+    reads: bool,
+    /// The budget for reading them, made when the first is read.
+    read: Option<Work>,
+    /// The reading budget's refusal, once it is spent.
+    unread: Option<TooComplex>,
 }
 
 impl Place {
@@ -122,14 +143,47 @@ impl Place {
         Place {
             work: Some(work()),
             spent: None,
+            reads: true,
+            read: None,
+            unread: None,
         }
     }
 
-    /// Drawing none, for what needs only what each annotation is.
+    /// Drawing none.
     pub(crate) fn own() -> Place {
         Place {
             work: None,
             spent: None,
+            reads: true,
+            read: None,
+            unread: None,
+        }
+    }
+
+    /// Drawing and reading none, for what needs only what each annotation is.
+    pub(crate) fn kinds() -> Place {
+        Place {
+            reads: false,
+            ..Place::own()
+        }
+    }
+
+    /// `f` reading an annotation's points and text within the budget: `None` once it is
+    /// spent, for this annotation and those after it, and when none are read.
+    pub(crate) fn read<T>(
+        &mut self,
+        f: impl FnOnce(&mut Work) -> Result<T, TooComplex>,
+    ) -> Option<T> {
+        if !self.reads || self.unread.is_some() {
+            return None;
+        }
+        let work = (self.read).get_or_insert_with(|| Work::new(READING, budget::limit(READ_STEPS)));
+        match work.take(READ_EACH).and_then(|()| f(work)) {
+            Ok(t) => Some(t),
+            Err(e) => {
+                self.unread = Some(e);
+                None
+            }
         }
     }
 
@@ -147,9 +201,10 @@ impl Place {
         pdf.rect(d.get(b"Rect").ok()?)
     }
 
-    /// Refused when any was placed at its own `/Rect` because the budget was spent.
+    /// Refused when any was placed at its own `/Rect` because the drawing budget was spent,
+    /// or listed unread because the reading budget was.
     pub(crate) fn whole(self) -> Result<(), TooComplex> {
-        self.spent.map_or(Ok(()), Err)
+        self.spent.or(self.unread).map_or(Ok(()), Err)
     }
 }
 
@@ -210,9 +265,6 @@ pub(crate) struct BoxGeometry {
     pub text_rgb: Vec<f32>,
     /// Alignment (`/Q`).
     pub q: i64,
-    /// The bytes of `/DA` and `/DS` read, which drawing the box is charged
-    /// ([`Pdf::free_text`]).
-    pub read: usize,
 }
 
 impl BoxGeometry {
@@ -622,21 +674,10 @@ impl Pdf {
                 };
                 ops.push(op("J", vec![1.into()]));
                 ops.push(op("j", vec![1.into()]));
-                // The strokes share the points, so one listed many times is read and drawn
-                // only to the points left.
-                let mut left = MAX_POINTS;
-                for s in list.iter().take(MAX_POINTS) {
-                    if left == 0 {
-                        break;
-                    }
-                    work.take(1)?;
-                    let p = self.points_charged(Some(s), left, work)?;
-                    if let Some(p) = p.filter(|p| !p.is_empty()) {
-                        left -= p.len();
-                        polyline(&mut ops, &p);
-                        if p.len() == 1 {
-                            ops.push(op("l", nums(&[p[0].0, p[0].1])));
-                        }
+                for p in self.ink_strokes(list, work)? {
+                    polyline(&mut ops, &p);
+                    if p.len() == 1 {
+                        ops.push(op("l", nums(&[p[0].0, p[0].1])));
                     }
                 }
                 line.paint(&mut ops, false);
@@ -706,8 +747,13 @@ impl Pdf {
     }
 
     /// Where and how a text box whose box is `rect` sets its text, as [`Self::free_text`]
-    /// draws it.
-    pub(crate) fn box_geometry(&self, d: &Dictionary, rect: [f32; 4]) -> BoxGeometry {
+    /// draws it. Its `/DA` and `/DS` are charged to `work` before they are read.
+    pub(crate) fn box_geometry(
+        &self,
+        d: &Dictionary,
+        rect: [f32; 4],
+        work: &mut Work,
+    ) -> Result<BoxGeometry, TooComplex> {
         // `/Rotate` (as Acrobat writes it) turns the text with its page, so it reads
         // upright as the page is shown.
         let turn = d
@@ -730,17 +776,9 @@ impl Pdf {
         let to_own = mx::inv(to_page).unwrap_or(mx::ID);
         let inner = self.inner(d, rect);
         let mut tb = mx::transform_rect(to_own, inner);
-        let da = d
-            .get(b"DA")
-            .ok()
-            .and_then(|o| self.string_bytes(o))
-            .unwrap_or_default();
+        let da = (self.bytes_charged(d.get(b"DA").ok(), work)?).unwrap_or_default();
         let (_, size, color) = parse_da(&da);
-        let style = d
-            .get(b"DS")
-            .ok()
-            .and_then(|o| self.text_value(o))
-            .unwrap_or_default();
+        let style = (self.text_charged(d.get(b"DS").ok(), false, work)?).unwrap_or_default();
         let (ds_size, ds_color) = parse_style(&style);
         let size = if size > 0.0 {
             size
@@ -769,7 +807,7 @@ impl Pdf {
                 clouded = true;
             }
         }
-        BoxGeometry {
+        Ok(BoxGeometry {
             w,
             h,
             matrix,
@@ -788,8 +826,7 @@ impl Pdf {
                 .ok()
                 .and_then(|o| self.int_value(o))
                 .unwrap_or(0),
-            read: da.len() + style.len(),
-        }
+        })
     }
 
     /// How text box `id` sets its text, as it is drawn: `None` when it isn't a text box on a
@@ -800,7 +837,7 @@ impl Pdf {
             return None;
         }
         let rect = self.rect(d.get(b"Rect").ok()?)?;
-        let g = self.box_geometry(d, rect);
+        let g = self.box_geometry(d, rect, &mut work()).ok()?;
         let to_vis = mx::inv(self.vis_down(self.annot_page(id).ok()?).0)?;
         let shown = mx::mul(g.to_page, to_vis);
         // Its own x along the page as shown, its own y up it.
@@ -828,8 +865,7 @@ impl Pdf {
         alpha: f32,
         work: &mut Work,
     ) -> Result<Drawing, TooComplex> {
-        let g = self.box_geometry(d, rect);
-        work.take(g.read as u64)?;
+        let g = self.box_geometry(d, rect, work)?;
         let text = self.box_text(d);
         work.take(SETTING * text.len() as u64)?;
         let bg = self.colour(d, b"C");
@@ -970,7 +1006,7 @@ impl Pdf {
 
     /// [`Pdf::points_upto`], charged to `work` a step for each point before it is read:
     /// annotations can share an array, which each reads again.
-    fn points_charged(
+    pub(crate) fn points_charged(
         &self,
         o: Option<&Object>,
         n: usize,
@@ -982,6 +1018,86 @@ impl Pdf {
         let len = o.as_array().map_or(0, Vec::len).min(2 * n);
         work.take(len.div_ceil(2) as u64)?;
         Ok(self.points_upto(Some(o), n))
+    }
+
+    /// The strokes of an `/InkList`, those with points, charged to `work` as
+    /// [`Pdf::points_charged`] charges them. They share [`MAX_POINTS`], so one listed many
+    /// times is read only to the points left.
+    pub(crate) fn ink_strokes(
+        &self,
+        list: &[Object],
+        work: &mut Work,
+    ) -> Result<Vec<Vec<(f32, f32)>>, TooComplex> {
+        let mut left = MAX_POINTS;
+        let mut out = Vec::new();
+        for s in list.iter().take(MAX_POINTS) {
+            if left == 0 {
+                break;
+            }
+            work.take(1)?;
+            let p = self.points_charged(Some(s), left, work)?;
+            if let Some(p) = p.filter(|p| !p.is_empty()) {
+                left -= p.len();
+                out.push(p);
+            }
+        }
+        Ok(out)
+    }
+
+    /// [`Pdf::string_bytes`], charged to `work` a step for each byte before it is read.
+    pub(crate) fn bytes_charged(
+        &self,
+        o: Option<&Object>,
+        work: &mut Work,
+    ) -> Result<Option<Vec<u8>>, TooComplex> {
+        match o.and_then(|o| self.doc.dereference(o).ok()) {
+            Some((_, Object::String(s, _))) => {
+                work.take(s.len() as u64)?;
+                Ok(Some(s.clone()))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// [`Pdf::text_value`] (or [`Pdf::shown_text_value`] when `shown`), charged to `work` a
+    /// step for each byte before it is read: a stream is decoded only to the steps left,
+    /// and refused past them.
+    pub(crate) fn text_charged(
+        &self,
+        o: Option<&Object>,
+        shown: bool,
+        work: &mut Work,
+    ) -> Result<Option<String>, TooComplex> {
+        let Some((_, o)) = o.and_then(|o| self.doc.dereference(o).ok()) else {
+            return Ok(None);
+        };
+        match o {
+            Object::String(s, _) => {
+                work.take(s.len() as u64)?;
+                Ok(Some(match shown {
+                    true => decode_shown_text(s),
+                    false => decode_text(s),
+                }))
+            }
+            Object::Name(n) => {
+                work.take(n.len() as u64)?;
+                Ok(Some(String::from_utf8_lossy(n).into_owned()))
+            }
+            Object::Stream(s) => {
+                let max = work.left().min(crate::MAX_CONTENT as u64) as usize;
+                match s.decompressed_content_with_limit(max) {
+                    Ok(data) => {
+                        work.take(data.len() as u64)?;
+                        Ok(Some(decode_text(&data)))
+                    }
+                    Err(lopdf::Error::Decompress(
+                        lopdf::DecompressError::MemoryLimitExceeded { .. },
+                    )) if max < crate::MAX_CONTENT => Err(work.refusal()),
+                    Err(_) => Ok(None),
+                }
+            }
+            _ => Ok(None),
+        }
     }
 }
 

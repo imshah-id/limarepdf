@@ -3,7 +3,7 @@
 //! comment, and its place on the page. Each gets a drawing of its own straight away, so
 //! other viewers show it as LimarePDF does.
 
-use crate::annot_ap::{self, arrow_size, DRAWN, NOTE_SIZE};
+use crate::annot_ap::{self, arrow_size, Place, DRAWN, NOTE_SIZE};
 use crate::annots::NO_VIEW;
 use crate::doc::encode_text;
 use crate::embed::check_writable;
@@ -543,10 +543,11 @@ impl Pdf {
         let pb = self.page_box(self.annot_page(id)?);
         let m = Metrics::Set(self.setter(FontChoice::default(), &text));
         let mut r = rect;
+        let mut work = annot_ap::work();
         // Growing can make room for margins or a cloud the box had none for, which take
         // some of it back: measure again.
         for _ in 0..3 {
-            let g = self.box_geometry(d, r);
+            let g = self.box_geometry(d, r, &mut work)?;
             let look = g.look(None);
             let need = lines_height(&text, look.w, g.size, look.inset(), &m);
             if need <= look.h + 0.01 {
@@ -627,11 +628,14 @@ impl Pdf {
         opacity: f32,
         contents: &str,
     ) -> Result<()> {
-        let old = self
-            .annotations()
-            .into_iter()
+        let mut place = Place::drawn();
+        let old = (self.listed(&mut place).into_iter())
             .find(|a| a.id == id)
             .ok_or_else(|| anyhow!("no such annotation"))?;
+        // Its text unread would be written over with what is shown for it.
+        if old.unread {
+            place.whole()?;
+        }
         let opacity = opacity.clamp(0.0, 1.0);
         let looks_new = old.color != color
             || (old.opacity - opacity).abs() > 1e-3

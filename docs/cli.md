@@ -53,8 +53,8 @@ with the status it would have had otherwise.
 | `limarepdf-cli search in.pdf "invoice"` | Find text: one line a match, `page 3: …the words around it…`, then the count ("1 match", "12 matches", "No matches"); `--boxes` also prints where each match is on its page (`page 3 [x0 y0 x1 y1]`, points from the top left), a phrase running on to the next page on both. `--match-case`: capital and small letters must be as typed ("Walrus" doesn't find "walrus"); `--whole-words`: whole words only ("walrus" doesn't find "walruses"; [details](reading-and-finding.md#find-words)) |
 | `limarepdf-cli objects in.pdf --pages 1` | List the editable objects (text lines, images, paths) with their boxes; OCR text is marked "(hidden)", and a line in more than one font, size or colour shows its first part's, marked "mixed" |
 | `limarepdf-cli render in.pdf --dpi 150 --out-dir pngs` | Save pages as images, as the app shows them; `--format jpeg --quality 85` for JPEG. Images already there aren't replaced, and nothing is written, unless you add `--overwrite`; an image name that is a link to the input is refused even then. Filled form fields are drawn as the app draws them; a warning names any it can't draw, which come out empty, and another says what else the images lack (a picture it can't read, a font that isn't installed), as the app's notice does. A page past 65,280 pixels a side, or 268 million in all, at that resolution refuses the whole run; so does a file LimarePDF can't open ([details](export-and-printing.md#pages-as-images)) |
-| `limarepdf-cli annot list in.pdf` | List the annotations (comments, notes, highlights, drawings): number, page, type, author, date and comment, and which one a reply answers. `--pages 2-3` for some pages; links and form fields are left out |
-| `limarepdf-cli annot list in.pdf --json` | The same as a JSON array, with each annotation's colour, opacity and box on the page (points from the top left) |
+| `limarepdf-cli annot list in.pdf` | List the annotations (comments, notes, highlights, drawings): number, page, type, author, date and comment, and which one a reply answers. `--pages 2-3` for some pages; links and form fields are left out. When the annotations are too many or too long to read (more than 16,777,216 steps), those past that are listed without their author or comment, marked "too large to show" |
+| `limarepdf-cli annot list in.pdf --json` | The same as a JSON array, with each annotation's colour, opacity and box on the page (points from the top left), and `"unread": true` for one too large to show |
 | `limarepdf-cli form list in.pdf` | List the form fields: name, kind, value, pages, and whether each is required or read-only, with a choice's options |
 | `limarepdf-cli form list in.pdf --json` | The fields' values as a JSON object keyed by field name, in the form's order: text as strings, checkboxes as `true`/`false`, a radio group or drop-down's choice as a string (`null` for none), a multi-select list as an array. Push buttons and signatures are left out |
 
@@ -97,6 +97,9 @@ with that reason. Hybrid forms, which carry ordinary fields alongside the XFA, a
 The types are `highlight`, `underline`, `strikeout`, `squiggly`, `note`, `textbox`, `square`, `circle`, `line`,
 `polygon`, `polyline`, `ink` (freehand drawing) and `stamp`; other types can be named as the file does, for example
 `FileAttachment`. Removing an annotation also removes the replies to it. Locked annotations are removed too.
+Removing reads every annotation, to choose by its author and to leave none out, so when they are too many or too
+long to read it stops with a message and writes nothing ("the document is too complex: reading the annotations
+would take more than 16777216 steps, so nothing was changed").
 
 Flattening draws highlights, notes, text boxes, shapes, lines, drawings, stamps and carets; replies and comment
 pop-ups are removed without being drawn, and hidden annotations are removed. Links, form fields, file attachments,
