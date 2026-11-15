@@ -584,11 +584,11 @@ impl Pdf {
         if d.get(b"Subtype").and_then(Object::as_name).ok() != Some(b"FreeText") {
             bail!("the annotation isn't a text box");
         }
-        let text = self.box_text(d);
+        let mut work = annot_ap::work();
+        let text = self.box_text(d, &mut work)?;
         let pb = self.page_box(self.annot_page(id)?);
         let m = Metrics::Set(self.setter(FontChoice::default(), &text));
         let mut r = rect;
-        let mut work = annot_ap::work();
         // Growing can make room for margins or a cloud the box had none for, which take
         // some of it back: measure again.
         for _ in 0..3 {

@@ -612,15 +612,20 @@ fn long_text() -> String {
 fn sharing_a_text() -> Pdf {
     let mut p = zebras(1);
     let text = p.doc.add_object(Object::string_literal(long_text()));
+    boxes_sharing(&mut p, text);
+    p
+}
+
+/// 20 text boxes on page 1 of `p`, below "Zebra", sharing `text`.
+fn boxes_sharing(p: &mut Pdf, text: ObjectId) {
     let rect = [72i64, 400, 300, 500].map(Object::from).to_vec();
     for _ in 0..20 {
         let d = dictionary! {
             "Type" => "Annot", "Subtype" => "FreeText", "Rect" => rect.clone(),
             "Contents" => text, "DA" => Object::string_literal("/Helv 12 Tf 0 g"),
         };
-        annotate(&mut p, d);
+        annotate(p, d);
     }
-    p
 }
 
 /// A text box's text is charged to drawing it: 20 text boxes sharing one 20,004-character
@@ -815,15 +820,20 @@ fn a_text_box_s_style_is_read_once_and_listed_as_drawn() {
     assert_eq!((colour, taken), (Some([1.0, 0.0, 0.0]), read));
 }
 
-/// A page of [`zebras`] with 20 comments sharing one text, a stream that deflates
-/// `inflated` and reads it as hexadecimal once inflated (`[/FlateDecode /ASCIIHexDecode]`).
-fn comments_sharing(inflated: Vec<u8>) -> Pdf {
-    let mut p = zebras(1);
+/// A text added to `p`, a stream that deflates `inflated` and reads it as hexadecimal once
+/// inflated (`[/FlateDecode /ASCIIHexDecode]`).
+fn hex_text(p: &mut Pdf, inflated: Vec<u8>) -> ObjectId {
     let mut s = Stream::new(Dictionary::new(), inflated);
     s.compress().unwrap();
     let filters = vec![Object::from("FlateDecode"), Object::from("ASCIIHexDecode")];
     s.dict.set("Filter", filters);
-    let text = p.doc.add_object(s);
+    p.doc.add_object(s)
+}
+
+/// A page of [`zebras`] with 20 comments sharing one text, a [`hex_text`] of `inflated`.
+fn comments_sharing(inflated: Vec<u8>) -> Pdf {
+    let mut p = zebras(1);
+    let text = hex_text(&mut p, inflated);
     let rect = [72i64, 600, 92, 620].map(Object::from).to_vec();
     for _ in 0..20 {
         let d = dictionary! {
@@ -873,6 +883,26 @@ fn a_text_is_charged_each_filter_it_is_decoded_through() {
     let (listed, read) = listed_within(&p, 10_000_000);
     assert!((1..20).contains(&read), "{read} read");
     assert!(listed[..read].iter().all(|a| a.contents == "A"));
+}
+
+/// A text box's text is charged what decoding it takes each time it is read, checked and
+/// drawn alike: flattening 20 text boxes sharing one that inflates to 100,000 bytes and
+/// then isn't hexadecimal is refused past the budget, with nothing changed, and done within
+/// it. Before, a text box's text was read uncharged, and its failure was free.
+#[test]
+fn text_boxes_whose_text_fails_to_decode_are_charged_it() {
+    use limarepdf_core::{budget_seam, TooComplex};
+    let mut p = zebras(1);
+    let text = hex_text(&mut p, vec![b'z'; 100_000]);
+    boxes_sharing(&mut p, text);
+    let before = p.state_before();
+    let (e, _) = budget_seam::with_limit(1_000_000, || p.flatten_annotations(None));
+    let e = e.expect_err("refused");
+    let too = e.downcast_ref::<TooComplex>().expect("too complex");
+    assert_eq!(too.what, "drawing the annotations", "{e:#}");
+    assert_eq!(p.state_since(&before), []);
+    let (done, _) = budget_seam::with_limit(40_000_000, || p.flatten_annotations(None));
+    assert_eq!(done.unwrap().drawn, 20);
 }
 
 /// Removing annotations, which offers each to be chosen by what it says, is refused past

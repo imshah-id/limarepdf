@@ -91,12 +91,12 @@ const MAX_DASH: usize = 16;
 const WHAT: &str = "drawing the annotations";
 
 /// The steps drawing annotations may take ([`Work`]): 256 for each annotation, one for each
-/// point read, each byte of other text read (a stamp's name, `/DA`, `/DS`, a text checked
-/// for what its font can't write; a stream's own bytes and what its filters give,
-/// [`Work::decode`]) and each byte drawn, and two for each byte of a text
-/// box's text set. Annotations can share their points and text, which each draws again, so
-/// the steps count everything drawn, however often. 2²⁴: 200 times the most the render
-/// corpus's annotations take with their own drawings taken away (83,771,
+/// point read, each byte of text read (a stamp's name, `/DA`, `/DS`, a text box's text each
+/// time it is checked for what its font can't write or set; a stream's own bytes and what
+/// its filters give, [`Work::decode`]) and each byte drawn, and two more for each byte of a
+/// text box's text set. Annotations can share their points and text, which each draws
+/// again, so the steps count everything drawn, however often. 2²⁴: 200 times the most the
+/// render corpus's annotations take with their own drawings taken away (83,771,
 /// `pdfjs/issue15292.pdf`), drawn in at most about 3 s (architecture.md, after `annot_rect`).
 const STEPS: u64 = 1 << 24;
 /// The steps an annotation takes before its points and text.
@@ -406,8 +406,7 @@ impl Pdf {
         if d.get(b"Subtype").and_then(Object::as_name).ok() != Some(b"FreeText") {
             return Ok(None);
         }
-        let text = self.box_text(d);
-        work.take(text.len() as u64)?;
+        let text = self.box_text(d, work)?;
         let text: String = text.chars().filter(|c| !c.is_control()).collect();
         Ok(Some(embed::unwritable(FontChoice::default(), &text)).filter(|m| !m.is_empty()))
     }
@@ -486,14 +485,14 @@ impl Pdf {
         Some((text, fonts))
     }
 
-    /// A text box's text, its `/Contents` with line breaks as `\n`.
-    pub(crate) fn box_text(&self, d: &Dictionary) -> String {
-        d.get(b"Contents")
-            .ok()
-            .and_then(|o| self.text_value(o))
+    /// A text box's text, its `/Contents` with line breaks as `\n`, charged to `work` as it
+    /// is read ([`Pdf::text_charged`]).
+    pub(crate) fn box_text(&self, d: &Dictionary, work: &mut Work) -> Result<String, TooComplex> {
+        let text = self.text_charged(d.get(b"Contents").ok(), false, work)?;
+        Ok(text
             .unwrap_or_default()
             .replace("\r\n", "\n")
-            .replace('\r', "\n")
+            .replace('\r', "\n"))
     }
 
     /// Where annotation `d` is on the page: its `/Rect`, or for one placed by its points whose
@@ -867,7 +866,7 @@ impl Pdf {
         work: &mut Work,
     ) -> Result<Drawing, TooComplex> {
         let g = self.box_geometry(d, rect, work)?;
-        let text = self.box_text(d);
+        let text = self.box_text(d, work)?;
         work.take(SETTING * text.len() as u64)?;
         let bg = self.colour(d, b"C");
         let mut ops = Vec::new();

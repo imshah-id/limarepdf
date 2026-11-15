@@ -1357,12 +1357,13 @@ file: `Pdf::annotations` and `page_links` list it, `move_annotation` moves from 
 removes the annotation when a mark touches it or its `/Rect`.
 
 Drawing annotations has a budget (`annot_ap::STEPS`, `work`; WP-04): 256 steps for each annotation, one for each
-point read, each byte of other text read (a stamp's name, `/DA`, `/DS`, a text checked for characters its font
-can't write) and each byte the drawing writes, and two for each byte of a text box's text set (`SETTING`).
-Text written as a stream, here and in reading them (below), is charged its own bytes and each byte its filters
-give, a failure too (`budget::Work::decode`): lopdf limits each filter to a try's size, tried at the stream's own
-size (4 KiB at least) and then four times larger as far as the steps left allow, a try that fails is charged all
-it could take, and past them it is refused. Before, a failure was free and only the last filter's bytes counted.
+point read, each byte of text read (a stamp's name, `/DA`, `/DS`, a text box's text each time it is checked for
+characters its font can't write or set, `box_text`) and each byte the drawing writes, and two more for each byte
+of a text box's text set (`SETTING`). Text written as a stream, here and in reading them (below), is charged its
+own bytes and each byte its filters give, a failure too (`budget::Work::decode`): lopdf limits each filter to a
+try's size, tried at the stream's own size (4 KiB at least) and then four times larger as far as the steps left
+allow, a try that fails is charged all it could take, and past them it is refused. Before, a failure was free and
+only the last filter's bytes counted, and a text box's text was read uncharged, only its length charged after.
 Annotations can share their points and text, which each reads again, so it counts everything drawn, however
 often. One budget covers what a change draws, and everything is drawn before anything is put in the file,
 so a refusal (`TooComplex`, "drawing the annotations") changes nothing: flattening, printing (`print_planned`),
