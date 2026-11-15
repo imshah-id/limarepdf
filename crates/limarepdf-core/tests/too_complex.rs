@@ -123,6 +123,65 @@ fn a_page_drawing_forms_over_and_over_is_refused_past_its_budget() {
     }
 }
 
+/// A spot colour whose tint transform is stitched `depth` levels deep, each level listing the
+/// one below `width` times, down to one exponential function.
+fn shared_tint(p: &mut Pdf, width: usize, depth: usize) -> Object {
+    let mut part = p.doc.add_object(dictionary! {
+        "FunctionType" => 2, "Domain" => vec![0.into(), 1.into()],
+        "C0" => vec![0.into()], "C1" => vec![1.into()], "N" => 1,
+    });
+    for _ in 0..depth {
+        let bounds = (1..width).map(|i| Object::Real(i as f32 / width as f32));
+        part = p.doc.add_object(dictionary! {
+            "FunctionType" => 3, "Domain" => vec![0.into(), 1.into()],
+            "Functions" => vec![Object::Reference(part); width],
+            "Bounds" => bounds.collect::<Vec<_>>(),
+            "Encode" => (0..width).flat_map(|_| [0.into(), 1.into()]).collect::<Vec<Object>>(),
+        });
+    }
+    Object::Array(vec![
+        "Separation".into(),
+        "Spot".into(),
+        "DeviceGray".into(),
+        part.into(),
+    ])
+}
+
+/// The steps reading [`shared_tint`]'s space takes, counted from the rule: the space and its
+/// alternate, each function once, and each part a stitching function lists.
+fn tint_steps(width: u64, depth: u64) -> u64 {
+    2 + (depth + 1) + depth * width
+}
+
+/// Reading a colour space is charged to its page's budget, each function read once: a page
+/// choosing a spot colour stitched three levels deep from parts it shares (8,421 functions
+/// read before) is read within the steps it needs, and refused one step short.
+#[test]
+fn a_page_s_colour_spaces_are_charged_to_its_budget() {
+    use limarepdf_core::{budget_seam, TooComplex};
+    let mut p = zebras(1);
+    let space = shared_tint(&mut p, 20, 3);
+    let form = p.doc.add_object(Stream::new(
+        dictionary! {
+            "Type" => "XObject", "Subtype" => "Form",
+            "BBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+            "Resources" => dictionary! { "ColorSpace" => dictionary! { "CS0" => space } },
+        },
+        b"/CS0 cs".to_vec(),
+    ));
+    draw_form(&mut p, 0, form);
+    // q, Do and Q; the form opened; its one operator.
+    let needed = zebra_steps() + 3 + 1 + 1 + tint_steps(20, 3);
+    let (read, taken) = budget_seam::with_limit(needed, || p.page_objects(0).map(|_| ()));
+    read.unwrap();
+    assert_eq!(taken, [needed]);
+    let (read, taken) = budget_seam::with_limit(needed - 1, || p.page_objects(0).map(|_| ()));
+    let e = read.unwrap_err();
+    let too = e.downcast_ref::<TooComplex>().expect("too complex");
+    assert_eq!(too.limit, needed - 1, "{e:#}");
+    assert!(taken.len() == 1 && taken[0] < needed, "{taken:?}");
+}
+
 /// A form whose content can't be decoded is passed over, as before: the rest of the page
 /// is read.
 #[test]

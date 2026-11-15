@@ -274,10 +274,11 @@ impl Parsed {
 const WHAT: &str = "reading the page";
 
 /// The steps reading one page may take ([`Work`]): an operator is a step, and so is each form
-/// opened, with one more for each KiB of its content. Every form is read again each time it
-/// is drawn, so the steps count everything a page draws, however often. 2²³: 14 times the
-/// most a page of the render corpus takes (588,688, `pdfbox/5134.pdf`), about 4 s of reading
-/// (architecture.md, after `reach::STEPS`).
+/// opened, with one more for each KiB of its content, and reading a colour space
+/// ([`Space::named`]). Every form is read again each time it is drawn, so the steps count
+/// everything a page draws, however often. 2²³: 7.5 times the most a page of the render corpus
+/// takes (1,124,715, `pdfbox/5134.pdf`), about 4 s of reading (architecture.md, after
+/// `reach::STEPS`).
 pub(crate) const STEPS: u64 = 1 << 23;
 
 /// Whether reading a page was refused ([`TooComplex`]), rather than a form in it couldn't
@@ -474,13 +475,16 @@ impl Pdf {
         let xobjs = self.resolved_dict(res.get(b"XObject").ok());
         let colour_spaces = self.resolved_dict(res.get(b"ColorSpace").ok());
         let mut space_cache: HashMap<Vec<u8>, Arc<Space>> = HashMap::new();
-        let mut space_named = |o: Option<&Object>| -> Arc<Space> {
+        let mut space_named = |o: Option<&Object>, work: &mut Work| {
             let Some(Object::Name(name)) = o else {
-                return Arc::new(Space::Other);
+                return Ok(Arc::new(Space::Other));
             };
-            let space = space_cache.entry(name.clone());
-            (space.or_insert_with(|| Arc::new(Space::named(&self.doc, &colour_spaces, name))))
-                .clone()
+            if let Some(space) = space_cache.get(name) {
+                return Ok(space.clone());
+            }
+            let space = Arc::new(Space::named(&self.doc, &colour_spaces, name, work)?);
+            space_cache.insert(name.clone(), space.clone());
+            Ok::<_, TooComplex>(space)
         };
         let mut font_cache: HashMap<Vec<u8>, Option<FontCtx>> = HashMap::new();
         let mut form_text: Vec<TextData> = Vec::new();
@@ -536,7 +540,7 @@ impl Pdf {
                 // A colour space's colour, as it shows (PB-65); a pattern's, or one that
                 // can't be read, leaves the colour shown as it was.
                 "cs" => {
-                    gs.fill_space = space_named(op.operands.first());
+                    gs.fill_space = space_named(op.operands.first(), work)?;
                     gs.fill = gs.fill_space.rgb(&gs.fill_space.first()).or(gs.fill);
                     if let Some(name) = op.operands.first() {
                         gs.paint = Paint::space(name);
@@ -544,7 +548,7 @@ impl Pdf {
                     }
                 }
                 "CS" => {
-                    gs.stroke_space = space_named(op.operands.first());
+                    gs.stroke_space = space_named(op.operands.first(), work)?;
                     gs.stroke = gs.stroke_space.rgb(&gs.stroke_space.first()).or(gs.stroke);
                     if !op.operands.is_empty() {
                         gs.stroke_at = InkAt::space_of(i);

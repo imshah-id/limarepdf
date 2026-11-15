@@ -1128,10 +1128,14 @@ a copy, not strict) leaves the pictures listed when that walk fails rather than 
 
 Reading a page (`objects.rs`, `parse_as_page`; S1-06, H-07) has a budget of its own: a step per operator and per
 form opened, plus one per KiB of the form's content, charged across every form the page draws, however often (a
-form is read again each time it is drawn), one per cell the underline grids go through (S1-07), and one for
+form is read again each time it is drawn), one per cell the underline grids go through (S1-07), one for
 each part of the rest of looking for underlines that can grow faster than the page (CP-05; both under
-"Underlines and strike-throughs"). `objects::STEPS` is 2²³ (8,388,608): 7.5 times the corpus maximum,
-1,124,715 steps (`pdfbox/5134.pdf`, page 1, 474,984 of them looking for underlines; every page of the 1,080
+"Underlines and strike-throughs"), and the colour spaces the page sets (`colour.rs`, `Space::named`; WP-04): a
+step for each space and each function read, one per part a list of parts names, one per 1,024 numbers of an
+array and one per KiB of sampled data, calculator code and colour tables. A function many parts share is read
+once for each depth it is met at, so three levels listing the same function 20 times read 4 functions, not
+8,421. `objects::STEPS` is 2²³ (8,388,608): 7.5 times the corpus maximum, 1,124,715 steps (`pdfbox/5134.pdf`,
+page 1, 474,984 of them looking for underlines; every page of the 1,080
 files that open, measured 2026-11-06 with the budget lifted; 649,731 before CP-05, 12.9 times, and 588,688
 before the grids' cells were counted, 14 times). A step takes about 0.47 µs in an optimised build, whatever the
 forms' depth or width, so a page is refused after about 4 s of reading; the heaviest corpus page reads in
