@@ -1118,9 +1118,13 @@ node carries its stream (`Node::stream`, `None` for a page's content) and the re
 its 32-deep limit, is gone. `drop_hidden_properties` stays a scan of every object, the boundary's safe superset.
 
 The walk is charged against a `budget::Work` (`budget.rs`, `TooComplex`), one step per drawing reached, name
-looked up, page, annotation and holder, and one per KiB of resources read. Resources are told apart as they are
-read (`Walk::res`), by what they hold: the same entries in any order, compared exactly after a hash with random
-keys, are one set, numbered, and a drawing without resources of its own is followed once for each set it is
+looked up, page, annotation and holder, one per KiB of resources read, and one per KiB of what it keeps of marked
+content (properties written in the resources, `Node::properties`, and alternative text, `Node::alt`). Resources
+are read once where they are written (`Walk::res`: an object of their own, the dictionary whose `/Resources` they
+are, or a Type 3 font's name in a set), however many drawings share them, and the walk borrows what it reads,
+copying only what it keeps. They are told apart as they are read (`Walk::told`), by what they hold: the same
+entries in any order, compared exactly after a hash with random keys, are one set, numbered, and a drawing
+without resources of its own is followed once for each set it is
 drawn with (WP-04; a form drawn from pages whose resources only printed alike was once followed with the first
 page's, and `scan_layers` skipped the second page's). `reach::STEPS` is 2²² (4,194,304): 32
 times the corpus maximum, 129,066 steps (`pdfjs/issue6692.pdf`, 109 pages; the 1,080 files that open, measured

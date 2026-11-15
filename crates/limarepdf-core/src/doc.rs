@@ -635,15 +635,7 @@ impl Pdf {
     }
 
     pub(crate) fn inherited(&self, id: ObjectId, key: &[u8]) -> Option<Object> {
-        let mut cur = id;
-        for _ in 0..64 {
-            let d = self.doc.get_dictionary(cur).ok()?;
-            if let Ok(v) = d.get(key) {
-                return Some(v.clone());
-            }
-            cur = d.get(b"Parent").ok()?.as_reference().ok()?;
-        }
-        None
+        crate::unfillable::inherited_at(&self.doc, id, key).map(|(_, o)| o.clone())
     }
 
     pub(crate) fn num(&self, o: &Object) -> Option<f32> {
