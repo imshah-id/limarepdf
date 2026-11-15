@@ -1085,13 +1085,13 @@ removed). An original is kept when a certainly drawn readable node draws it, and
 page goes to `report.left`; drawn by nothing, it is unlisted. Then every `/Resources` and `/DR` in the file, at
 any depth in any object, whatever holds it and whether or not anything draws with it, is found, and in their
 `/XObject` and `/Properties` dictionaries the entries for unused originals, and properties holding removed
-alternative text that no node uses (by reference, or a direct one by equality), are worked out first, reading
-only, then removed in place, shared dictionaries too. Last, an independent walk follows every reference from the
-trailer, as saving keeps it: the tag tree (`StructTreeRoot`) and private application data (`PieceInfo`) are
-followed after everything else, so an object something else reaches counts as that, and each route still
-reaching anything removed is a `report.left` sentence naming it ("removed content may still be in the file,
-through the tag tree"), which makes both callers refuse: the app rolls back, the CLI writes nothing. Nothing is
-cut on those routes (that needs its own design).
+alternative text that no node uses (by reference, or a direct one by equality, found by its hash in
+`retained::Props`), are worked out first, reading only, then removed in place, shared dictionaries too. Last, an
+independent walk follows every reference from the trailer, as saving keeps it: the tag tree (`StructTreeRoot`) and
+private application data (`PieceInfo`) are followed after everything else, so an object something else reaches
+counts as that, and each route still reaching anything removed is a `report.left` sentence naming it ("removed
+content may still be in the file, through the tag tree"), which makes both callers refuse: the app rolls back, the
+CLI writes nothing. Nothing is cut on those routes (that needs its own design).
 Removing hidden layers takes the same steps (`drop_hidden_layers`, PB-153; PB-111 with it): a walk before the
 change (which refuses, as the check does, when the drawings are too complex) and one after every edit; the
 removed set is the pictures and forms drawn before and not after, with those carrying a hidden `/OC` of their

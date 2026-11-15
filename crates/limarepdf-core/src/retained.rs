@@ -36,6 +36,7 @@ use crate::reach::{self, mask_drawing, Reach, ALT};
 use crate::{trees, Pdf};
 use lopdf::{Dictionary, Document, Object, ObjectId};
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::hash::{BuildHasher, Hasher, RandomState};
 
 /// What redaction took out of the pages, to be looked for in the rest of the file.
 #[derive(Default)]
@@ -308,7 +309,12 @@ fn names_mut<'a>(doc: &'a mut Document, leaf: &Place) -> Option<&'a mut Vec<Obje
 #[derive(Default)]
 pub(crate) struct Props {
     refs: HashSet<ObjectId>,
+    /// Those written there, in the order added.
     direct: Vec<Object>,
+    /// Where each of `direct` is, by its hash ([`reach::weigh`]).
+    places: HashMap<u64, Vec<usize>>,
+    /// The hash's keys, random, so that no file can choose properties that collide.
+    keys: RandomState,
 }
 
 impl Props {
@@ -317,16 +323,35 @@ impl Props {
             Object::Reference(id) => {
                 self.refs.insert(*id);
             }
-            o if !self.direct.contains(o) => self.direct.push(o.clone()),
-            _ => {}
+            o => {
+                let (hash, there) = self.written(o);
+                if !there {
+                    self.places.entry(hash).or_default().push(self.direct.len());
+                    self.direct.push(o.clone());
+                }
+            }
         }
     }
 
     pub(crate) fn has(&self, o: &Object) -> bool {
         match o {
             Object::Reference(id) => self.refs.contains(id),
-            o => self.direct.contains(o),
+            o => self.written(o).1,
         }
+    }
+
+    /// The hash of `o`, written there, and whether it is among those written there: compared
+    /// only with those of the same hash.
+    fn written(&self, o: &Object) -> (u64, bool) {
+        let mut h = self.keys.build_hasher();
+        reach::weigh(o, &self.keys, &mut h);
+        let hash = h.finish();
+        let there = (self.places.get(&hash).into_iter().flatten()).any(|&i| {
+            #[cfg(test)]
+            tests::COMPARED.set(tests::COMPARED.get() + 1);
+            self.direct[i] == *o
+        });
+        (hash, there)
     }
 
     /// Each as resource dictionaries list it.
@@ -700,5 +725,36 @@ impl Pdf {
             unread: unread.into_iter().collect(),
             left,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lopdf::dictionary;
+    use std::cell::Cell;
+
+    thread_local! {
+        /// Properties written in resources compared on this thread.
+        pub(super) static COMPARED: Cell<usize> = const { Cell::new(0) };
+    }
+
+    /// Properties written in the resources are found by their hash, not compared with each one
+    /// kept, and listed once each, in the order added: the comparisons adding 5,000 different
+    /// ones takes, and finding each and one not there.
+    #[test]
+    fn properties_written_are_found_without_comparing_each() {
+        let all: Vec<Object> = (0..5_000i64)
+            .map(|i| dictionary! { "MCID" => i }.into())
+            .collect();
+        let mut props = Props::default();
+        COMPARED.set(0);
+        all.iter().for_each(|p| props.add(p));
+        let adding = COMPARED.replace(0);
+        assert!(all.iter().all(|p| props.has(p)));
+        assert!(!props.has(&dictionary! { "MCID" => 5_000i64 }.into()));
+        assert_eq!((adding, COMPARED.get()), (0, 5_000));
+        props.add(&all[7]);
+        assert!(props.listed().eq(all));
     }
 }

@@ -426,7 +426,7 @@ fn weigh_dict(d: &Dictionary, keys: &RandomState, h: &mut DefaultHasher) -> u64 
 }
 
 /// [`weigh_dict`] for any object; 0 and -0 alike, as they are equal.
-fn weigh(o: &Object, keys: &RandomState, h: &mut DefaultHasher) -> u64 {
+pub(crate) fn weigh(o: &Object, keys: &RandomState, h: &mut DefaultHasher) -> u64 {
     std::mem::discriminant(o).hash(h);
     match o {
         Object::Null => 8,
