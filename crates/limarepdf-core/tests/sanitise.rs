@@ -1174,6 +1174,63 @@ fn hidden_layers_in_forms_nested_40_deep_are_removed() {
     assert_eq!(p.state_since(&before), []);
 }
 
+/// Two pages whose resources print alike (lopdf's `Debug`, which the walk once told them
+/// apart by): the first's forms are one named `A h 0 R/B`, the second's `A` (`h`) and `B`.
+/// Only the second draws `h`, a form without resources showing text in a hidden layer with the
+/// page's: it is checked too, and the text leaves the file.
+#[test]
+fn hidden_layers_drawn_with_resources_printing_like_others_are_removed() {
+    let mut p = Pdf::new();
+    let off = add_layers(&mut p);
+    let font = helvetica(&mut p);
+    let form = |content: &str| {
+        Stream::new(
+            dictionary! {
+                "Type" => "XObject", "Subtype" => "Form", "BBox" => rect([0, 0, 300, 200]),
+            },
+            content.as_bytes().to_vec(),
+        )
+    };
+    let h = p.doc.add_object(form(
+        "/OC /L1 BDC BT /F1 12 Tf 30 150 Td (WALRUS-TWIN) Tj ET EMC \
+         BT /F1 12 Tf 30 120 Td (Visible twin) Tj ET",
+    ));
+    let v = p.doc.add_object(form(""));
+    let pages = [
+        (
+            dictionary! { format!("A {} 0 R/B", h.0) => v },
+            "BT /F1 12 Tf 10 20 Td (Page one) Tj ET",
+        ),
+        (
+            dictionary! { "A" => h, "B" => v },
+            "BT /F1 12 Tf 10 20 Td (Page two) Tj ET q /A Do Q",
+        ),
+    ];
+    for (i, (forms, content)) in pages.into_iter().enumerate() {
+        p.insert_blank(i, 300.0, 200.0).unwrap();
+        let s = Stream::new(Dictionary::new(), content.as_bytes().to_vec());
+        let s = p.doc.add_object(s);
+        let page = p.page_ids()[i];
+        let d = p.doc.get_dictionary_mut(page).unwrap();
+        d.set("Contents", s);
+        d.set(
+            "Resources",
+            dictionary! {
+                "Font" => dictionary! { "F1" => font }, "Properties" => dictionary! { "L1" => off },
+                "XObject" => forms,
+            },
+        );
+    }
+    Saved::of(&mut p.clone()).assert_kept(&["WALRUS-TWIN"]);
+    let rep = p.remove_hidden(&[Hidden::HiddenLayers]).unwrap();
+    assert_eq!(rep.count(Hidden::HiddenLayers), 1);
+    let saved = Saved::of(&mut p);
+    saved.assert_gone(&["WALRUS-TWIN"]);
+    saved.assert_kept(&["Visible twin", "Page one", "Page two"]);
+    let users = saved.hidden_layer_users();
+    assert!(users.is_empty(), "{users:?}");
+}
+
 #[test]
 fn hidden_layers_with_content_that_cant_be_read_are_refused() {
     let mut p = make(
