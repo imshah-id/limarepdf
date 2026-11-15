@@ -4,7 +4,8 @@
 //! itself is read once. Drawing annotations has a budget too: flattening and redacting
 //! annotations too complex to draw are refused, and listing them places those past it at
 //! their own `/Rect`. So does reading their points and text: a listing lists those past
-//! it unread, and removing information is refused past it. Changing one reads it alone, and
+//! it unread, and removing information is refused past it. A text is charged what decoding
+//! it takes, a failure too. Changing one reads it alone, and
 //! is refused past the points it is drawn with rather than write them back cut.
 
 mod common;
@@ -812,6 +813,66 @@ fn a_text_box_s_style_is_read_once_and_listed_as_drawn() {
     // Drawing none; reading 64 for the annotation, then its `/DA`, `/DS` and text.
     let read = vec![0, 64 + 1_000 + ds.len() as u64 + 5];
     assert_eq!((colour, taken), (Some([1.0, 0.0, 0.0]), read));
+}
+
+/// A page of [`zebras`] with 20 comments sharing one text, a stream that deflates
+/// `inflated` and reads it as hexadecimal once inflated (`[/FlateDecode /ASCIIHexDecode]`).
+fn comments_sharing(inflated: Vec<u8>) -> Pdf {
+    let mut p = zebras(1);
+    let mut s = Stream::new(Dictionary::new(), inflated);
+    s.compress().unwrap();
+    let filters = vec![Object::from("FlateDecode"), Object::from("ASCIIHexDecode")];
+    s.dict.set("Filter", filters);
+    let text = p.doc.add_object(s);
+    let rect = [72i64, 600, 92, 620].map(Object::from).to_vec();
+    for _ in 0..20 {
+        let d = dictionary! {
+            "Type" => "Annot", "Subtype" => "Text", "Rect" => rect.clone(), "Contents" => text,
+        };
+        annotate(&mut p, d);
+    }
+    p
+}
+
+/// The annotations of [`comments_sharing`]'s page listed within `limit`, and how many of
+/// them, the first, were read; the rest are listed unread, by both listings alike.
+fn listed_within(p: &Pdf, limit: u64) -> (Vec<limarepdf_core::Annot>, usize) {
+    use limarepdf_core::budget_seam;
+    let (all, _) = budget_seam::with_limit(limit, || p.annotations());
+    let (page, _) = budget_seam::with_limit(limit, || p.page_annotations(0).unwrap());
+    let read = |listed: &[limarepdf_core::Annot]| {
+        assert_eq!(listed.len(), 20);
+        let read = listed.iter().take_while(|a| !a.unread).count();
+        assert!(listed[read..].iter().all(|a| a.unread));
+        read
+    };
+    let n = read(&all);
+    assert_eq!(read(&page), n);
+    (all, n)
+}
+
+/// A text that fails to decode is charged what decoding it took: of 20 comments sharing one
+/// that inflates to 100,000 bytes and then isn't hexadecimal, the first are listed read,
+/// without it, and the rest unread. Before, the failure was free, and all 20 were read.
+#[test]
+fn a_text_that_fails_to_decode_is_charged_what_decoding_took() {
+    let p = comments_sharing(vec![b'z'; 100_000]);
+    let (listed, read) = listed_within(&p, 5_000_000);
+    assert!((1..20).contains(&read), "{read} read");
+    assert!(listed[..read].iter().all(|a| a.contents.is_empty()));
+}
+
+/// A text is charged each filter it is decoded through: of 20 comments sharing one that
+/// inflates to 1,000,000 spaces and a hexadecimal "A", the first are listed with the "A" and
+/// the rest unread. Before, only the "A" was charged, and all 20 were read.
+#[test]
+fn a_text_is_charged_each_filter_it_is_decoded_through() {
+    let mut inflated = vec![b' '; 1_000_000];
+    inflated.extend(b"41");
+    let p = comments_sharing(inflated);
+    let (listed, read) = listed_within(&p, 10_000_000);
+    assert!((1..20).contains(&read), "{read} read");
+    assert!(listed[..read].iter().all(|a| a.contents == "A"));
 }
 
 /// Removing annotations, which offers each to be chosen by what it says, is refused past

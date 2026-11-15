@@ -2,6 +2,12 @@
 //! leads, charged across all of it, so a file built to be followed for ever (or for hours) is
 //! refused with a [`TooComplex`] instead, before anything is changed.
 
+use lopdf::{DecompressError, Stream};
+
+/// What a stream's first try at decoding is limited to, when it has fewer bytes of its own
+/// ([`Work::decode`]).
+const FIRST_TRY: u64 = 4 << 10;
+
 /// The work an operation may still do.
 pub(crate) struct Work {
     left: u64,
@@ -64,16 +70,64 @@ impl Work {
         Ok(())
     }
 
-    /// The steps left.
-    pub(crate) fn left(&self) -> u64 {
-        self.left
-    }
-
     /// The refusal for taking more steps than are left.
     pub(crate) fn refusal(&self) -> TooComplex {
         TooComplex {
             what: self.what,
             limit: self.limit,
+        }
+    }
+
+    /// Stream `s` decoded within the steps left, charged a step for each of its own bytes
+    /// and each byte its filters give, a failure too. lopdf limits each filter to a try's
+    /// size, so a try takes at most its bytes and that size for each filter: it is tried at
+    /// its own size (4 KiB at least), then four times larger as far as the steps left
+    /// allow, each try that fails charged all it could take, and refused past them. `None`
+    /// when it can't be decoded or gives more than [`crate::MAX_CONTENT`] bytes.
+    pub(crate) fn decode(&mut self, s: &Stream) -> Result<Option<Vec<u8>>, TooComplex> {
+        let filters = s.filters().map_or(0, |f| f.len()) as u64;
+        if filters > Stream::MAX_FILTERS as u64 {
+            // lopdf decodes none of it.
+            self.take(filters)?;
+            return Ok(None);
+        }
+        let (own, most) = (s.content.len() as u64, crate::MAX_CONTENT as u64);
+        let fits = |left: u64| match filters {
+            0 => most,
+            n => (left.saturating_sub(own) / n).min(most),
+        };
+        let mut size = own.max(FIRST_TRY).min(fits(self.left));
+        if own + filters * size > self.left {
+            return Err(self.refusal());
+        }
+        loop {
+            let at_most = own + filters * size;
+            match s.decompressed_content_with_limit(size as usize) {
+                Ok(data) => {
+                    // The last filter gives what was decoded, the others at most the size.
+                    let given = match filters {
+                        0 => 0,
+                        n => (n - 1) * size + data.len() as u64,
+                    };
+                    self.take(own + given)?;
+                    return Ok(Some(data));
+                }
+                Err(lopdf::Error::Decompress(DecompressError::MemoryLimitExceeded { .. })) => {
+                    self.take(at_most)?;
+                    if size == most {
+                        return Ok(None);
+                    }
+                    let next = (4 * size).min(fits(self.left));
+                    if next <= size {
+                        return Err(self.refusal());
+                    }
+                    size = next;
+                }
+                Err(_) => {
+                    self.take(at_most)?;
+                    return Ok(None);
+                }
+            }
         }
     }
 
@@ -197,5 +251,32 @@ mod tests {
         let t = e.downcast_ref::<TooComplex>().expect("too complex");
         assert_eq!(t.limit, 0);
         assert!(format!("{e:#}").contains("counting would take more than 0 steps"));
+    }
+
+    /// A stream is charged its own bytes and what each of its filters gives: tried at 4 KiB
+    /// and then 16, a deflated one is charged both tries; one that can't be decoded, all its
+    /// try could take; one giving more than the steps left allow, refused.
+    #[test]
+    fn a_stream_is_charged_its_bytes_and_what_its_filters_give() {
+        use lopdf::dictionary;
+        let mut w = Work::new("decoding", 1_000);
+        let plain = Stream::new(dictionary! {}, vec![b'a'; 100]);
+        let decoded = (w.decode(&plain), w.taken());
+        assert_eq!(decoded, (Ok(Some(vec![b'a'; 100])), 100));
+        let hex = |s: &[u8]| Stream::new(dictionary! { "Filter" => "ASCIIHexDecode" }, s.into());
+        let mut w = Work::new("decoding", 1_000);
+        let decoded = (w.decode(&hex(b"4142")), w.taken());
+        assert_eq!(decoded, (Ok(Some(b"AB".to_vec())), 4 + 2));
+        let mut w = Work::new("decoding", 1_000);
+        assert_eq!((w.decode(&hex(b"zz")), w.taken()), (Ok(None), 1_000));
+        let mut w = Work::new("decoding", 5);
+        assert_eq!(w.decode(&hex(b"4142")), Err(w.refusal()));
+        let mut flate = Stream::new(dictionary! {}, vec![b'a'; 10_000]);
+        flate.compress().unwrap();
+        let own = flate.content.len() as u64;
+        let mut w = Work::new("decoding", 1_000_000);
+        let decoded = (w.decode(&flate), w.taken());
+        let taken = (own + 4_096) + (own + 10_000);
+        assert_eq!(decoded, (Ok(Some(vec![b'a'; 10_000])), taken));
     }
 }

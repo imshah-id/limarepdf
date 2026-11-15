@@ -92,7 +92,8 @@ const WHAT: &str = "drawing the annotations";
 
 /// The steps drawing annotations may take ([`Work`]): 256 for each annotation, one for each
 /// point read, each byte of other text read (a stamp's name, `/DA`, `/DS`, a text checked
-/// for what its font can't write) and each byte drawn, and two for each byte of a text
+/// for what its font can't write; a stream's own bytes and what its filters give,
+/// [`Work::decode`]) and each byte drawn, and two for each byte of a text
 /// box's text set. Annotations can share their points and text, which each draws again, so
 /// the steps count everything drawn, however often. 2²⁴: 200 times the most the render
 /// corpus's annotations take with their own drawings taken away (83,771,
@@ -111,9 +112,9 @@ pub(crate) fn work() -> Work {
 /// What reading listed annotations is called when its budget refuses it.
 const READING: &str = "reading the annotations";
 /// The steps reading listed annotations may take ([`Place::read`]): 64 for each
-/// annotation, one for each point and ink stroke read and each byte of text. Annotations
-/// can share their points and text, which each reads again, so the steps count everything
-/// read, however often. 2²⁴: 2,295 times the most the render corpus's annotations take
+/// annotation, one for each point and ink stroke read and each byte of text (a stream's as
+/// drawing charges it). Annotations can share their points and text, which each reads
+/// again, so the steps count everything read, however often. 2²⁴: 2,295 times the most the render corpus's annotations take
 /// (7,310, `pdfjs/issue12579.pdf`), read in at most about 1 s (architecture.md, after
 /// `annot_rect`).
 const READ_STEPS: u64 = 1 << 24;
@@ -1060,8 +1061,9 @@ impl Pdf {
     }
 
     /// [`Pdf::text_value`] (or [`Pdf::shown_text_value`] when `shown`), charged to `work` a
-    /// step for each byte before it is read: a stream is decoded only to the steps left,
-    /// and refused past them.
+    /// step for each byte before it is read: a stream its own bytes and what each of its
+    /// filters gives, a failure too, decoded only within the steps left and refused past
+    /// them ([`Work::decode`]).
     pub(crate) fn text_charged(
         &self,
         o: Option<&Object>,
@@ -1083,19 +1085,7 @@ impl Pdf {
                 work.take(n.len() as u64)?;
                 Ok(Some(String::from_utf8_lossy(n).into_owned()))
             }
-            Object::Stream(s) => {
-                let max = work.left().min(crate::MAX_CONTENT as u64) as usize;
-                match s.decompressed_content_with_limit(max) {
-                    Ok(data) => {
-                        work.take(data.len() as u64)?;
-                        Ok(Some(decode_text(&data)))
-                    }
-                    Err(lopdf::Error::Decompress(
-                        lopdf::DecompressError::MemoryLimitExceeded { .. },
-                    )) if max < crate::MAX_CONTENT => Err(work.refusal()),
-                    Err(_) => Ok(None),
-                }
-            }
+            Object::Stream(s) => Ok(work.decode(s)?.map(|data| decode_text(&data))),
             _ => Ok(None),
         }
     }
