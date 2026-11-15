@@ -101,8 +101,8 @@ const WHAT: &str = "drawing the annotations";
 const STEPS: u64 = 1 << 24;
 /// The steps an annotation takes before its points and text.
 const EACH: u64 = 256;
-/// The steps setting a byte of a text box's text takes.
-const SETTING: u64 = 2;
+/// The steps setting a byte of a text box's text takes, drawn or measured to fit it.
+pub(crate) const SETTING: u64 = 2;
 
 /// A budget for drawing annotations.
 pub(crate) fn work() -> Work {

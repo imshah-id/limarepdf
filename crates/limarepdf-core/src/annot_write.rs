@@ -575,7 +575,8 @@ impl Pdf {
 
     /// Make a text box tall enough for its text, as it is set inside the box's `/RD` margins
     /// and cloudy border: it grows downward as the page is shown, keeping its width, and
-    /// stops at the page's edge. It never shrinks. Not drawn here.
+    /// stops at the page's edge. It never shrinks. Not drawn here, but each measure is
+    /// charged as setting the text ([`annot_ap::SETTING`]), within a drawing budget.
     fn fit_text_box(&mut self, id: ObjectId) -> Result<()> {
         let d = self.doc.get_dictionary(id)?;
         let rect = self
@@ -594,6 +595,7 @@ impl Pdf {
         for _ in 0..3 {
             let g = self.box_geometry(d, r, &mut work)?;
             let look = g.look(None);
+            work.take(annot_ap::SETTING * text.len() as u64)?;
             let need = lines_height(&text, look.w, g.size, look.inset(), &m);
             if need <= look.h + 0.01 {
                 break;

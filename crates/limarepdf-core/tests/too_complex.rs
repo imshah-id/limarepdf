@@ -905,6 +905,29 @@ fn text_boxes_whose_text_fails_to_decode_are_charged_it() {
     assert_eq!(done.unwrap().drawn, 20);
 }
 
+/// Fitting a text box to its text charges setting it each time it is measured: a
+/// 20,004-character one ([`long_text`]), measured in its box and again grown to the foot of
+/// the page, takes two steps a byte each time, after one to read it. Before, only reading
+/// it was charged.
+#[test]
+fn fitting_a_text_box_charges_its_text() {
+    use limarepdf_core::{budget_seam, TextStyle};
+    let mut p = zebras(1);
+    let rect = [72i64, 400, 300, 500].map(Object::from).to_vec();
+    let d = dictionary! {
+        "Type" => "Annot", "Subtype" => "FreeText", "Rect" => rect,
+        "Contents" => Object::string_literal(long_text()),
+        "DA" => Object::string_literal("/Helv 12 Tf 0 g"),
+    };
+    let id = annotate(&mut p, d);
+    let style = TextStyle::default();
+    let (done, taken) = budget_seam::with_limit(u64::MAX, || p.set_text_style(id, &style));
+    done.unwrap();
+    // Checking, fitting and drawing it, each with a budget of its own.
+    assert_eq!(taken.len(), 3, "{taken:?}");
+    assert!(taken[1] >= 5 * 20_004, "{taken:?}");
+}
+
 /// Removing annotations, which offers each to be chosen by what it says, is refused past
 /// the budget, with nothing changed, rather than keep one unread: an annotation written
 /// into the page's list directly isn't given an object of its own. Within it, they go.
