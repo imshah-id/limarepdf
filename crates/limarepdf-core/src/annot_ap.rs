@@ -114,9 +114,9 @@ const READING: &str = "reading the annotations";
 /// The steps reading listed annotations may take ([`Place::read`]): 64 for each
 /// annotation, one for each point and ink stroke read and each byte of text (a stream's as
 /// drawing charges it). Annotations can share their points and text, which each reads
-/// again, so the steps count everything read, however often. 2²⁴: 2,295 times the most the render corpus's annotations take
-/// (7,310, `pdfjs/issue12579.pdf`), read in at most about 1 s (architecture.md, after
-/// `annot_rect`).
+/// again, so the steps count everything read, however often. 2²⁴: 2,295 times the most
+/// the render corpus's annotations take (7,310, `pdfjs/issue12579.pdf`), read in at most
+/// about 1 s (architecture.md, after `annot_rect`).
 const READ_STEPS: u64 = 1 << 24;
 /// The steps reading an annotation takes before its points and text.
 const READ_EACH: u64 = 64;
