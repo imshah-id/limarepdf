@@ -299,6 +299,25 @@ impl Pdf {
         self.every_annotation_in(place, |p, page| p.annot_refs(page))
     }
 
+    /// Annotation `id` as [`Pdf::annotations`] lists it (on the first page that does), but
+    /// read alone: placed and read within budgets of its own, reading no other annotation.
+    pub fn annotation(&self, id: (u32, u16)) -> Result<Annot> {
+        self.listed_one(id, &mut Place::drawn())
+    }
+
+    /// [`Pdf::annotation`], placed and read by `place`.
+    pub(crate) fn listed_one(&self, id: ObjectId, place: &mut Place) -> Result<Annot> {
+        let pages = self.page_ids();
+        let i = (pages.iter())
+            .position(|&p| self.annot_refs(p).contains(&id))
+            .ok_or_else(|| anyhow!("no such annotation"))?;
+        let mut layers = self.layers_off();
+        let one = self.annotations_in(i, pages[i], vec![id], &mut layers, place)?;
+        one.into_iter()
+            .next()
+            .ok_or_else(|| anyhow!("no such annotation"))
+    }
+
     /// The annotations on one page (zero-based), in the file's order (the order they are
     /// drawn in), placed as [`Pdf::annotations`] places them.
     pub fn page_annotations(&self, page_index: usize) -> Result<Vec<Annot>> {

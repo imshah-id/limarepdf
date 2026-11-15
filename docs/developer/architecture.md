@@ -1342,7 +1342,11 @@ marked content tagged with it (`/OC /LimareField1 BDC … EMC`, the layer or rul
 form or comments, finishing signing and printing all do it; a rule written in place is stored as an object of its
 own, since renderers look a tag's layer up by reference. A drawing reads at most 100,000 points (`MAX_POINTS`)
 from each entry, and an Ink drawing's strokes, or a Squiggly one's wavy lines, share 100,000 between them, so a
-stroke listed many times is drawn only to the points left.
+stroke listed many times is drawn only to the points left. A change made from the points (adding a stroke,
+setting a drawing's width, which sizes its box by them, turning a drawing, moving an annotation by its `/L`,
+`/Vertices`, `/QuadPoints`, `/CL` or `/InkList`) is refused past them instead (`TooComplex`, "changing the
+annotation", limit 100,000; `annot_write::past_its_points`), counted by each array's length before any is read,
+so nothing is written from points cut short and nothing changes.
 
 A drawing is placed by the annotation's `/Rect`, which flattening and every renderer map its box onto. Markup,
 links, lines, polygons, polylines and ink (`BY_POINTS`) are drawn from their own points instead, so one whose
@@ -1381,8 +1385,10 @@ read, their text, points and style not (empty, `text_style` `None`). The app sho
 (`editor::TOO_LARGE`) for their text on the card, the tip, the inspector and the replies, and lets them be
 selected, moved and deleted as if read (text markup still stays on its text; a redaction mark isn't resized, its
 areas unknown), never changed: a double-click doesn't open one for typing (`writable`), its inspector offers only
-Delete, and `change_annotation` refuses for one, rather than write what is shown over its text. Deleting one
-(`Pdf::remove_annotation`, from the Comments view or the page) reads no other annotation. What removes
+Delete. Changing one reads it alone (`Pdf::annotation`, as the listings list it but within budgets of its own,
+as the app does to type in a comment), so `change_annotation` refuses only when that one alone is past the
+budget, rather than write what is shown over its text. Deleting one (`Pdf::remove_annotation`, from the Comments
+view or the page) reads no other annotation. What removes
 information reads every annotation and refuses past the budget (`Place::whole`): `remove_annotations` (`annot
 remove`, choosing by author), applying redaction (the marks' areas) and its search for the removed text in the
 comments (`find_elsewhere`). What needs only what each annotation is reads nothing more (`Place::kinds`):

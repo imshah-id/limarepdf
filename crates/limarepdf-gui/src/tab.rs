@@ -1355,7 +1355,7 @@ impl Tab {
                     });
                 }
                 Action::AnnotText(p, id, text) => {
-                    let Some(a) = self.pdf.annotations().into_iter().find(|a| a.id == id) else {
+                    let Ok(a) = self.pdf.annotation(id) else {
                         self.error = Some("That comment isn't in the document any more".into());
                         continue;
                     };
@@ -4498,6 +4498,37 @@ mod tests {
             pdf.insert_blank(i, 612.0, 792.0).unwrap();
         }
         Tab::new(ctx, 1, pdf, None, Colours::default()).unwrap()
+    }
+
+    /// Typing in a comment changes it reading no other (WP-04 5a.3d): while a note on page 1
+    /// is changed, no budget takes a tenth of what reading the 100 long notes on page 2
+    /// takes. Before, the note was found by listing every annotation, twice.
+    #[test]
+    fn typing_in_a_comment_reads_no_other() {
+        use limarepdf_core::budget_seam;
+        let ctx = egui::Context::default();
+        let mut pdf = Pdf::new();
+        for i in 0..2 {
+            pdf.insert_blank(i, 612.0, 792.0).unwrap();
+        }
+        let yellow = [1.0, 1.0, 0.0];
+        let one = pdf.add_note(0, (100.0, 100.0), yellow, "Walrus one", "Tester");
+        let one = one.unwrap();
+        let long = "walrus ".repeat(1_000);
+        for i in 0..100 {
+            let (x, y) = ((i % 10) as f32 * 40.0, (i / 10) as f32 * 60.0);
+            let at = (100.0 + x, 100.0 + y);
+            pdf.add_note(1, at, yellow, &long, "Tester").unwrap();
+        }
+        let (_, all) = budget_seam::with_limit(u64::MAX, || pdf.annotations());
+        let all = all.into_iter().max().unwrap();
+        let mut t = Tab::new(&ctx, 1, pdf, None, Colours::default()).unwrap();
+        t.ed.actions
+            .push(Action::AnnotText(0, one, "Walrus uno".into()));
+        let ((), taken) = budget_seam::with_limit(u64::MAX, || t.apply_actions(&ctx));
+        assert_eq!(t.error, None);
+        assert_eq!(t.pdf.page_annotations(0).unwrap()[0].contents, "Walrus uno");
+        assert!(taken.iter().all(|&s| s < all / 10), "{taken:?} of {all}");
     }
 
     /// Properties, the opening view and page labels apply as they are set: one undo step

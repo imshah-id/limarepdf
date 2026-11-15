@@ -791,6 +791,62 @@ fn an_annotation_placed_by_its_points_is_listed_and_moved_where_it_is_drawn() {
     assert!(ink(&mut p, [55, 78, 145, 82]).0 > 20, "drawn where it went");
 }
 
+/// One annotation read alone (`Pdf::annotation`, WP-04) is as every annotation lists it: on
+/// either page, a line placed where it is drawn, a note, a text box, a drawing and the
+/// highlight replying to the note. A pop-up, a link and something not in the file are no
+/// such annotation.
+#[test]
+fn one_annotation_is_as_they_are_all_listed() {
+    let mut p = page();
+    p.insert_blank(1, 300.0, 200.0).unwrap();
+    line_away_from_its_rect(&mut p);
+    let link = add(&mut p, 0, "Link", [0.0, 0.0, 10.0, 10.0], dictionary! {});
+    let note = add(
+        &mut p,
+        1,
+        "Text",
+        [10.0, 170.0, 30.0, 190.0],
+        dictionary! { "Contents" => text("Check this"), "T" => text("Sam") },
+    );
+    let popup = add(
+        &mut p,
+        1,
+        "Popup",
+        [40.0, 120.0, 140.0, 190.0],
+        dictionary! { "Parent" => note },
+    );
+    add(
+        &mut p,
+        1,
+        "FreeText",
+        [100.0, 60.0, 200.0, 140.0],
+        dictionary! { "Contents" => text("Hello there"), "DA" => text("/Helv 12 Tf 1 0 0 rg") },
+    );
+    add(
+        &mut p,
+        1,
+        "Ink",
+        [100.0, 60.0, 200.0, 140.0],
+        dictionary! { "InkList" => vec![nums(&[110.0, 70.0, 150.0, 130.0, 190.0, 70.0])] },
+    );
+    let quad = [50.0, 100.0, 150.0, 100.0, 150.0, 112.0, 50.0, 112.0];
+    add(
+        &mut p,
+        1,
+        "Highlight",
+        [50.0, 100.0, 150.0, 112.0],
+        dictionary! { "QuadPoints" => nums(&quad), "IRT" => note },
+    );
+    let all = p.annotations();
+    assert_eq!(all.len(), 5);
+    for a in &all {
+        assert_eq!(&p.annotation(a.id).unwrap(), a);
+    }
+    for id in [link, popup, (999, 0)] {
+        assert!(p.annotation(id).is_err(), "{id:?}");
+    }
+}
+
 /// PB-114: redacting where an annotation placed by its points is drawn removes it, as
 /// redacting where its `/Rect` is does: a line away from its `/Rect`, and a highlight whose
 /// `/Rect` is a point at its left end, each marked over its right half. Both were kept, drawn

@@ -3,8 +3,9 @@
 //! comment, and its place on the page. Each gets a drawing of its own straight away, so
 //! other viewers show it as LimarePDF does.
 
-use crate::annot_ap::{self, arrow_size, Place, DRAWN, NOTE_SIZE};
+use crate::annot_ap::{self, arrow_size, Place, DRAWN, MAX_POINTS, NOTE_SIZE};
 use crate::annots::NO_VIEW;
+use crate::budget::TooComplex;
 use crate::doc::encode_text;
 use crate::embed::check_writable;
 use crate::form_ap::{lines_height, nums, Metrics};
@@ -24,6 +25,17 @@ const PAD: f32 = 1.0;
 const INK_TOLERANCE: f32 = 0.35;
 /// Most points kept from one pen stroke.
 const MAX_STROKE: usize = 20_000;
+/// What changing an annotation is called when it is refused past its points.
+const CHANGING: &str = "changing the annotation";
+
+/// The refusal of a change to an annotation past the [`MAX_POINTS`] points it is drawn
+/// with, which would write them back cut.
+fn past_its_points() -> TooComplex {
+    TooComplex {
+        what: CHANGING,
+        limit: MAX_POINTS as u64,
+    }
+}
 
 impl Pdf {
     /// Mark lines of text on page `page_index` (zero-based) with a highlight, underline,
@@ -287,7 +299,14 @@ impl Pdf {
         if d.get(b"Subtype").and_then(|o| o.as_name()).ok() != Some(b"Ink") {
             bail!("not a drawing");
         }
-        let mut list = self.strokes(d);
+        let mut list = self.strokes(d)?.unwrap_or_default();
+        // Within the points it is drawn with, the new stroke too.
+        let points: usize = (list.iter().chain([&new]))
+            .map(|s| s.len().div_ceil(2))
+            .sum();
+        if points > MAX_POINTS || list.len() >= MAX_POINTS {
+            return Err(past_its_points().into());
+        }
         list.push(new);
         let pad = ink_pad(self.border(d).0);
         self.atomically(|p| {
@@ -312,7 +331,10 @@ impl Pdf {
                 .numbers(d.get(b"L").ok())
                 .filter(|l| l.len() >= 4)
                 .map(|l| line_rect(&l, look.width, look.arrow)),
-            b"Ink" => Some(points_rect(&self.strokes(d), ink_pad(look.width))),
+            b"Ink" => Some(points_rect(
+                &self.strokes(d)?.unwrap_or_default(),
+                ink_pad(look.width),
+            )),
             _ => bail!("not a shape, line or drawing"),
         };
         self.atomically(|p| {
@@ -392,7 +414,7 @@ impl Pdf {
             bail!("not a drawing");
         }
         let pad = ink_pad(self.border(d).0);
-        let strokes = self.strokes(d);
+        let strokes = self.strokes(d)?.unwrap_or_default();
         // The middle of the strokes as shown; y runs down, so a positive angle turns
         // clockwise.
         let r = points_rect(&strokes, 0.0);
@@ -411,14 +433,41 @@ impl Pdf {
         })
     }
 
-    /// A drawing's strokes as numbers, as `/InkList` holds them.
-    fn strokes(&self, d: &Dictionary) -> Vec<Vec<f32>> {
-        d.get(b"InkList")
-            .ok()
+    /// A drawing's strokes as numbers, as `/InkList` holds them (`None` when it has none):
+    /// all of them, or refused ([`past_its_points`]), with nothing more read, past the
+    /// [`MAX_POINTS`] points it is drawn with or that many strokes.
+    fn strokes(&self, d: &Dictionary) -> std::result::Result<Option<Vec<Vec<f32>>>, TooComplex> {
+        let list = (d.get(b"InkList").ok())
             .and_then(|o| self.doc.dereference(o).ok())
-            .and_then(|(_, o)| o.as_array().ok())
-            .map(|list| list.iter().filter_map(|s| self.numbers(Some(s))).collect())
-            .unwrap_or_default()
+            .and_then(|(_, o)| o.as_array().ok());
+        let Some(list) = list else {
+            return Ok(None);
+        };
+        if list.len() > MAX_POINTS {
+            return Err(past_its_points());
+        }
+        let mut left = MAX_POINTS;
+        let mut out = Vec::new();
+        for s in list {
+            out.extend(self.numbers_within(Some(s), &mut left)?);
+        }
+        Ok(Some(out))
+    }
+
+    /// The numbers of an array of them, all of them, the points they make (half as many,
+    /// rounded up) taken from `left`: refused ([`past_its_points`]), with none read, when
+    /// they are more than `left`. For a change, which would otherwise write them back cut.
+    fn numbers_within(
+        &self,
+        o: Option<&Object>,
+        left: &mut usize,
+    ) -> std::result::Result<Option<Vec<f32>>, TooComplex> {
+        let Some((_, o)) = o.and_then(|o| self.doc.dereference(o).ok()) else {
+            return Ok(None);
+        };
+        let points = o.as_array().map_or(0, Vec::len).div_ceil(2);
+        *left = left.checked_sub(points).ok_or_else(past_its_points)?;
+        Ok(self.numbers(Some(o)))
     }
 
     /// The page an annotation is on: its `/P`, else the page that lists it.
@@ -492,7 +541,9 @@ impl Pdf {
             .is_ok_and(|s| s == b"Redact");
         let mut changed: Vec<(&[u8], Object)> = vec![(b"Rect", nums(&new).into())];
         for key in [&b"L"[..], b"Vertices", b"QuadPoints", b"CL"] {
-            if let Some(v) = self.numbers(d.get(key).ok()) {
+            // Each within the points it is drawn with.
+            let mut left = MAX_POINTS;
+            if let Some(v) = self.numbers_within(d.get(key).ok(), &mut left)? {
                 let mut v = map_points(map, &v);
                 // A redaction mark's one area stays `PAD` inside its box, as it was made,
                 // however far it is stretched (PF-37).
@@ -502,16 +553,10 @@ impl Pdf {
                 changed.push((key, nums(&v).into()));
             }
         }
-        let ink = d
-            .get(b"InkList")
-            .ok()
-            .and_then(|o| self.doc.dereference(o).ok())
-            .and_then(|(_, o)| o.as_array().ok());
-        if let Some(list) = ink {
+        if let Some(list) = self.strokes(d)? {
             let strokes: Vec<Object> = list
                 .iter()
-                .filter_map(|s| self.numbers(Some(s)))
-                .map(|v| nums(&map_points(map, &v)).into())
+                .map(|v| nums(&map_points(map, v)).into())
                 .collect();
             changed.push((b"InkList", strokes.into()));
         }
@@ -629,9 +674,7 @@ impl Pdf {
         contents: &str,
     ) -> Result<()> {
         let mut place = Place::drawn();
-        let old = (self.listed(&mut place).into_iter())
-            .find(|a| a.id == id)
-            .ok_or_else(|| anyhow!("no such annotation"))?;
+        let old = self.listed_one(id, &mut place)?;
         // Its text unread would be written over with what is shown for it.
         if old.unread {
             place.whole()?;

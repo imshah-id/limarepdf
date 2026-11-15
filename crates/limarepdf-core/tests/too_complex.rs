@@ -4,7 +4,8 @@
 //! itself is read once. Drawing annotations has a budget too: flattening and redacting
 //! annotations too complex to draw are refused, and listing them places those past it at
 //! their own `/Rect`. So does reading their points and text: a listing lists those past
-//! it unread, and removing information is refused past it.
+//! it unread, and removing information is refused past it. Changing one reads it alone, and
+//! is refused past the points it is drawn with rather than write them back cut.
 
 mod common;
 
@@ -920,18 +921,131 @@ fn removing_the_comments_reads_only_what_each_is() {
     assert_eq!(rep.unwrap().count(Hidden::Comments), 20);
 }
 
-/// Changing an annotation listed unread is refused, with nothing changed, rather than
-/// write over what wasn't read.
+/// Changing an annotation reads it alone: the last of 20 text boxes, listed unread past the
+/// budget, is changed within it. Before, it was found by listing them all, and refused.
+/// Past what reading it alone takes, it is refused, with nothing changed, rather than write
+/// over what wasn't read.
 #[test]
-fn changing_an_annotation_past_the_reading_budget_is_refused() {
+fn changing_an_annotation_reads_it_alone() {
     use limarepdf_core::{budget_seam, TooComplex};
     let mut p = sharing_a_text();
-    let last = p.annotations().last().unwrap().id;
+    let (listed, _) = budget_seam::with_limit(200_000, || p.annotations());
+    let last = listed.last().unwrap().id;
+    assert!(listed.last().unwrap().unread);
+    let red = Some([1.0, 0.0, 0.0]);
     let before = p.state_before();
-    let (e, _) =
-        budget_seam::with_limit(200_000, || p.set_annotation(last, None, 1.0, &long_text()));
+    let (e, _) = budget_seam::with_limit(10_000, || p.set_annotation(last, red, 1.0, &long_text()));
     let e = e.expect_err("refused");
     let too = e.downcast_ref::<TooComplex>().expect("too complex");
     assert_eq!(too.what, "reading the annotations", "{e:#}");
     assert_eq!(p.state_since(&before), []);
+    let (done, _) =
+        budget_seam::with_limit(200_000, || p.set_annotation(last, red, 1.0, &long_text()));
+    done.unwrap();
+    assert_eq!(p.annotations().last().unwrap().color, red);
+}
+
+/// A freehand drawing on page 1 of `p`, with a `/Rect` of its own, listing one stroke of
+/// `points` points zigzagging from (100, 200) `times` times.
+fn drawing(p: &mut Pdf, points: usize, times: usize) -> ObjectId {
+    let stroke: Vec<Object> = (0..points as i64)
+        .flat_map(|i| [100 + i % 200, 200 + i % 2 * 50].map(Object::from))
+        .collect();
+    let stroke = p.doc.add_object(stroke);
+    let rect = [100i64, 200, 300, 250].map(Object::from).to_vec();
+    let d = dictionary! {
+        "Type" => "Annot", "Subtype" => "Ink", "Rect" => rect,
+        "InkList" => vec![Object::Reference(stroke); times],
+        "C" => vec![Object::from(0i64)],
+    };
+    annotate(p, d)
+}
+
+/// Whether `e` is the refusal of a change past the 100,000 points an annotation is drawn
+/// with.
+fn past_its_points(e: &anyhow::Error) -> bool {
+    use limarepdf_core::TooComplex;
+    e.downcast_ref::<TooComplex>()
+        .is_some_and(|t| (t.what, t.limit) == ("changing the annotation", 100_000))
+}
+
+/// Changing a drawing reads its strokes within the 100,000 points it is drawn with, and is
+/// refused past them, with nothing changed, rather than write them back cut: one listing a
+/// 60,000-point stroke twice, and one with a 150,000-point stroke, aren't added to,
+/// restyled, turned or moved. Before, the first was written back whole (and 10,000 strokes
+/// would have been too), the second cut to 100,000 points. One of 100,000 points is.
+#[test]
+fn changing_a_drawing_past_its_points_is_refused() {
+    use limarepdf_core::ShapeLook;
+    let look = ShapeLook {
+        fill: None,
+        width: 3.0,
+        arrow: false,
+    };
+    let change = |p: &mut Pdf, id, n| match n {
+        0 => p.add_ink_stroke(0, id, &[(150.0, 150.0), (200.0, 160.0)]),
+        1 => p.set_shape_look(id, &look),
+        2 => p.rotate_ink(0, id, 30.0),
+        _ => p.move_annotation(0, id, [50.0, 50.0, 400.0, 300.0]),
+    };
+    for (points, times) in [(60_000, 2), (150_000, 1)] {
+        let mut p = zebras(1);
+        let id = drawing(&mut p, points, times);
+        let before = p.state_before();
+        for n in 0..4 {
+            let e = change(&mut p, id, n).expect_err("refused");
+            assert!(past_its_points(&e), "{points} × {times}, {n}: {e:#}");
+            assert_eq!(p.state_since(&before), [], "{points} × {times}, {n}");
+        }
+    }
+    let mut p = zebras(1);
+    let id = drawing(&mut p, 50_000, 2);
+    for n in 1..4 {
+        change(&mut p, id, n).unwrap();
+    }
+}
+
+/// Adding a stroke to a drawing is refused when the drawing would then have more than the
+/// 100,000 points it is drawn with, with nothing changed. Before, it was added.
+#[test]
+fn adding_a_stroke_past_a_drawing_s_points_is_refused() {
+    let stroke = [(150.0, 150.0), (200.0, 160.0)];
+    let mut p = zebras(1);
+    let id = drawing(&mut p, 99_999, 1);
+    let before = p.state_before();
+    let e = p.add_ink_stroke(0, id, &stroke).expect_err("refused");
+    assert!(past_its_points(&e), "{e:#}");
+    assert_eq!(p.state_since(&before), []);
+    let mut p = zebras(1);
+    let id = drawing(&mut p, 99_998, 1);
+    p.add_ink_stroke(0, id, &stroke).unwrap();
+}
+
+/// Moving an annotation reads each of its entries of points within the 100,000 it is drawn
+/// with, and is refused past them, with nothing changed, rather than write them back cut: a
+/// polygon of 150,000 points isn't moved. Before, it was moved and cut to 100,000. One of
+/// 100,000 is.
+#[test]
+fn moving_an_annotation_past_its_points_is_refused() {
+    let polygon = |p: &mut Pdf, points: i64| {
+        let vertices: Vec<Object> = (0..points)
+            .flat_map(|i| [100 + i % 200, 200 + i % 2 * 50].map(Object::from))
+            .collect();
+        let rect = [100i64, 200, 300, 250].map(Object::from).to_vec();
+        let d = dictionary! {
+            "Type" => "Annot", "Subtype" => "Polygon", "Rect" => rect,
+            "Vertices" => vertices, "C" => vec![Object::from(0i64)],
+        };
+        annotate(p, d)
+    };
+    let to = [50.0, 50.0, 400.0, 300.0];
+    let mut p = zebras(1);
+    let id = polygon(&mut p, 150_000);
+    let before = p.state_before();
+    let e = p.move_annotation(0, id, to).expect_err("refused");
+    assert!(past_its_points(&e), "{e:#}");
+    assert_eq!(p.state_since(&before), []);
+    let mut p = zebras(1);
+    let id = polygon(&mut p, 100_000);
+    p.move_annotation(0, id, to).unwrap();
 }
