@@ -12,6 +12,7 @@ use crate::{Align, Pdf, Result};
 use anyhow::{anyhow, bail};
 use lopdf::{Dictionary, Object, ObjectId};
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 
 /// How many of a page's annotations are shown, a limit that keeps a malformed or hostile
 /// file from running away. Removing information reads them all.
@@ -382,32 +383,40 @@ impl Pdf {
     /// Every redaction mark, on each page that lists it, without [`MAX_ANNOTS`], placed by
     /// `place`: a mark several pages list is applied on each. Each list's entries are looked
     /// at once however many pages share it, within the reading budget ([`Place::look`]),
-    /// and only marks are built; none once `place` is done.
+    /// and only marks are built; a page whose list was looked at before is charged a step
+    /// for each of its marks, each placed there again. None is built once `place` is done.
     pub(crate) fn every_mark(&self, place: &mut Place) -> Vec<Annot> {
         let mut layers = self.layers_off();
-        let mut found: HashMap<ObjectId, Vec<ObjectId>> = HashMap::new();
+        let mut found: HashMap<ObjectId, Rc<[ObjectId]>> = HashMap::new();
         let mut out = Vec::new();
         for (i, page, to_vis) in self.placed_pages() {
             let Some((at, list)) = self.annots_at(page) else {
                 continue;
             };
-            let mut marks = || {
-                place.look(list.len());
-                #[cfg(test)]
-                tests::ENTRIES_READ.set(tests::ENTRIES_READ.get() + list.len());
-                (list.iter().filter_map(|o| o.as_reference().ok()))
-                    .filter(|&id| {
-                        self.doc.get_dictionary(id).is_ok_and(|d| {
-                            d.get(b"Subtype").and_then(Object::as_name).ok() == Some(b"Redact")
+            let marks = match at.and_then(|at| found.get(&at)) {
+                Some(marks) => {
+                    place.look(marks.len());
+                    marks.clone()
+                }
+                None => {
+                    place.look(list.len());
+                    #[cfg(test)]
+                    tests::ENTRIES_READ.set(tests::ENTRIES_READ.get() + list.len());
+                    let marks: Rc<[ObjectId]> = (list.iter())
+                        .filter_map(|o| o.as_reference().ok())
+                        .filter(|&id| {
+                            self.doc.get_dictionary(id).is_ok_and(|d| {
+                                d.get(b"Subtype").and_then(Object::as_name).ok() == Some(b"Redact")
+                            })
                         })
-                    })
-                    .collect::<Vec<ObjectId>>()
+                        .collect();
+                    if let Some(at) = at {
+                        found.insert(at, marks.clone());
+                    }
+                    marks
+                }
             };
-            let marks = match at {
-                Some(at) => found.entry(at).or_insert_with(marks).clone(),
-                None => marks(),
-            };
-            for id in marks {
+            for &id in marks.iter() {
                 if place.done() {
                     return out;
                 }
@@ -720,12 +729,17 @@ impl Pdf {
             .filter(|&(_, id)| {
                 self.doc.get_dictionary(id).is_ok_and(|d| {
                     let kind = d.get(b"Subtype").and_then(Object::as_name).ok();
-                    kind.and_then(AnnotKind::of).is_some_and(|k| pick(&k))
-                        && d.get(b"Rect").ok().and_then(|o| self.rect(o)).is_some()
+                    kind.and_then(AnnotKind::of).is_some_and(|k| pick(&k)) && self.has_rect(d)
                 })
             })
             .map(|(_, id)| id)
             .collect()
+    }
+
+    /// Whether annotation `d` has a `/Rect` to place it by: the listings leave out one
+    /// without.
+    pub(crate) fn has_rect(&self, d: &Dictionary) -> bool {
+        d.get(b"Rect").ok().and_then(|o| self.rect(o)).is_some()
     }
 
     /// The pages the listings list annotations on, those that can be placed, each with its
@@ -1248,9 +1262,77 @@ mod tests {
         d.set("Subtype", "Redact");
         BUILT.set(0);
         ENTRIES_READ.set(0);
-        let marks = p.redaction_marks();
+        let marks = p.redaction_marks().unwrap();
         let counts = (marks.len(), ENTRIES_READ.get(), BUILT.get());
         assert_eq!(counts, (200, 1_000, 200));
+    }
+
+    /// The squares of [`sharing_annots`] made redaction marks, without a `/Rect` unless
+    /// `rect`.
+    fn as_marks(p: &mut Pdf, rect: bool) {
+        let page = p.page_ids()[0];
+        let ids: Vec<ObjectId> = (p.annots_array(page).unwrap().iter())
+            .filter_map(|o| o.as_reference().ok())
+            .collect();
+        for id in ids {
+            let d = p.doc.get_dictionary_mut(id).unwrap();
+            d.set("Subtype", "Redact");
+            if !rect {
+                d.remove(b"Rect");
+            }
+        }
+    }
+
+    /// The marks many pages share are counted once, as the listing gives them (Q1), and none
+    /// is built: 2,000 pages sharing 100 marks count 100.
+    #[test]
+    fn marks_many_pages_share_are_counted_once_building_none() {
+        let (mut p, _) = sharing_annots(2_000, 100);
+        as_marks(&mut p, true);
+        BUILT.set(0);
+        let n = p.redaction_mark_count();
+        assert_eq!((n, BUILT.get()), (100, 0));
+    }
+
+    /// The count is of marks, not the areas they cover (PB-40), within the budget for
+    /// reading them and past it, where listing them is refused: 3 pages sharing a mark of
+    /// two quads, one of none and one without a `/Rect`, listed and applied nowhere, count
+    /// 2 marks of 9 areas.
+    #[test]
+    fn the_count_is_of_marks_not_areas() {
+        let (mut p, first) = sharing_annots(3, 3);
+        as_marks(&mut p, true);
+        let quad = [10, 20, 20, 20, 10, 10, 20, 10].map(Object::from);
+        let d = p.doc.get_dictionary_mut(first).unwrap();
+        d.set("QuadPoints", [quad.clone(), quad].concat());
+        let last = p.annots_array(p.page_ids()[0]).unwrap()[2].as_reference();
+        p.doc
+            .get_dictionary_mut(last.unwrap())
+            .unwrap()
+            .remove(b"Rect");
+        let within = (p.redaction_mark_count(), p.redaction_marks().unwrap().len());
+        let ((count, listed), _) = budget_seam::with_limit(1, || {
+            let listed = p.redaction_marks();
+            (
+                p.redaction_mark_count(),
+                listed.is_err_and(|e| e.is::<TooComplex>()),
+            )
+        });
+        assert_eq!((within, count, listed), ((2, 9), 2, true));
+    }
+
+    /// Applying marks many pages share is refused past the budget for reading them, each
+    /// page's marks charged, even marks with nothing to place: 2,000 pages sharing 100 marks
+    /// without a `/Rect`, with a budget of 100,000 steps.
+    #[test]
+    fn applying_marks_many_pages_share_is_refused_past_the_budget() {
+        let (mut p, _) = sharing_annots(2_000, 100);
+        as_marks(&mut p, false);
+        BUILT.set(0);
+        let (e, _) = budget_seam::with_limit(100_000, || p.apply_redactions());
+        let built = BUILT.get();
+        let refused = e.as_ref().is_err_and(|e| e.is::<TooComplex>());
+        assert!(refused && built <= 100_000, "{:?}, {built} built", e.err());
     }
 
     #[test]

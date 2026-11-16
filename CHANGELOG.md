@@ -71,9 +71,11 @@
 - The Comments view's search box says "Search", which fits in it. Before, "Search comments" was cut off. A screen
   reader still calls it Search comments.
 - The redaction notice and the Redact tool's pane count marks: "2 marks for redaction (outlined in red) aren't
-  applied yet". A mark over several lines is one. Before, they counted areas, so one mark over three lines was
-  "3 areas". Fill and sign's notice says "3 items you put down" for a signature, a date and a tick. Before, it said
-  "3 signatures and other items" whatever they were.
+  applied yet". A mark over several lines is one, and so is a mark several pages share, as the Comments view lists
+  it. The questions before saving and before applying the marks count them the same way. Before, they counted
+  areas, so one mark over three lines was "3 areas", and a shared mark counted once for each page. Fill and sign's
+  notice says "3 items you put down" for a signature, a date and a tick. Before, it said "3 signatures and other
+  items" whatever they were.
 - The inspector's edge takes a drag from a press on its line, or just onto the pages, as from the panel's side.
   Before, the pages' scroll bar lay over that part of it, so such a press went to the pages.
 - While you type in a form field, the inspector stays headed **Document**, or the selected pages, as what it shows

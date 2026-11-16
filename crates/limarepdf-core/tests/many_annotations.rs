@@ -251,13 +251,13 @@ fn marked() -> Pdf {
 #[test]
 fn a_mark_past_those_shown_is_applied() {
     let mut p = marked();
-    assert_eq!(p.redaction_marks().len(), 2);
+    assert_eq!(p.redaction_marks().unwrap().len(), 2);
 
     let rep = p.apply_redactions().unwrap();
     assert!(rep.left.is_empty(), "{:?}", rep.left);
     // The marks are gone; the comments stay.
     assert_eq!(annots(&p).len(), SHOWN);
-    assert!(p.redaction_marks().is_empty());
+    assert!(p.redaction_marks().unwrap().is_empty());
     Saved::of(&mut p).assert_gone(&["FIRSTWORD", "SECONDWORD"]);
 }
 

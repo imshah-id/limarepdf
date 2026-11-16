@@ -1225,9 +1225,24 @@ impl Pdf {
     /// The areas the document's redaction marks cover: (page, box in displayed-page
     /// points, y down), one per marked area. Every mark counts, not only those shown, on
     /// each page that lists it. Marks are placed and read as [`Pdf::annotations`] places
-    /// and reads them.
-    pub fn redaction_marks(&self) -> Vec<(usize, [f32; 4])> {
-        marks_of(self.every_mark(&mut Place::drawn()))
+    /// and reads them, and refused past either budget ([`crate::TooComplex`]) rather than
+    /// give one elsewhere than it is shown; [`Pdf::redaction_mark_count`] counts them
+    /// still.
+    pub fn redaction_marks(&self) -> Result<Vec<(usize, [f32; 4])>> {
+        let mut place = Place::drawn().stopping();
+        let marks = marks_of(self.every_mark(&mut place));
+        place.whole()?;
+        Ok(marks)
+    }
+
+    /// How many redaction marks the document has: marks, not the areas
+    /// [`Pdf::redaction_marks`] gives (a mark over several lines is one, PB-40), each once
+    /// however many pages list it, as the listing gives them (Q1). None is built and nothing
+    /// is charged to a budget, so it is never refused. For the marks banner and the
+    /// questions before saving and applying, asked after every change.
+    pub fn redaction_mark_count(&self) -> usize {
+        self.annotations_of_kind(|k| *k == crate::AnnotKind::Redact)
+            .len()
     }
 
     /// Apply the document's redaction marks: remove everything under them as
@@ -1237,9 +1252,7 @@ impl Pdf {
     pub fn apply_redactions(&mut self) -> Result<RedactReport> {
         self.atomically(|p| {
             p.own_direct_annots()?;
-            let mut place = Place::drawn().stopping();
-            let marks = marks_of(p.every_mark(&mut place));
-            place.whole()?;
+            let marks = p.redaction_marks()?;
             if marks.is_empty() {
                 bail!("the document has no redaction marks");
             }

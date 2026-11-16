@@ -497,14 +497,14 @@ enum Dialog {
     ConfirmSaveRepaired(Asked),
     /// Save edits the document's signatures don't allow?
     ConfirmSaveDisallowed(Box<SaveDisallowed>),
-    /// Remove everything under this many marked areas?
+    /// Remove everything under this many redaction marks?
     ConfirmApplyRedactions(Asked, usize),
     /// Draw this many fill-and-sign items into the pages?
     ConfirmFinishSigning(Asked, usize),
     RemoveHidden(Asked, dlg::RemoveHidden),
     /// Reduce file size, with its preview (ENH-19).
     ReduceSize(Asked, Box<dlg::Reduce>),
-    /// Save (`true`: as a new file) with this many marked areas not yet applied?
+    /// Save (`true`: as a new file) with this many redaction marks not yet applied?
     ConfirmSaveMarks(Asked, bool, usize),
     Print(Asked, Box<dlg::Print>),
     /// Print with fields whose values won't show on paper?
@@ -2869,7 +2869,7 @@ impl App {
         let Some(t) = self.tabs.get(self.active) else {
             return;
         };
-        let marks = t.pdf.redaction_marks().len();
+        let marks = t.pdf.redaction_mark_count();
         if marks > 0 {
             self.dialog = Dialog::ConfirmSaveMarks(Asked::of(t), as_new, marks);
         } else {
@@ -3353,7 +3353,7 @@ impl App {
                 }
             },
             Act::ApplyRedactions if has => {
-                let n = self.tabs[self.active].pdf.redaction_marks().len();
+                let n = self.tabs[self.active].pdf.redaction_mark_count();
                 if n == 0 {
                     self.tabs[self.active].info = Some(
                         "There are no redaction marks: mark areas with Protect > Mark redaction, \
@@ -5498,7 +5498,7 @@ impl App {
                          LimarePDF then checks that nothing readable is left under them. Undo \
                          brings it all back until you close the document; once saved, it is \
                          gone from the file.",
-                        plural(*n, "the marked area", "the {n} marked areas")
+                        plural(*n, "the mark", "the {n} marks")
                     ),
                     Btn::danger("Apply redactions"),
                 )
@@ -5589,11 +5589,10 @@ impl App {
                     Ask::new(
                         "Save without applying the redactions?",
                         &format!(
-                            "This document has {} marked for redaction but not applied: \
-                             nothing under the marks has been removed, and anyone can still \
-                             read it. Apply them first with {}, or save the marks to finish \
-                             or review later.",
-                            plural(*n, "an area", "{n} areas"),
+                            "This document has {} not yet applied: nothing under the marks \
+                             has been removed, and anyone can still read it. Apply them first \
+                             with {}, or save the marks to finish or review later.",
+                            plural(*n, "a redaction mark", "{n} redaction marks"),
                             menu::way(Act::ApplyRedactions)
                         ),
                         Btn::danger("Save with marks"),
@@ -18944,7 +18943,13 @@ mod tests {
         t.query = "walrus".into();
         t.run_search();
         t.mark_results_for_redaction(&ctx, "Tester");
-        let pages: Vec<usize> = t.pdf.redaction_marks().iter().map(|m| m.0).collect();
+        let pages: Vec<usize> = t
+            .pdf
+            .redaction_marks()
+            .unwrap()
+            .iter()
+            .map(|m| m.0)
+            .collect();
         assert_eq!(pages, [0, 2, 3]);
     }
 

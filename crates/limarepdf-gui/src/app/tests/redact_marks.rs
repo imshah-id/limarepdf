@@ -103,7 +103,10 @@ fn a_redaction_mark_moves_with_a_drag() {
     app.act(&ctx, Act::ApplyRedactions);
     click(&mut app, &ctx, "Apply redactions");
     let text = app.tabs[0].pdf.page_text(0);
-    assert!(app.tabs[0].pdf.redaction_marks().is_empty(), "not applied");
+    assert!(
+        app.tabs[0].pdf.redaction_marks().unwrap().is_empty(),
+        "not applied"
+    );
     assert!(text.contains("Walrus one"), "{text:?}");
     assert!(text.contains("Walrus three"), "{text:?}");
     assert!(!text.contains("Walrus two"), "{text:?}");
@@ -264,7 +267,7 @@ fn the_banner_for_one_mark_says_it() {
 }
 
 /// PB-40: the notice and the Redact tool's pane count marks, not areas: a mark over a line
-/// of text and one drawn as a box are two marks.
+/// of text and one drawn as a box are two marks, and a third over two lines makes three.
 #[test]
 fn the_notice_and_the_pane_count_marks() {
     let one = crate::banners::redactions(1).text;
@@ -288,8 +291,12 @@ fn the_notice_and_the_pane_count_marks() {
         (tree.nodes.iter()).any(|(_, n)| n.value() == Some(s))
     };
     assert!(shown(&ty.pause(&mut app), "No marks yet."), "none");
-    for (area, says) in [(ONE, "1 mark."), (TWO, "2 marks.")] {
-        let add = |p: &mut Pdf| p.add_redaction_mark(0, &[area], "").map(drop);
+    for (areas, says) in [
+        (&[ONE][..], "1 mark."),
+        (&[TWO], "2 marks."),
+        (&[ONE, TWO], "3 marks."),
+    ] {
+        let add = |p: &mut Pdf| p.add_redaction_mark(0, areas, "").map(drop);
         assert!(app.tabs[0].edit(&ctx, add));
         assert!(shown(&ty.pause(&mut app), says), "not {says:?}");
     }
@@ -458,7 +465,7 @@ fn one_undo_takes_back_applied_redactions() {
         assert!(!now.contains("two"), "{when}: {now:?}");
         let kept = now.contains("Walrus one") && now.contains("Walrus three");
         assert!(kept, "{when}: {now:?}");
-        let marks = app.tabs[0].pdf.redaction_marks();
+        let marks = app.tabs[0].pdf.redaction_marks().unwrap();
         assert!(marks.is_empty(), "{when}: marks left {marks:?}");
     };
     gone(&app, "applied");
@@ -603,7 +610,7 @@ fn applying_what_the_tag_tree_would_keep_changes_nothing() {
     );
     assert!(t.state() == was, "the tab changed");
     assert_eq!(t.pdf.state_since(&before), []);
-    assert_eq!(t.pdf.redaction_marks().len(), 1);
+    assert_eq!(t.pdf.redaction_marks().unwrap().len(), 1);
     assert!(t.pdf.page_text(0).contains("FormSecretZebra"));
     let at = |o: &Object| t.pdf.doc.dereference(o).unwrap().1.clone();
     let res = at(t

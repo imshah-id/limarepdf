@@ -3154,7 +3154,7 @@ impl Tab {
             return;
         }
         self.marks_rev = self.revision;
-        let n = self.pdf.redaction_marks().len();
+        let n = self.pdf.redaction_mark_count();
         self.ed.redact_marks = n;
         // Fewer marks lower the bar, so the next one added shows the banner again.
         self.marks_hidden = self.marks_hidden.min(n);
