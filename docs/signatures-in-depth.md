@@ -589,7 +589,10 @@ those parts allows it. So an object that is both page content and, say, a commen
 as "just a comment". Pointers from one structure to another (a bookmark to a page, a tag to an annotation) don't
 count as parts. A signature field added with an action on it or on its widget (one run when its page opens, say)
 is refused for the action, even where adding the field is allowed: the field is listed as added beside the refused
-action.
+action. Signing in a field counts as signing only when LimarePDF lists that signature, since nothing else checks it:
+one it doesn't list (in a field nested more than 32 levels deep, say, or on one of a field's widgets rather than the
+field itself) is refused as a signature it can't check. A form field moved into a signature field, or out of one,
+is refused too.
 
 LimarePDF reads the later additions with its own strict reader rather than the lenient one it uses to open files, and
 refuses as malformed:
@@ -657,10 +660,13 @@ The full record, with the files used, is in [Testing](developer/testing.md#digit
   LimarePDF lists it; it can't tell whether that was the intent.
 - Malformed later additions are refused even when another reader can repair them.
 - A document too large to judge shows "the later additions are malformed: the document is too complex to check",
-  never allowed: past 500,000 nodes of its page tree or form fields, past 4,000,000 steps giving its objects their
-  parts, or past 4,000,000 steps comparing its pages' annotation lists with the next version's. There each entry is
-  a step, as is each change found for each page it shows on, and each comparison of two annotations written into a
-  list directly (which the format doesn't allow), so a page or two with a couple of thousand of those is enough.
+  never allowed: past 500,000 distinct nodes of its page tree or of its form fields, past 4,000,000 steps walking
+  them, past 4,000,000 steps giving its objects their parts, or past 4,000,000 steps comparing its pages' annotation
+  lists with the next version's. Walking them, each kid a node lists is a step, as is each 64 bytes of a field's
+  name, so a couple of thousand fields that all list the same couple of thousand kids are enough; how deeply they
+  nest isn't limited. Comparing annotation lists, each entry is a step, as is each change found for each page it
+  shows on, and each comparison of two annotations written into a list directly (which the format doesn't allow),
+  so a page or two with a couple of thousand of those is enough.
   Giving parts, each object in such an annotation is a step for each page sharing its list, so a thousand pages
   sharing 500 of them of ten objects each is enough there; an object shared by many pages costs each page after the
   first a step for each of its references that page reached already, so a hundred pages sharing resources of 100

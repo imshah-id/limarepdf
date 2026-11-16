@@ -1594,7 +1594,28 @@ hundred pages sharing 100 objects that each refer to the same 100 others: refuse
 last of all from the catalog: refused at a limit of 2,000 (`references_reached_again_last_cost_steps`); a structure
 tree's parent tree listing an element once for each of its 5,000 marked pieces, reached by the catalog alone: a step,
 the same within 1,000 (`a_parent_tree_listing_an_element_again_costs_a_step`); an article thread through 300 pages
-still a step a bead a page (`a_thread_through_every_page_costs_a_step_a_bead`). Trust is in `trust.rs`: the trust
+still a step a bead a page (`a_thread_through_every_page_costs_a_step_a_bead`). Walking the page tree and the form
+fields, each kid a node lists and each 64 bytes of a field's name is a step, against the same limit (its own count),
+and nesting isn't limited: a page 70 levels down was skipped before, as was a field 40 down
+(`pages_deep_in_the_tree_are_checked`, `fields_deep_in_the_form_are_checked`). A page-tree node listing a page and
+1,000 nodes that each list the same: refused at a limit of 100,000 (`page_tree_kids_cost_a_step_each`); a root field
+named with 6,400 bytes over 1,000 kids: refused at 50,000 (`long_field_names_cost_steps`). Whether a field's widgets
+show is worked out once for each list of kids fields share, a `/Rect` read only when it has four numbers: 1,000
+fields that each list all of them, 8,008,000 numbers read before, at most 50,000 now
+(`form_kids_cost_a_step_each`); a `/Rect` of 10,000 numbers, 20,000 read before, none now
+(`a_rectangle_of_too_many_numbers_is_not_read`). Each field keeps the top of its tree as it's recorded, so a signature
+field added after signing is judged with all its nodes however deep (`a_new_signature_fields_deep_widget_is_judged`),
+and the trees of those added are gathered in one look at each field and judged in a second, both through one counted
+accessor: 2,000 new signature fields, about 4,000,000 looks before, 4,000 now
+(`new_signature_fields_are_looked_at_a_couple_of_times_each`; a scan of every field for each new tree counts
+4,004,000). A field signed after signing counts as signing only when the report lists its signature, as nothing else
+checks it, and every signed node of a new field is judged, not only the first: one nested past the 32 levels the
+report follows, or a value on a widget the report doesn't read, is refused
+(`a_signature_the_report_doesnt_list_is_refused`, `a_new_signature_the_report_doesnt_list_is_refused`; the widget's
+was allowed before, `a_signature_on_a_fields_widget_is_refused`). A field made part of a signature field, or no
+longer, by a list of kids or fields changing is refused, as its signing would go unjudged: a widget moved under one
+and given a made-up signature was reported as nothing before
+(`a_widget_moved_under_a_signature_field_and_signed_is_refused`). Trust is in `trust.rs`: the trust
 list file (`trust.txt`
 in the settings folder, whose location `limarepdf_core::settings_dir` gives both the app and the command line), and
 the chain search from a signer's certificate to a trusted authority over the certificates the signature and the

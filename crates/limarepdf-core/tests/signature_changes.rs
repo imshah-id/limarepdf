@@ -758,6 +758,200 @@ fn signing_an_existing_field_while_adding_an_action_is_refused() {
     assert!(!report(&b).all_ok());
 }
 
+/// `b` with an empty signature field `Deep` on the page, `depth` untitled fields below the
+/// top of the form.
+fn deep_signature_field(b: &[u8], depth: usize) -> Vec<u8> {
+    edit(b, |prev, new| {
+        let p = page(prev);
+        let w = new.add_object(dictionary! {
+            "Type" => "Annot", "Subtype" => "Widget", "FT" => "Sig",
+            "T" => Object::string_literal("Deep"), "F" => 4, "P" => p,
+            "Rect" => vec![150.into(), 100.into(), 250.into(), 140.into()],
+        });
+        add_annot(prev, new, w);
+        let mut top = w;
+        for _ in 0..depth {
+            top = new.add_object(dictionary! { "Kids" => vec![Object::from(top)] });
+        }
+        let r = root(prev);
+        let mut c = dict(prev, r);
+        c.set(
+            "AcroForm",
+            dictionary! { "Fields" => vec![Object::from(top)] },
+        );
+        new.set_object(r, Object::Dictionary(c));
+    })
+}
+
+/// Gives field (or widget) `id` a made-up signature (a document timestamp if `stamp`), not a
+/// real one, and a drawing.
+fn fake_sign(prev: &Document, new: &mut Document, id: ObjectId, stamp: bool) {
+    let v = new.add_object(dictionary! {
+        "Type" => if stamp { "DocTimeStamp" } else { "Sig" },
+        "Filter" => "Adobe.PPKLite",
+        "SubFilter" => if stamp { "ETSI.RFC3161" } else { "adbe.pkcs7.detached" },
+        "ByteRange" => vec![0.into(), 10.into(), 20.into(), 10.into()],
+        "Contents" => Object::String(vec![0; 4], lopdf::StringFormat::Hexadecimal),
+    });
+    let ap = appearance(new, "BT (PAID) Tj ET");
+    let mut d = dict(prev, id);
+    d.set("V", v);
+    d.set("AP", dictionary! { "N" => ap });
+    new.set_object(id, Object::Dictionary(d));
+}
+
+/// `b` with a made-up signature in field `Deep` (see [`fake_sign`]).
+fn fake_signature(b: &[u8], stamp: bool) -> Vec<u8> {
+    edit(b, |prev, new| {
+        fake_sign(prev, new, titled(prev, "Deep"), stamp)
+    })
+}
+
+/// The first kid field `id` lists.
+fn first_kid(d: &Document, id: ObjectId) -> ObjectId {
+    let field = dict(d, id);
+    let kids = field.get(b"Kids").unwrap().as_array().unwrap();
+    kids[0].as_reference().unwrap()
+}
+
+/// A field signed after a certification allowing no changes (with a timestamp) or after an
+/// ordinary signature, made up both times: at the top of the form the report lists it (as
+/// broken) and the signing is allowed; nested 33 deep, past what the report lists, nothing
+/// would check it, so it's refused.
+#[test]
+fn a_signature_the_report_doesnt_list_is_refused() {
+    let mut wrong = Vec::new();
+    for depth in [0, 33] {
+        let field = deep_signature_field(&base_pdf(), depth);
+        for (stamp, signed) in [(true, certify(&field, 1)), (false, approve(&field))] {
+            let b = fake_signature(&signed, stamp);
+            let r = report(&b);
+            let listed = (r.signatures.iter()).any(|s| s.fields.iter().any(|f| f == "Deep"));
+            let kind = match stamp {
+                true => ChangeKind::DocumentTimestamp("Deep".into()),
+                false => ChangeKind::Signed("Deep".into()),
+            };
+            let got = changes(&b);
+            let fine = match listed {
+                true => depth == 0 && got == [(kind, None)],
+                false => depth == 33 && !got.iter().any(|(k, r)| *k == kind || r.is_none()),
+            };
+            if !fine || got.is_empty() {
+                wrong.push(format!("depth {depth}, timestamp {stamp}: {got:?}"));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// A made-up signature on the widget of an empty signature field rather than on the field:
+/// the report reads a field's signature from the field, so it doesn't list this one, and with
+/// nothing to check it the signing is refused. It was allowed (after an ordinary signature,
+/// and as a document timestamp after a certification allowing no changes).
+#[test]
+fn a_signature_on_a_fields_widget_is_refused() {
+    let field = extra_field(&base_pdf(), true, |_| Dictionary::new());
+    let what = "a signature in field \"Extra\" it can't check";
+    let want = [(ChangeKind::Unrecognised(what.into()), Some(Refusal::Never))];
+    let mut wrong = Vec::new();
+    for (stamp, signed) in [(true, certify(&field, 1)), (false, approve(&field))] {
+        let b = edit(&signed, |prev, new| {
+            let w = first_kid(prev, titled(prev, "Extra"));
+            fake_sign(prev, new, w, stamp);
+        });
+        let got = changes(&b);
+        if got != want || report(&b).all_ok() {
+            wrong.push(format!("timestamp {stamp}: {got:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// The base document with text field `A`, its widget `F` (titled if `named`) on the page, and
+/// after it empty signature field `B`, whose kids are in an array of their own: `F` again,
+/// `depth` untitled fields down, if `shared`; none if not.
+fn two_parents(depth: usize, named: bool, shared: bool) -> Vec<u8> {
+    edit(&base_pdf(), |prev, new| {
+        let a = new.new_object_id();
+        let mut w = dictionary! {
+            "Type" => "Annot", "Subtype" => "Widget", "F" => 4, "P" => page(prev), "Parent" => a,
+            "Rect" => vec![150.into(), 100.into(), 250.into(), 140.into()],
+        };
+        if named {
+            w.set("T", Object::string_literal("F"));
+        }
+        let f = new.add_object(w);
+        add_annot(prev, new, f);
+        let (t, kids) = (Object::string_literal("A"), vec![Object::from(f)]);
+        let field = dictionary! { "FT" => "Tx", "T" => t, "Kids" => kids };
+        new.set_object(a, Object::Dictionary(field));
+        let mut top = f;
+        for _ in 0..depth {
+            top = new.add_object(dictionary! { "Kids" => vec![Object::from(top)] });
+        }
+        let kids: Vec<Object> = if shared { vec![top.into()] } else { Vec::new() };
+        let kids = new.add_object(kids);
+        let b = new.add_object(dictionary! {
+            "FT" => "Sig", "T" => Object::string_literal("B"), "Kids" => kids,
+        });
+        let r = root(prev);
+        let mut c = dict(prev, r);
+        c.set(
+            "AcroForm",
+            dictionary! { "Fields" => vec![Object::from(a), Object::from(b)] },
+        );
+        new.set_object(r, Object::Dictionary(c));
+    })
+}
+
+/// `F` of [`two_parents`] made `B`'s by edits to lists of kids and fields alone (`A` listing
+/// it no more, or `B` listed first, `B` listing it too if it didn't), and given a made-up
+/// signature in the same revision: refused as a change to `A`'s field. Before, `F` turning
+/// into part of a signature field meant its signing was never judged, and nothing was
+/// reported: 33 levels down, past what the report lists, or listed by `B` only in the revision.
+#[test]
+fn a_widget_moved_under_a_signature_field_and_signed_is_refused() {
+    let mut wrong = Vec::new();
+    for (depth, named, shared) in [(33, true, true), (0, false, false)] {
+        let form = two_parents(depth, named, shared);
+        for (stamp, signed) in [(true, certify(&form, 1)), (false, approve(&form))] {
+            for drop in [true, false] {
+                let b = edit(&signed, |prev, new| {
+                    let (a, b) = (titled(prev, "A"), titled(prev, "B"));
+                    let f = first_kid(prev, a);
+                    if !shared {
+                        let kids = dict(prev, b).get(b"Kids").unwrap().as_reference().unwrap();
+                        new.set_object(kids, vec![Object::from(f)]);
+                    }
+                    if drop {
+                        let mut d = dict(prev, a);
+                        d.set("Kids", Vec::<Object>::new());
+                        new.set_object(a, Object::Dictionary(d));
+                    } else {
+                        let r = root(prev);
+                        let mut c = dict(prev, r);
+                        let mut acro = c.get(b"AcroForm").unwrap().as_dict().unwrap().clone();
+                        let mut fields = acro.get(b"Fields").unwrap().as_array().unwrap().clone();
+                        fields.retain(|f| f.as_reference().ok() != Some(b));
+                        fields.insert(0, b.into());
+                        acro.set("Fields", fields);
+                        c.set("AcroForm", acro);
+                        new.set_object(r, Object::Dictionary(c));
+                    }
+                    fake_sign(prev, new, f, stamp);
+                });
+                let got = changes(&b);
+                let moved = ChangeKind::FieldChanged((if named { "A.F" } else { "A" }).into());
+                if !got.contains(&(moved, Some(Refusal::Never))) || report(&b).all_ok() {
+                    let case = format!("depth {depth}, timestamp {stamp}, A drops it {drop}");
+                    wrong.push(format!("{case}: {got:?}"));
+                }
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 #[test]
 fn a_change_undone_before_the_next_signature_still_counts() {
     let b = approve(&base_pdf());

@@ -14,7 +14,7 @@ use crate::{Pdf, Result};
 use chrono::{DateTime, FixedOffset, NaiveDate, Utc};
 use lopdf::xref::XrefEntry;
 use lopdf::{Dictionary, Object, ObjectId};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 /// The digital signatures in a document, as checked by [`verify_signatures`].
@@ -517,6 +517,10 @@ pub fn verify_signatures(
             None => groups.push((place, vec![(field, node.id)])),
         }
     }
+    // A field signed after a signature counts as signing only if it's listed here.
+    let listed: HashSet<ObjectId> = (groups.iter())
+        .flat_map(|(_, fields)| fields.iter().map(|&(_, id)| id))
+        .collect();
     let mut versions = Versions::new(bytes, password, &pdf);
     let mut signatures: Vec<DigitalSignature> = groups
         .into_iter()
@@ -547,7 +551,7 @@ pub fn verify_signatures(
             locks: signatures[i].locks.as_ref(),
         })
         .collect();
-    let found = sig_changes::analyse(&mut versions, &inputs, certified);
+    let found = sig_changes::analyse(&mut versions, &inputs, &listed, certified);
     for (i, changes) in which.into_iter().zip(found) {
         signatures[i].changes = changes;
     }
