@@ -1237,12 +1237,12 @@ impl Pdf {
 
     /// How many redaction marks the document has: marks, not the areas
     /// [`Pdf::redaction_marks`] gives (a mark over several lines is one, PB-40), each once
-    /// however many pages list it, as the listing gives them (Q1). None is built and nothing
-    /// is charged to a budget, so it is never refused. For the marks banner and the
-    /// questions before saving and applying, asked after every change.
+    /// however many pages list it, as the listing gives them (Q1), and those written into a
+    /// page's list directly, which applying applies too. None is built and nothing is
+    /// charged to a budget, so it is never refused. For the marks banner and the questions
+    /// before saving and applying, asked after every change.
     pub fn redaction_mark_count(&self) -> usize {
-        self.annotations_of_kind(|k| *k == crate::AnnotKind::Redact)
-            .len()
+        self.count_of_kind(|k| *k == crate::AnnotKind::Redact)
     }
 
     /// Apply the document's redaction marks: remove everything under them as

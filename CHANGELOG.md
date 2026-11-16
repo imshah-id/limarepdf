@@ -76,6 +76,11 @@
   areas, so one mark over three lines was "3 areas", and a shared mark counted once for each page. Fill and sign's
   notice says "3 items you put down" for a signature, a date and a tick. Before, it said "3 signatures and other
   items" whatever they were.
+- Redaction marks another app wrote into a page's list of comments, rather than as objects of their own as PDF
+  asks, are counted with the others: the redaction notice and the questions before saving and before applying
+  count them. Before, they weren't counted. With only such marks in a file, **Apply redactions** was greyed and
+  saving didn't ask, though `limarepdf-cli redact --apply` applied them; alongside other marks, the questions
+  counted fewer marks than were then applied.
 - The inspector's edge takes a drag from a press on its line, or just onto the pages, as from the panel's side.
   Before, the pages' scroll bar lay over that part of it, so such a press went to the pages.
 - While you type in a form field, the inspector stays headed **Document**, or the selected pages, as what it shows

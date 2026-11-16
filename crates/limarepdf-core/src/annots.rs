@@ -725,20 +725,40 @@ impl Pdf {
     ) -> HashSet<ObjectId> {
         let placed: Vec<ObjectId> = self.placed_pages().into_iter().map(|p| p.1).collect();
         (self.listed_annots(&placed).into_iter())
-            .filter(|&(_, id)| {
-                self.doc.get_dictionary(id).is_ok_and(|d| {
-                    let kind = d.get(b"Subtype").and_then(Object::as_name).ok();
-                    kind.and_then(AnnotKind::of).is_some_and(|k| pick(&k)) && self.has_rect(d)
-                })
-            })
+            .filter(|&(_, id)| (self.doc.get_dictionary(id)).is_ok_and(|d| self.of_kind(d, &pick)))
             .map(|(_, id)| id)
             .collect()
     }
 
-    /// Whether annotation `d` has a `/Rect` to place it by: the listings leave out one
-    /// without.
-    pub(crate) fn has_rect(&self, d: &Dictionary) -> bool {
-        d.get(b"Rect").ok().and_then(|o| self.rect(o)).is_some()
+    /// How many annotations of the kinds `pick` chooses the pages list: those
+    /// [`Pdf::annotations_of_kind`] finds, and those written into a list directly, which
+    /// the listings skip but removing information gives objects first
+    /// ([`Pdf::own_direct_annots`]). Each list is read once, and none is built.
+    pub(crate) fn count_of_kind(&self, pick: impl Fn(&AnnotKind) -> bool) -> usize {
+        let placed: Vec<ObjectId> = self.placed_pages().into_iter().map(|p| p.1).collect();
+        let mut seen = HashSet::new();
+        let mut n = 0;
+        for (_, _, list) in self.each_annots(&placed) {
+            n += (list.iter())
+                .filter(|o| match o {
+                    Object::Reference(id) => {
+                        seen.insert(*id)
+                            && (self.doc.get_dictionary(*id)).is_ok_and(|d| self.of_kind(d, &pick))
+                    }
+                    Object::Dictionary(d) => self.of_kind(d, &pick),
+                    _ => false,
+                })
+                .count();
+        }
+        n
+    }
+
+    /// Whether annotation `d` is of a kind `pick` chooses and has a `/Rect` to place it by:
+    /// the listings leave out one without.
+    fn of_kind(&self, d: &Dictionary, pick: impl Fn(&AnnotKind) -> bool) -> bool {
+        let kind = d.get(b"Subtype").and_then(Object::as_name).ok();
+        kind.and_then(AnnotKind::of).is_some_and(|k| pick(&k))
+            && d.get(b"Rect").ok().and_then(|o| self.rect(o)).is_some()
     }
 
     /// The pages the listings list annotations on, those that can be placed, each with its

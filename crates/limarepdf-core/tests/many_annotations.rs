@@ -261,6 +261,26 @@ fn a_mark_past_those_shown_is_applied() {
     Saved::of(&mut p).assert_gone(&["FIRSTWORD", "SECONDWORD"]);
 }
 
+/// A redaction mark written into the page's list directly is counted, as applying applies
+/// it: the notice, the question before saving and Apply redactions go by the count. One
+/// without a `/Rect` is not, as the listing leaves it out.
+#[test]
+fn a_mark_written_into_the_list_directly_is_counted() {
+    let mut p = page("BT /F1 12 Tf 20 100 Td (DIRECTWORD) Tj ET");
+    let mark = |r: Option<[i64; 4]>| {
+        let mut d = dictionary! { "Type" => "Annot", "Subtype" => "Redact" };
+        if let Some(r) = r {
+            d.set("Rect", rect(r));
+        }
+        Object::Dictionary(d)
+    };
+    set_annots(&mut p, vec![mark(Some([15, 80, 110, 110])), mark(None)]);
+    let counted = p.redaction_mark_count();
+    let rep = p.apply_redactions().unwrap();
+    assert_eq!((counted, rep.pages[0].chars), (1, 10));
+    Saved::of(&mut p).assert_gone(&["DIRECTWORD"]);
+}
+
 #[test]
 fn an_attachment_past_those_shown_is_removed() {
     let mut p = page("");

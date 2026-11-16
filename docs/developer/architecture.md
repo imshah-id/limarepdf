@@ -1409,11 +1409,13 @@ and its search for the removed text in the comments (`find_elsewhere`). The mark
 however many pages share it, and only they are built; a page whose list was looked through before is charged a step
 for each of its marks, so P pages sharing M marks are refused past the budget, not built P × M times, uncharged where
 a mark has no `/Rect`. What needs only what each annotation is picks ids by kind, building no entry
-(`annotations_of_kind`): sanitising's comments and attachments, the marks applying redaction removes, and the count
-of marks for the marks banner, the Redact pane and the questions before saving and applying
-(`redaction_mark_count`, never refused): each mark with a `/Rect` once, however many pages list it, as the listing
-gives it, and a mark over several lines is one, not one per area as `redaction_marks` gives them (PB-40). `annot
-list` marks one "too large to show" (`"unread": true` in JSON). `READ_STEPS` is 2²⁴: 2,242 times the corpus
+(`annotations_of_kind`): sanitising's comments and attachments, and the marks applying redaction removes. The count
+of marks for the marks banner, the Redact pane and the questions before saving and applying (`redaction_mark_count`,
+by `count_of_kind`, never refused) reads each list once: each mark with a `/Rect` once, however many pages list it,
+as the listing gives it, and one written into a list directly, which the listings skip but applying gives an object
+first (`own_direct_annots`) and applies; a mark over several lines is one, not one per area as `redaction_marks`
+gives them (PB-40). `annot list` marks one "too large to show" (`"unread": true` in JSON).
+`READ_STEPS` is 2²⁴: 2,242 times the corpus
 maximum, 7,480 steps (`pdfjs/issue12579.pdf`, 85 annotations; the 1,086 files that open, measured 2026-11-15 with
 the budget lifted). Timed in an optimised build (the `ci-test` profile) on made-up pages just under the limit, ink
 strokes sharing their points are the dearest: listed in 0.7 s and removed in 0.9 s (0.04 µs a step). 258,111
@@ -2157,8 +2159,8 @@ every file a command reads besides the document (a picture, a password file, for
 certificate, the digital ID used) and refuses an output that is one of them (PB-139). The contract, its tests and
 limits: [contracts](contracts.md#file-identity-and-destinations).
 
-Listing annotations (`Pdf::annotations`, and `annotations_of_kind` for the redaction marks counted after every
-change and before every save) takes the pages' ids from one list (`placed_pages`); looked up by number
+Listing annotations (`Pdf::annotations`, and `count_of_kind` for the redaction marks counted after every change
+and before every save) takes the pages' ids from one list (`placed_pages`); looked up by number
 (`page_id_at`, which builds the page list) it went through the page tree once a page, 63 ms on 300 pages (batch 37).
 
 Crash recovery copies are kept by `crates/limarepdf-gui/src/recovery.rs`, in a private
