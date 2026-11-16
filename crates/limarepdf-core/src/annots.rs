@@ -402,7 +402,7 @@ impl Pdf {
                 None => {
                     place.look(list.len());
                     #[cfg(test)]
-                    tests::ENTRIES_READ.set(tests::ENTRIES_READ.get() + list.len());
+                    entries_read(list.len());
                     let marks: Rc<[ObjectId]> = (list.iter())
                         .filter_map(|o| o.as_reference().ok())
                         .filter(|&id| {
@@ -548,39 +548,47 @@ impl Pdf {
     /// popups too.
     pub(crate) fn drop_annotations_ids(
         &mut self,
-        mut gone: HashSet<ObjectId>,
+        gone: HashSet<ObjectId>,
     ) -> Result<(usize, HashSet<ObjectId>)> {
         if gone.is_empty() {
             return Ok((0, HashSet::new()));
         }
-        // Each reply on every page and what it replies to (`/IRT`), from the kinds listed
-        // ([`AnnotKind::of`]), without placing or reading any more of them.
         let pages = self.page_ids();
-        let replies: Vec<(ObjectId, ObjectId)> = (self.listed_annots(&pages).into_iter())
-            .filter_map(|(_, id)| {
-                let d = self.doc.get_dictionary(id).ok()?;
+        let mut all = HashSet::new();
+        with_replies(&mut all, gone, &self.replies(&pages));
+        Ok((all.len(), self.take_out(&pages, &all)?))
+    }
+
+    /// The replies `pages` list, by what each replies to (`/IRT`), from the kinds listed
+    /// ([`AnnotKind::of`]), without placing or reading any more of them.
+    pub(crate) fn replies(&self, pages: &[ObjectId]) -> HashMap<ObjectId, Vec<ObjectId>> {
+        let mut out: HashMap<ObjectId, Vec<ObjectId>> = HashMap::new();
+        for (_, id) in self.listed_annots(pages) {
+            let to = self.doc.get_dictionary(id).ok().and_then(|d| {
                 AnnotKind::of(d.get(b"Subtype").ok()?.as_name().ok()?)?;
-                Some((id, d.get(b"IRT").and_then(Object::as_reference).ok()?))
-            })
-            .collect();
-        loop {
-            let before = gone.len();
-            for &(id, to) in &replies {
-                if gone.contains(&to) {
-                    gone.insert(id);
-                }
-            }
-            if gone.len() == before {
-                break;
+                d.get(b"IRT").and_then(Object::as_reference).ok()
+            });
+            if let Some(to) = to {
+                out.entry(to).or_default().push(id);
             }
         }
+        out
+    }
+
+    /// Take the annotations `gone` and their popups out of the lists of `pages`. Returns
+    /// the annotations taken out, with `gone`.
+    pub(crate) fn take_out(
+        &mut self,
+        pages: &[ObjectId],
+        gone: &HashSet<ObjectId>,
+    ) -> Result<HashSet<ObjectId>> {
         // Each list is changed once: pages sharing one keep sharing it, or all lose it.
         let mut off = HashSet::new();
         let mut changed = Vec::new();
-        for (i, at, refs) in self.each_annots(&pages) {
+        for (i, at, refs) in self.each_annots(pages) {
             let (kept, taken): (Vec<Object>, Vec<Object>) = refs.iter().cloned().partition(|o| {
                 o.as_reference()
-                    .map_or(true, |id| !gone.contains(&id) && !self.popup_of(id, &gone))
+                    .map_or(true, |id| !gone.contains(&id) && !self.popup_of(id, gone))
             });
             off.extend(taken.iter().filter_map(|o| o.as_reference().ok()));
             if !taken.is_empty() {
@@ -603,15 +611,15 @@ impl Pdf {
             }
         }
         if !emptied.is_empty() {
-            for page in pages {
+            for &page in pages {
                 let at = self.annots_at(page).and_then(|(at, _)| at);
                 if at.is_some_and(|at| emptied.contains(&at)) {
                     self.doc.get_dictionary_mut(page)?.remove(b"Annots");
                 }
             }
         }
-        off.extend(&gone);
-        Ok((gone.len(), off))
+        off.extend(gone);
+        Ok(off)
     }
 
     /// Draw the annotations into the pages' content as they look now and remove them, so
@@ -772,7 +780,7 @@ impl Pdf {
 
     /// The page's `/Annots` array, resolved, and its object when the page refers to one
     /// rather than writing it in.
-    fn annots_at(&self, page: ObjectId) -> Option<(Option<ObjectId>, &[Object])> {
+    pub(crate) fn annots_at(&self, page: ObjectId) -> Option<(Option<ObjectId>, &[Object])> {
         let o = self.doc.get_dictionary(page).ok()?.get(b"Annots").ok()?;
         let (at, o) = self.doc.dereference(o).ok()?;
         Some((at, o.as_array().ok()?))
@@ -799,7 +807,7 @@ impl Pdf {
                 return None;
             }
             #[cfg(test)]
-            tests::ENTRIES_READ.set(tests::ENTRIES_READ.get() + list.len());
+            entries_read(list.len());
             Some((i, at, list))
         })
     }
@@ -826,7 +834,7 @@ impl Pdf {
     pub(crate) fn all_annot_refs(&self, page: ObjectId) -> Vec<ObjectId> {
         let list = self.annots_array(page).unwrap_or_default();
         #[cfg(test)]
-        tests::ENTRIES_READ.set(tests::ENTRIES_READ.get() + list.len());
+        entries_read(list.len());
         list.iter().filter_map(|o| o.as_reference().ok()).collect()
     }
 
@@ -838,7 +846,7 @@ impl Pdf {
     }
 
     /// Whether `id` is a popup belonging to one of `gone`.
-    fn popup_of(&self, id: ObjectId, gone: &HashSet<ObjectId>) -> bool {
+    pub(crate) fn popup_of(&self, id: ObjectId, gone: &HashSet<ObjectId>) -> bool {
         let Ok(d) = self.doc.get_dictionary(id) else {
             return false;
         };
@@ -1093,6 +1101,27 @@ fn pdf_date(s: &str) -> Option<String> {
         out += &format!(" {}:{}", &digits[8..10], &digits[10..12]);
     }
     Some(out)
+}
+
+/// Into `gone`, the annotations `ids` with the replies to each at any depth, by what they
+/// reply to ([`Pdf::replies`]): each looked at once.
+pub(crate) fn with_replies(
+    gone: &mut HashSet<ObjectId>,
+    ids: impl IntoIterator<Item = ObjectId>,
+    replies: &HashMap<ObjectId, Vec<ObjectId>>,
+) {
+    let mut todo: Vec<ObjectId> = ids.into_iter().collect();
+    while let Some(id) = todo.pop() {
+        if gone.insert(id) {
+            todo.extend(replies.get(&id).into_iter().flatten());
+        }
+    }
+}
+
+/// Counts `n` `/Annots` entries read on this thread ([`tests::ENTRIES_READ`]).
+#[cfg(test)]
+pub(crate) fn entries_read(n: usize) {
+    tests::ENTRIES_READ.set(tests::ENTRIES_READ.get() + n);
 }
 
 #[cfg(test)]
@@ -1395,6 +1424,98 @@ mod tests {
         let built = BUILT.get();
         let refused = e.as_ref().is_err_and(|e| e.is::<TooComplex>());
         assert!(refused && built <= 100_000, "{:?}, {built} built", e.err());
+    }
+
+    /// [`sharing_annots`] on `n` pages with 1,000 squares, the first `n` moved apart, and a
+    /// redaction for each page over its own one of them.
+    fn marked_apart(n: usize) -> (Pdf, Vec<(usize, [f32; 4])>) {
+        let (mut p, _) = sharing_annots(n, 1_000);
+        let page = p.page_ids()[0];
+        let squares: Vec<ObjectId> = (p.annots_array(page).unwrap().iter())
+            .filter_map(|o| o.as_reference().ok())
+            .take(n)
+            .collect();
+        let mut marks = Vec::new();
+        for (i, id) in squares.into_iter().enumerate() {
+            let x = 5 * i as i64;
+            let rect = vec![(x + 1).into(), 99.into(), (x + 3).into(), 101.into()];
+            p.doc.get_dictionary_mut(id).unwrap().set("Rect", rect);
+            // Halfway down the page, so the same seen from the top.
+            let x = x as f32;
+            marks.push((i, [x, 98.0, x + 4.0, 102.0]));
+        }
+        (p, marks)
+    }
+
+    /// Redacting reads the list of annotations marked pages share once, however many of
+    /// them it marks: marks on 50 pages sharing 1,000 squares, each over its own, read no
+    /// more of the list than marks on two. Each page counts its square, and the pages still
+    /// share the 950 left.
+    #[test]
+    fn redacting_reads_a_list_marked_pages_share_once() {
+        let annots = |p: &Pdf| -> Vec<Option<Object>> {
+            let page = |id| p.doc.get_dictionary(id).unwrap();
+            (p.page_ids().into_iter())
+                .map(|id| page(id).get(b"Annots").ok().cloned())
+                .collect()
+        };
+        let redact = |pages: usize| {
+            let (mut p, marks) = marked_apart(50);
+            let shared = annots(&p);
+            ENTRIES_READ.set(0);
+            let report = p.redact(&marks[..pages]).unwrap();
+            let read = ENTRIES_READ.get();
+            let counts: Vec<usize> = report.pages.iter().map(|r| r.annots).collect();
+            let left = p.annots_array(p.page_ids()[0]).map_or(0, <[Object]>::len);
+            (read, counts, annots(&p) == shared, left)
+        };
+        let ((two, ..), (many, counts, shared, left)) = (redact(2), redact(50));
+        assert_eq!(
+            (many.saturating_sub(two), counts, shared, left),
+            (0, vec![1; 50], true, 950)
+        );
+    }
+
+    /// Redacting counts an annotation, with its replies, on the first marked page it goes
+    /// with: two pages sharing a square, its pop-up and a reply to it, both marked over the
+    /// square and the second over the pop-up too, count 2 and 0, and lose the list.
+    #[test]
+    fn redacting_counts_each_annotation_on_the_first_page_it_goes_with() {
+        let (mut p, first) = sharing_annots(2, 3);
+        let ids: Vec<ObjectId> = (p.annots_array(p.page_ids()[0]).unwrap().iter())
+            .filter_map(|o| o.as_reference().ok())
+            .collect();
+        let at = |x: i64| -> Vec<Object> { vec![x.into(), 95.into(), (x + 10).into(), 105.into()] };
+        p.doc.get_dictionary_mut(first).unwrap().set("Rect", at(10));
+        let d = p.doc.get_dictionary_mut(ids[1]).unwrap();
+        d.set("Subtype", "Popup");
+        d.set("Parent", first);
+        d.set("Rect", at(100));
+        let d = p.doc.get_dictionary_mut(ids[2]).unwrap();
+        d.set("IRT", first);
+        d.set("Rect", at(200));
+        // Halfway down the page, so the same seen from the top.
+        let over = |x: f32| [x + 2.0, 98.0, x + 8.0, 102.0];
+        let marks = [(0, over(10.0)), (1, over(10.0)), (1, over(100.0))];
+        let report = p.redact(&marks).unwrap();
+        let counts: Vec<usize> = report.pages.iter().map(|r| r.annots).collect();
+        let lists: Vec<Option<usize>> = (p.page_ids().into_iter())
+            .map(|id| p.annots_array(id).map(<[Object]>::len))
+            .collect();
+        assert_eq!((counts, lists), (vec![2, 0], vec![None, None]));
+    }
+
+    /// Redacting charges each entry each marked page looks at to its budget for drawing the
+    /// annotations, before the drawings are checked: marks on 50 pages sharing 1,000
+    /// squares are refused there with a budget of 40,000 steps.
+    #[test]
+    fn redacting_charges_each_entry_each_marked_page_looks_at() {
+        let (mut p, marks) = marked_apart(50);
+        let (e, _) = budget_seam::with_limit(40_000, || p.redact(&marks));
+        let what = e
+            .err()
+            .and_then(|e| e.downcast_ref::<TooComplex>().map(|t| t.what));
+        assert_eq!(what, Some("drawing the annotations"));
     }
 
     #[test]

@@ -1408,13 +1408,21 @@ and its search for the removed text in the comments (`find_elsewhere`). The mark
 `Pdf::redaction_marks`, which refuses past either budget) are found by kind in each page's list, looked through once
 however many pages share it, and only they are built; a page whose list was looked through before is charged a step
 for each of its marks, so P pages sharing M marks are refused past the budget, not built P × M times, uncharged where
-a mark has no `/Rect`. What needs only what each annotation is picks ids by kind, building no entry
-(`annotations_of_kind`): sanitising's comments and attachments, and the marks applying redaction removes. The count
-of marks for the marks banner, the Redact pane and the questions before saving and applying (`redaction_mark_count`,
-by `count_of_kind`, never refused) reads each list once: each mark with a `/Rect` once, however many pages list it,
-as the listing gives it, and one written into a list directly, which the listings skip but applying gives an object
-first (`own_direct_annots`) and applies; a mark over several lines is one, not one per area as `redaction_marks`
-gives them (PB-40). `annot list` marks one "too large to show" (`"unread": true` in JSON).
+a mark has no `/Rect`. Applying finds the annotations under the marks the same way (`annots_under`), before anything
+changes and once for all the marked pages, within the drawing budget (above): each list is read once however many
+marked pages share it, and each entry each marked page looks at is charged a step, as is drawing one placed by its
+points, so P marked pages sharing N entries are refused ("drawing the annotations") before the drawings are checked,
+not read P × N times. They go once, after every page (`Pdf::take_out`, each list changed once, with the replies to
+them, `Pdf::replies` and `with_replies`, and their pop-ups), and the fields of the widgets among them are pruned
+once (`prune_fields`); each page counts those going with it, one gone with an earlier page not again. Before, each
+marked page read its list and every page's list for the replies, and changed its own: 50 marked pages sharing a
+list of 1,000 entries read 140,328 entries more than 2 did. What needs only what each annotation is picks ids by
+kind, building no entry (`annotations_of_kind`): sanitising's comments and attachments, and the marks applying
+redaction removes. The count of marks for the marks banner, the Redact pane and the questions before saving and
+applying (`redaction_mark_count`, by `count_of_kind`, never refused) reads each list once: each mark with a `/Rect`
+once, however many pages list it, as the listing gives it, and one written into a list directly, which the listings
+skip but applying gives an object first (`own_direct_annots`) and applies; a mark over several lines is one, not one
+per area as `redaction_marks` gives them (PB-40). `annot list` marks one "too large to show" (`"unread": true` in JSON).
 `READ_STEPS` is 2²⁴: 2,242 times the corpus
 maximum, 7,480 steps (`pdfjs/issue12579.pdf`, 85 annotations; the 1,086 files that open, measured 2026-11-15 with
 the budget lifted). Timed in an optimised build (the `ci-test` profile) on made-up pages just under the limit, ink

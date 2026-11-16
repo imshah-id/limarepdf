@@ -124,7 +124,8 @@ looked at), or when the document's drawings lead to one another in too many ways
 complex: checking the drawings would take more than 4194304 steps, so nothing was changed"). The largest of 1,080
 test files takes about 130,000 of those steps. It stops too when the comments are too many or too long to read,
 as it reads every mark's areas and looks for the removed text in every comment ("reading the annotations would
-take more than 16777216 steps").
+take more than 16777216 steps"), or too many to look through, page by marked page, for those touching the areas
+("drawing the annotations would take more than 16777216 steps").
 
 ## The check afterwards
 
