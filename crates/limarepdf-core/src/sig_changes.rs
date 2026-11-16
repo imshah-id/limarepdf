@@ -26,7 +26,7 @@ use std::fmt;
 // ---------------------------------------------------------------- report types
 
 /// Something that changed after a signature.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Change {
     pub kind: ChangeKind,
     /// The page it is on (zero-based), where it has one.
@@ -90,7 +90,7 @@ pub enum ChangeKind {
 }
 
 /// Why a change isn't allowed.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Refusal {
     /// Never allowed after signing.
     Never,
@@ -184,6 +184,7 @@ pub(crate) fn analyse(
     sigs.iter()
         .map(|s| {
             let seen = changes_after(versions, bytes, s.end, &ends, &mut cache);
+            let mut once: HashSet<Change> = HashSet::new();
             let mut out: Vec<Change> = Vec::new();
             for x in seen {
                 let c = Change {
@@ -191,7 +192,7 @@ pub(crate) fn analyse(
                     kind: x.kind,
                     page: x.page,
                 };
-                if !out.contains(&c) {
+                if once.insert(c.clone()) {
                     out.push(c);
                 }
             }
@@ -202,7 +203,7 @@ pub(crate) fn analyse(
 }
 
 /// What a change needs to be allowed.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum Need {
     Never,
     /// Always allowed: validation data, metadata.
@@ -1164,6 +1165,23 @@ impl Version<'_> {
         self.resolve(o)?.as_array().ok()
     }
 
+    /// The object holding the array `o` refers to (as [`Version::resolve`] follows it);
+    /// `None` for an array written in place, or for anything else.
+    fn array_holder<'b>(&'b self, mut o: &'b Object) -> Option<ObjectId> {
+        let mut at = None;
+        for _ in 0..8 {
+            match o {
+                Object::Reference(id) => {
+                    at = Some(*id);
+                    o = self.get(*id)?;
+                }
+                Object::Array(_) => return at,
+                _ => return None,
+            }
+        }
+        None
+    }
+
     fn name<'b>(&'b self, d: &'b Dictionary, key: &[u8]) -> Option<&'b [u8]> {
         self.resolve(d.get(key).ok()?)?.as_name().ok()
     }
@@ -1385,6 +1403,8 @@ fn same_entry(a: &XrefEntry, b: &XrefEntry) -> bool {
 /// Objects equal in value: how a string is written (literal or hex) and where a stream
 /// sits in the file don't count. Acrobat rewrites strings in its own way when saving.
 fn same_object(a: &Object, b: &Object) -> bool {
+    #[cfg(test)]
+    tests::COMPARED.set(tests::COMPARED.get() + 1);
     same_at(a, b, 0)
 }
 
@@ -1491,7 +1511,8 @@ struct FieldInfo {
 }
 
 /// The most nodes walked in the page tree or the form, and the most steps assigning
-/// roles; beyond that the document is refused as too complex to check.
+/// roles or comparing a version's annotation lists with the next's; beyond that the
+/// document is refused as too complex to check.
 const MAX_NODES: usize = 500_000;
 const MAX_STEPS: usize = 4_000_000;
 
@@ -1507,8 +1528,10 @@ struct Roles {
     pages: Vec<ObjectId>,
     page_nodes: HashSet<ObjectId>,
     page_index: HashMap<ObjectId, usize>,
-    /// Each leaf page's `/Annots` entries.
-    page_annots: HashMap<ObjectId, Vec<Object>>,
+    /// Each `/Annots` list once (one several pages share is kept once), and each leaf
+    /// page's list in it.
+    annot_lists: Vec<Vec<Object>>,
+    page_annots: HashMap<ObjectId, usize>,
     /// Indirect annotations and the page listing them.
     annots: HashMap<ObjectId, usize>,
     fields: BTreeMap<ObjectId, FieldInfo>,
@@ -1535,6 +1558,7 @@ impl Roles {
             pages: Vec::new(),
             page_nodes: HashSet::new(),
             page_index: HashMap::new(),
+            annot_lists: Vec::new(),
             page_annots: HashMap::new(),
             annots: HashMap::new(),
             fields: BTreeMap::new(),
@@ -1572,19 +1596,23 @@ impl Roles {
                 }
             }
         }
+        // Each list once, at the first page that has it: one written into the page is the
+        // page's own.
+        let mut lists: HashMap<ObjectId, usize> = HashMap::new();
         for (i, &page) in r.pages.iter().enumerate() {
-            let entries = v
-                .dict_of(page)
-                .and_then(|d| d.get(b"Annots").ok())
-                .and_then(|a| v.array(a))
-                .cloned()
-                .unwrap_or_default();
-            for e in &entries {
-                if let Ok(id) = e.as_reference() {
-                    r.annots.entry(id).or_insert(i);
+            let annots = v.dict_of(page).and_then(|d| d.get(b"Annots").ok());
+            let key = annots.and_then(|a| v.array_holder(a)).unwrap_or(page);
+            let at = *lists.entry(key).or_insert_with(|| {
+                let entries = annots.and_then(|a| v.array(a)).cloned().unwrap_or_default();
+                for e in &entries {
+                    if let Ok(id) = e.as_reference() {
+                        r.annots.entry(id).or_insert(i);
+                    }
                 }
-            }
-            r.page_annots.insert(page, entries);
+                r.annot_lists.push(entries);
+                r.annot_lists.len() - 1
+            });
+            r.page_annots.insert(page, at);
         }
 
         // The form's fields.
@@ -2052,90 +2080,165 @@ impl Judge<'_> {
         }
     }
 
-    /// Annotations added to, removed from or reordered on each page.
+    /// Annotations added to, removed from or reordered on each page. Each pair of lists
+    /// (before and after) is compared once, however many pages have it, within
+    /// [`MAX_STEPS`]; past them the document is too complex to check.
     fn annotations(&mut self) {
-        let (old, new) = (self.old, self.new);
-        for (i, page) in self.nr.pages.iter().enumerate() {
-            let Some(before) = self.or.page_annots.get(page) else {
+        let (or, nr) = (self.or, self.nr);
+        let mut steps = 0;
+        let mut compared: HashMap<(usize, usize), Vec<Seen>> = HashMap::new();
+        for (i, page) in nr.pages.iter().enumerate() {
+            let Some(&before) = or.page_annots.get(page) else {
                 continue;
             };
-            let after = &self.nr.page_annots[page];
-            let page = Some(i);
-            let has = |list: &[Object], e: &Object| list.iter().any(|x| same_object(x, e));
-            for e in before.iter().filter(|e| !has(after, e)) {
-                match annot_class(old, Some(e)) {
-                    AnnotClass::Comment => {
-                        self.push(seen(ChangeKind::CommentRemoved, page, Need::Comment))
-                    }
-                    AnnotClass::Widget => {
-                        let id = e.as_reference().ok();
-                        let field = id.and_then(|id| self.or.fields.get(&id));
-                        let kept = id.is_some_and(|id| self.nr.fields.contains_key(&id));
-                        match field {
-                            // Taken off the page but still a field.
-                            Some(f) if kept && f.signed => {
-                                self.push(never(ChangeKind::SignatureChanged(f.name.clone()), page))
-                            }
-                            Some(f) if kept => {
-                                self.push(never(ChangeKind::FieldChanged(f.name.clone()), page))
-                            }
-                            // A field removed is reported with the fields.
-                            Some(_) => {}
-                            None => self.push(never(ChangeKind::AnnotationChanged, page)),
-                        }
-                    }
-                    AnnotClass::Other => self.push(never(ChangeKind::AnnotationChanged, page)),
+            let after = nr.page_annots[page];
+            let found = match compared.entry((before, after)) {
+                std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    let (b, a) = (&or.annot_lists[before], &nr.annot_lists[after]);
+                    let Some(found) = self.list_changes(b, a, &mut steps) else {
+                        let why = "the document is too complex to check".to_string();
+                        self.push(never(ChangeKind::Malformed(why), None));
+                        return;
+                    };
+                    e.insert(found)
                 }
-            }
-            for e in after.iter().filter(|e| !has(before, e)) {
-                match annot_class(new, Some(e)) {
-                    AnnotClass::Comment => {
-                        let d = new.dict(e);
-                        if d.is_some_and(|d| d.has(b"A") || d.has(b"AA")) {
-                            self.push(never(ChangeKind::Actions, page));
-                        } else {
-                            self.push(seen(ChangeKind::CommentAdded, page, Need::Comment));
-                        }
-                    }
-                    AnnotClass::Widget => {
-                        let id = e.as_reference().ok();
-                        match id.and_then(|id| self.nr.fields.get(&id).map(|f| (id, f))) {
-                            // A widget of a field added in this step: reported with the
-                            // fields. A widget added to a field from before isn't allowed.
-                            Some((id, f)) => {
-                                let root = self.field_root(id);
-                                if self.or.fields.contains_key(&root) {
-                                    self.push(never(
-                                        ChangeKind::FieldChanged(f.name.clone()),
-                                        page,
-                                    ));
-                                }
-                            }
-                            None => self.push(never(ChangeKind::AnnotationChanged, page)),
-                        }
-                    }
-                    AnnotClass::Other => self.push(never(ChangeKind::AnnotationChanged, page)),
-                }
-            }
-            // Entries kept must keep their order (it decides what covers what).
-            let kept_before: Vec<&Object> = before.iter().filter(|e| has(after, e)).collect();
-            let kept_after: Vec<&Object> = after.iter().filter(|e| has(before, e)).collect();
-            let same_order = kept_before.len() == kept_after.len()
-                && kept_before
-                    .iter()
-                    .zip(&kept_after)
-                    .all(|(x, y)| same_object(x, y));
-            if !same_order {
-                if kept_after
-                    .iter()
-                    .all(|e| annot_class(new, Some(e)) == AnnotClass::Comment)
-                {
-                    self.push(seen(ChangeKind::CommentChanged, page, Need::Comment));
-                } else {
-                    self.push(never(ChangeKind::AnnotationChanged, page));
-                }
+            };
+            for s in found.iter() {
+                self.push(Seen {
+                    page: Some(i),
+                    ..s.clone()
+                });
             }
         }
+    }
+
+    /// What changed between a page's annotations `before` and `after`, each change once and
+    /// without the page; `None` past [`MAX_STEPS`]. Each entry costs a step; one referred to
+    /// is looked for by its reference, and one written in place (which the format doesn't
+    /// allow) is compared with those in place in the other list, a step each.
+    fn list_changes(
+        &self,
+        before: &[Object],
+        after: &[Object],
+        steps: &mut usize,
+    ) -> Option<Vec<Seen>> {
+        let (old, new) = (self.old, self.new);
+        *steps += before.len() + after.len();
+        if *steps > MAX_STEPS {
+            return None;
+        }
+        // For each entry of `list`, whether `other` has it too.
+        let in_other = |list: &[Object], other: &[Object], steps: &mut usize| {
+            let refs: HashSet<ObjectId> = (other.iter())
+                .filter_map(|e| e.as_reference().ok())
+                .collect();
+            let in_place: Vec<&Object> = (other.iter())
+                .filter(|e| e.as_reference().is_err())
+                .collect();
+            list.iter()
+                .map(|e| match e {
+                    Object::Reference(id) => Some(refs.contains(id)),
+                    e => {
+                        for x in &in_place {
+                            *steps += 1;
+                            if *steps > MAX_STEPS {
+                                return None;
+                            }
+                            if same_object(x, e) {
+                                return Some(true);
+                            }
+                        }
+                        Some(false)
+                    }
+                })
+                .collect::<Option<Vec<bool>>>()
+        };
+        let in_after = in_other(before, after, steps)?;
+        let in_before = in_other(after, before, steps)?;
+        let removed = (before.iter().zip(&in_after)).filter_map(|(e, &k)| (!k).then_some(e));
+        let added = (after.iter().zip(&in_before)).filter_map(|(e, &k)| (!k).then_some(e));
+
+        let mut out: Vec<Seen> = Vec::new();
+        let mut once: HashSet<(ChangeKind, Need)> = HashSet::new();
+        let mut push = |s: Seen| {
+            if once.insert((s.kind.clone(), s.need.clone())) {
+                out.push(s);
+            }
+        };
+        for e in removed {
+            match annot_class(old, Some(e)) {
+                AnnotClass::Comment => push(seen(ChangeKind::CommentRemoved, None, Need::Comment)),
+                AnnotClass::Widget => {
+                    let id = e.as_reference().ok();
+                    let field = id.and_then(|id| self.or.fields.get(&id));
+                    let kept = id.is_some_and(|id| self.nr.fields.contains_key(&id));
+                    match field {
+                        // Taken off the page but still a field.
+                        Some(f) if kept && f.signed => {
+                            push(never(ChangeKind::SignatureChanged(f.name.clone()), None))
+                        }
+                        Some(f) if kept => {
+                            push(never(ChangeKind::FieldChanged(f.name.clone()), None))
+                        }
+                        // A field removed is reported with the fields.
+                        Some(_) => {}
+                        None => push(never(ChangeKind::AnnotationChanged, None)),
+                    }
+                }
+                AnnotClass::Other => push(never(ChangeKind::AnnotationChanged, None)),
+            }
+        }
+        for e in added {
+            match annot_class(new, Some(e)) {
+                AnnotClass::Comment => {
+                    let d = new.dict(e);
+                    if d.is_some_and(|d| d.has(b"A") || d.has(b"AA")) {
+                        push(never(ChangeKind::Actions, None));
+                    } else {
+                        push(seen(ChangeKind::CommentAdded, None, Need::Comment));
+                    }
+                }
+                AnnotClass::Widget => {
+                    let id = e.as_reference().ok();
+                    match id.and_then(|id| self.nr.fields.get(&id).map(|f| (id, f))) {
+                        // A widget of a field added in this step: reported with the
+                        // fields. A widget added to a field from before isn't allowed.
+                        Some((id, f)) => {
+                            let root = self.field_root(id);
+                            if self.or.fields.contains_key(&root) {
+                                push(never(ChangeKind::FieldChanged(f.name.clone()), None));
+                            }
+                        }
+                        None => push(never(ChangeKind::AnnotationChanged, None)),
+                    }
+                }
+                AnnotClass::Other => push(never(ChangeKind::AnnotationChanged, None)),
+            }
+        }
+        // Entries kept must keep their order (it decides what covers what).
+        let kept_before: Vec<&Object> = (before.iter().zip(&in_after))
+            .filter_map(|(e, &k)| k.then_some(e))
+            .collect();
+        let kept_after: Vec<&Object> = (after.iter().zip(&in_before))
+            .filter_map(|(e, &k)| k.then_some(e))
+            .collect();
+        let same_order = kept_before.len() == kept_after.len()
+            && kept_before
+                .iter()
+                .zip(&kept_after)
+                .all(|(x, y)| same_object(x, y));
+        if !same_order {
+            if kept_after
+                .iter()
+                .all(|e| annot_class(new, Some(e)) == AnnotClass::Comment)
+            {
+                push(seen(ChangeKind::CommentChanged, None, Need::Comment));
+            } else {
+                push(never(ChangeKind::AnnotationChanged, None));
+            }
+        }
+        Some(out)
     }
 
     /// Whether a field's flags only gained read-only: the newer dictionary's own `/Ff` is
@@ -2604,4 +2707,83 @@ fn sign_seen(f: &FieldInfo, new_visible: Option<bool>) -> Seen {
             timestamp: f.timestamp,
         },
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::incremental::append_revision;
+    use lopdf::dictionary;
+    use std::cell::Cell;
+
+    thread_local! {
+        /// Objects compared (`same_object`) on this thread.
+        pub(super) static COMPARED: Cell<usize> = const { Cell::new(0) };
+    }
+
+    fn square(n: usize) -> Dictionary {
+        dictionary! {
+            "NM" => Object::string_literal(format!("square {n}")),
+            "Type" => "Annot",
+            "Subtype" => "Square",
+            "Rect" => vec![10.into(), 10.into(), 20.into(), 20.into()],
+        }
+    }
+
+    /// Two pages sharing one `/Annots` array of `n` entries made by `entry`, then a revision
+    /// adding one more: the changes after the first version (kind, page, allowed), and the
+    /// objects compared finding them.
+    fn shared_list_grown(
+        n: usize,
+        entry: impl Fn(&mut Document, usize) -> Object,
+    ) -> (Vec<(ChangeKind, Option<usize>, bool)>, usize) {
+        let mut p = Pdf::new();
+        p.insert_blank(0, 300.0, 200.0).unwrap();
+        p.insert_blank(1, 300.0, 200.0).unwrap();
+        let list: Vec<Object> = (0..n).map(|i| entry(&mut p.doc, i)).collect();
+        let list = p.doc.add_object(list);
+        for page in p.page_ids() {
+            p.doc.get_dictionary_mut(page).unwrap().set("Annots", list);
+        }
+        let signed = p.snapshot().unwrap();
+        let mut p = Pdf::from_bytes(&signed, None).unwrap();
+        let added = entry(&mut p.doc, n);
+        (p.doc.get_object_mut(list).and_then(Object::as_array_mut))
+            .unwrap()
+            .push(added);
+        let bytes = append_revision(&signed, &p.doc).unwrap().bytes;
+        let whole = Pdf::from_bytes(&bytes, None).unwrap();
+        let mut versions = Versions::new(&bytes, None, &whole);
+        let sig = Signed {
+            end: signed.len(),
+            locks: None,
+        };
+        COMPARED.set(0);
+        let found = analyse(&mut versions, &[sig], None);
+        let found = found[0]
+            .iter()
+            .map(|c| (c.kind.clone(), c.page, c.allowed()))
+            .collect();
+        (found, COMPARED.get())
+    }
+
+    /// Two pages sharing a list of 2,000 annotations, one more added after signing: the list
+    /// is compared with the one before once, by reference, and the change shows on each page.
+    #[test]
+    fn signature_changes_compare_each_annots_list_once() {
+        let (found, compared) = shared_list_grown(2_000, |d, i| d.add_object(square(i)).into());
+        let added = |page| (ChangeKind::CommentAdded, Some(page), true);
+        assert_eq!(found, [added(0), added(1)]);
+        assert!(compared <= 5_000, "{compared} objects compared");
+    }
+
+    /// Annotations written into the list directly (which the format doesn't allow) are
+    /// compared among themselves within a step count, past which the document is too complex
+    /// to check.
+    #[test]
+    fn direct_annotations_past_the_step_count_are_too_complex_to_check() {
+        let (found, _) = shared_list_grown(3_000, |_, i| square(i).into());
+        let why = "the document is too complex to check".to_string();
+        assert_eq!(found, [(ChangeKind::Malformed(why), None, false)]);
+    }
 }

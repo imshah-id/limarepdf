@@ -656,6 +656,12 @@ The full record, with the files used, is in [Testing](developer/testing.md#digit
 - An allowed change can still change what the page shows (a form field filled in, a comment placed over text).
   LimarePDF lists it; it can't tell whether that was the intent.
 - Malformed later additions are refused even when another reader can repair them.
+- A document too large to judge shows "the later additions are malformed: the document is too complex to check",
+  never allowed: past 500,000 nodes of its page tree or form fields, past 4,000,000 steps giving its objects their
+  parts, or past 4,000,000 steps comparing its pages' annotation lists with the next version's. There each entry is
+  a step, and so is each comparison of two annotations written into a list directly (which the format doesn't
+  allow), so a page or two with a couple of thousand of those is enough. Documents written as the format says come
+  nowhere near these.
 - Files that PDF apps read differently (something uses a part the file deletes or doesn't list, or the file is
   damaged) are shown as the PDF standard says, which other apps may not do. Their signatures show *can't check*
   even where another app calls them valid, and LimarePDF signs such a file only by writing it out in full first, which it

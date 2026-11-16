@@ -285,7 +285,7 @@ pub enum SigKind {
 
 /// What a certified document allows after certification (the DocMDP `/P` value), from
 /// least to most.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Permissions {
     /// No changes.
     NoChanges,
@@ -517,12 +517,7 @@ pub fn verify_signatures(
             None => groups.push((place, vec![(field, node.id)])),
         }
     }
-    let mut versions = Versions {
-        bytes,
-        password,
-        whole: &pdf,
-        cache: HashMap::new(),
-    };
+    let mut versions = Versions::new(bytes, password, &pdf);
     let mut signatures: Vec<DigitalSignature> = groups
         .into_iter()
         .map(|(place, fields)| check_one(&pdf, &mut versions, place, fields))
@@ -621,7 +616,17 @@ pub(crate) struct Versions<'a> {
 const MAX_VERSIONS: usize = 100;
 const MAX_VERSION_BYTES: usize = 1 << 30;
 
-impl Versions<'_> {
+impl<'a> Versions<'a> {
+    /// The versions of `bytes`, `whole` being the whole file opened with `password`.
+    pub(crate) fn new(bytes: &'a [u8], password: Option<&'a str>, whole: &'a Pdf) -> Self {
+        Versions {
+            bytes,
+            password,
+            whole,
+            cache: HashMap::new(),
+        }
+    }
+
     /// Whether the version ending at `end` is open or may be opened within the limits.
     fn allowed(&self, end: usize) -> bool {
         end == self.bytes.len()
