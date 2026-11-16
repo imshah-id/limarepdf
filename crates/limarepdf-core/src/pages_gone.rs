@@ -322,16 +322,11 @@ impl Pdf {
     /// of whose widgets are among those (and parents all of whose fields went); and the
     /// named destinations to them.
     fn what_goes(&self, keep: &[ObjectId], pages: HashSet<ObjectId>) -> Result<Gone> {
-        let staying: HashSet<ObjectId> =
-            keep.iter().flat_map(|&p| self.all_annot_refs(p)).collect();
+        let listed = |pages: &[ObjectId]| self.listed_annots(pages).into_iter().map(|(_, a)| a);
+        let staying: HashSet<ObjectId> = listed(keep).collect();
         let mut objects: HashSet<ObjectId> = pages.clone();
-        for &p in &pages {
-            objects.extend(
-                self.all_annot_refs(p)
-                    .into_iter()
-                    .filter(|a| !staying.contains(a)),
-            );
-        }
+        let going: Vec<ObjectId> = pages.iter().copied().collect();
+        objects.extend(listed(&going).filter(|a| !staying.contains(a)));
         let fields = self
             .acro_form()
             .and_then(|f| f.get(b"Fields").ok())

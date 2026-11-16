@@ -708,9 +708,8 @@ impl Pdf {
         let used = |id: &&ObjectId| any_props.has(&Object::Reference(**id));
         targets.extend(removed.properties.iter().filter(|id| !used(id)));
         if !removed.held.is_empty() {
-            let listed: HashSet<ObjectId> = (self.page_ids().into_iter())
-                .flat_map(|p| self.all_annot_refs(p))
-                .filter_map(|a| self.doc.get_dictionary(a).ok())
+            let listed: HashSet<ObjectId> = (self.listed_annots(&self.page_ids()).into_iter())
+                .filter_map(|(_, a)| self.doc.get_dictionary(a).ok())
                 .flat_map(|d| self.annot_holds(d))
                 .collect();
             targets.extend(removed.held.iter().filter(|id| !listed.contains(id)));

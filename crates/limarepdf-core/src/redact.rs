@@ -1243,10 +1243,7 @@ impl Pdf {
                 bail!("the document has no redaction marks");
             }
             let report = p.redact(&marks)?;
-            let ids = (p.every_annotation(&mut Place::kinds()).into_iter())
-                .filter(|a| a.kind == crate::AnnotKind::Redact)
-                .map(|a| a.id)
-                .collect();
+            let ids = p.annotations_of_kind(|k| *k == crate::AnnotKind::Redact);
             p.drop_annotations(ids)?;
             Ok(report)
         })

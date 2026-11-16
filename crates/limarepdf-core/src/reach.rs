@@ -543,7 +543,9 @@ impl Pdf {
             };
             w.reach.nodes[i].res = res.0.clone();
             w.todo.push((i, uses, res));
-            for annot in self.all_annot_refs(page) {
+            // Each page's list, shared or not: what a page draws is its own.
+            let list = self.annots_array(page).unwrap_or_default();
+            for annot in list.iter().filter_map(|o| o.as_reference().ok()) {
                 w.work.take(1)?;
                 let looks = (self.doc.get_dictionary(annot).ok())
                     .map(|d| self.appearances_of(d).0)

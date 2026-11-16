@@ -565,37 +565,20 @@ impl Pdf {
     }
 
     /// Annotations not Hidden (bit 2) whose subtype `hide` picks or that are in a layer
-    /// that's off, with their flags.
+    /// that's off, with their flags, each once however many pages list it.
     fn annots_where(&self, hide: impl Fn(&[u8]) -> bool) -> Vec<(ObjectId, i64)> {
         let mut layers = self.layers_off();
-        let mut out = Vec::new();
-        for page in self.page_ids() {
-            let Some(annots) = self
-                .doc
-                .get_dictionary(page)
-                .ok()
-                .and_then(|d| d.get(b"Annots").ok())
-            else {
-                continue;
-            };
-            let Ok((_, Object::Array(annots))) = self.doc.dereference(annots) else {
-                continue;
-            };
-            for r in annots {
-                let Ok(id) = r.as_reference() else { continue };
-                let Ok(d) = self.doc.get_dictionary(id) else {
-                    continue;
-                };
+        let pages = self.page_ids();
+        (self.listed_annots(&pages).into_iter())
+            .filter_map(|(_, id)| {
+                let d = self.doc.get_dictionary(id).ok()?;
                 let flags = d.get(b"F").ok().and_then(|f| self.num(f)).unwrap_or(0.0) as i64;
                 let sub = d.get(b"Subtype").and_then(|o| o.as_name()).unwrap_or(b"");
-                if flags & 2 == 0
-                    && (hide(sub) || (layers.as_mut()).is_some_and(|l| self.annot_layer_off(d, l)))
-                {
-                    out.push((id, flags));
-                }
-            }
-        }
-        out
+                (flags & 2 == 0
+                    && (hide(sub) || (layers.as_mut()).is_some_and(|l| self.annot_layer_off(d, l))))
+                .then_some((id, flags))
+            })
+            .collect()
     }
 
     pub fn to_bytes(&mut self) -> Result<Vec<u8>> {

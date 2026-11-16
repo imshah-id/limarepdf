@@ -3,7 +3,6 @@
 //! private application data), and optionally comments, form values, bookmarks and what
 //! lies outside the visible page area.
 
-use crate::annot_ap::Place;
 use crate::budget::{self, TooComplex, Work};
 use crate::fonts::FontCtx;
 use crate::inline::Inline;
@@ -989,13 +988,10 @@ impl Pdf {
     /// attached files (those holding one). Only what each is matters, so none is drawn to
     /// place it.
     fn annots_of(&self, h: Hidden) -> HashSet<ObjectId> {
-        (self.every_annotation(&mut Place::kinds()).into_iter())
-            .filter(|a| match h {
-                Hidden::Comments => a.kind != crate::AnnotKind::Redact,
-                _ => matches!(&a.kind, crate::AnnotKind::Other(s) if s == "FileAttachment"),
-            })
-            .map(|a| a.id)
-            .collect()
+        self.annotations_of_kind(|k| match h {
+            Hidden::Comments => *k != crate::AnnotKind::Redact,
+            _ => matches!(k, crate::AnnotKind::Other(s) if s == "FileAttachment"),
+        })
     }
 
     /// Remove the annotations `gone`, with the replies to them and their popups. When
@@ -1237,58 +1233,56 @@ impl Pdf {
         // goes, and the annotation when its normal drawing does.
         let mut gone = HashSet::new();
         let mut looks = Vec::new();
-        for page in self.page_ids() {
-            for id in self.all_annot_refs(page) {
-                let Ok(annot) = self.doc.get_dictionary(id) else {
-                    continue;
-                };
-                if annot
-                    .get(b"OC")
-                    .is_ok_and(|o| self.oc_hidden(o, &mut layers))
-                {
-                    gone.insert(id);
-                    continue;
-                }
-                let Ok(ap) = annot.get(b"AP") else {
-                    continue;
-                };
-                let mut ap = self.resolved_dict(Some(ap));
-                let mut changed = false;
-                for (k, v) in ap.clone().iter() {
-                    match self.doc.dereference(v) {
-                        Ok((_, Object::Stream(_))) => {
-                            if self.look_hidden(v, &mut layers) {
-                                ap.remove(k);
-                                changed = true;
-                            }
-                        }
-                        Ok((_, Object::Dictionary(states))) => {
-                            let mut states = states.clone();
-                            let hidden: Vec<Vec<u8>> = (states.iter())
-                                .filter(|(_, s)| self.look_hidden(s, &mut layers))
-                                .map(|(n, _)| n.clone())
-                                .collect();
-                            if hidden.is_empty() {
-                                continue;
-                            }
+        for (_, id) in self.listed_annots(&self.page_ids()) {
+            let Ok(annot) = self.doc.get_dictionary(id) else {
+                continue;
+            };
+            if annot
+                .get(b"OC")
+                .is_ok_and(|o| self.oc_hidden(o, &mut layers))
+            {
+                gone.insert(id);
+                continue;
+            }
+            let Ok(ap) = annot.get(b"AP") else {
+                continue;
+            };
+            let mut ap = self.resolved_dict(Some(ap));
+            let mut changed = false;
+            for (k, v) in ap.clone().iter() {
+                match self.doc.dereference(v) {
+                    Ok((_, Object::Stream(_))) => {
+                        if self.look_hidden(v, &mut layers) {
+                            ap.remove(k);
                             changed = true;
-                            for n in hidden {
-                                states.remove(&n);
-                            }
-                            if states.is_empty() {
-                                ap.remove(k);
-                            } else {
-                                ap.set(k.clone(), states);
-                            }
                         }
-                        _ => {}
                     }
+                    Ok((_, Object::Dictionary(states))) => {
+                        let mut states = states.clone();
+                        let hidden: Vec<Vec<u8>> = (states.iter())
+                            .filter(|(_, s)| self.look_hidden(s, &mut layers))
+                            .map(|(n, _)| n.clone())
+                            .collect();
+                        if hidden.is_empty() {
+                            continue;
+                        }
+                        changed = true;
+                        for n in hidden {
+                            states.remove(&n);
+                        }
+                        if states.is_empty() {
+                            ap.remove(k);
+                        } else {
+                            ap.set(k.clone(), states);
+                        }
+                    }
+                    _ => {}
                 }
-                if changed && ap.has(b"N") {
-                    looks.push((id, ap));
-                } else if changed {
-                    gone.insert(id);
-                }
+            }
+            if changed && ap.has(b"N") {
+                looks.push((id, ap));
+            } else if changed {
+                gone.insert(id);
             }
         }
         for (id, ap) in looks {

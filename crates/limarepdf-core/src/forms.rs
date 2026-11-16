@@ -355,24 +355,13 @@ impl Pdf {
         self.doc.dereference(form).ok()?.1.as_dict().ok()
     }
 
-    /// Each annotation listed on a page, with that page (zero-based) and its object.
+    /// Each annotation listed on a page, with the first page (zero-based) that lists it and
+    /// its object.
     fn annot_pages(&self) -> HashMap<ObjectId, (usize, ObjectId)> {
-        let mut map = HashMap::new();
-        for (i, id) in self.page_ids().into_iter().enumerate() {
-            let annots = self
-                .doc
-                .get_dictionary(id)
-                .ok()
-                .and_then(|d| d.get(b"Annots").ok())
-                .and_then(|o| self.doc.dereference(o).ok())
-                .and_then(|(_, o)| o.as_array().ok());
-            for a in annots.into_iter().flatten() {
-                if let Ok(a) = a.as_reference() {
-                    map.entry(a).or_insert((i, id));
-                }
-            }
-        }
-        map
+        let pages = self.page_ids();
+        (self.listed_annots(&pages).into_iter())
+            .map(|(i, a)| (a, (i, pages[i])))
+            .collect()
     }
 
     fn walk_field(&self, id: ObjectId, parent: &str, inh: &Inherited, depth: usize, w: &mut Walk) {

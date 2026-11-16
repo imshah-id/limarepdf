@@ -470,17 +470,17 @@ impl Pdf {
         Ok(self.numbers(Some(o)))
     }
 
-    /// The page an annotation is on: its `/P`, else the page that lists it.
+    /// The page an annotation is on: its `/P`, else the first page that lists it.
     pub(crate) fn annot_page(&self, id: ObjectId) -> Result<ObjectId> {
         let d = self.doc.get_dictionary(id)?;
-        match d.get(b"P").and_then(|o| o.as_reference()) {
-            Ok(p) => Ok(p),
-            Err(_) => self
-                .page_ids()
-                .into_iter()
-                .find(|&p| self.all_annot_refs(p).contains(&id))
-                .ok_or_else(|| anyhow!("the annotation is on no page")),
+        if let Ok(p) = d.get(b"P").and_then(|o| o.as_reference()) {
+            return Ok(p);
         }
+        let pages = self.page_ids();
+        let (i, _, _) = (self.each_annots(&pages))
+            .find(|(_, _, list)| list.iter().any(|o| o.as_reference().ok() == Some(id)))
+            .ok_or_else(|| anyhow!("the annotation is on no page"))?;
+        Ok(pages[i])
     }
 
     /// Set a text box's text size and colour, fill and border, and draw it again. Refused,

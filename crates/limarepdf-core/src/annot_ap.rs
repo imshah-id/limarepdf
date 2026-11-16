@@ -124,14 +124,11 @@ const READ_EACH: u64 = 64;
 /// Where listed annotations are ([`Pdf::annot_rect`]): those placed by what is drawn for
 /// them, drawn within one budget, and once it is spent each at its own `/Rect`; or none
 /// drawn, each at its own `/Rect`. Their points and text are read within another, and
-/// once it is spent not at all ([`Place::read`]); or none are read, for what needs only
-/// what each annotation is.
+/// once it is spent not at all ([`Place::read`]).
 pub(crate) struct Place {
     work: Option<Work>,
     /// The budget's refusal, once it is spent.
     spent: Option<TooComplex>,
-    /// Whether their points and text are read.
-    reads: bool,
     /// The budget for reading them, made when the first is read.
     read: Option<Work>,
     /// The reading budget's refusal, once it is spent.
@@ -144,7 +141,6 @@ impl Place {
         Place {
             work: Some(work()),
             spent: None,
-            reads: true,
             read: None,
             unread: None,
         }
@@ -155,27 +151,18 @@ impl Place {
         Place {
             work: None,
             spent: None,
-            reads: true,
             read: None,
             unread: None,
         }
     }
 
-    /// Drawing and reading none, for what needs only what each annotation is.
-    pub(crate) fn kinds() -> Place {
-        Place {
-            reads: false,
-            ..Place::own()
-        }
-    }
-
     /// `f` reading an annotation's points and text within the budget: `None` once it is
-    /// spent, for this annotation and those after it, and when none are read.
+    /// spent, for this annotation and those after it.
     pub(crate) fn read<T>(
         &mut self,
         f: impl FnOnce(&mut Work) -> Result<T, TooComplex>,
     ) -> Option<T> {
-        if !self.reads || self.unread.is_some() {
+        if self.unread.is_some() {
             return None;
         }
         let work = (self.read).get_or_insert_with(|| Work::new(READING, budget::limit(READ_STEPS)));
