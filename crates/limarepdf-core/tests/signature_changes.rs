@@ -622,6 +622,76 @@ fn new_fields_and_field_changes_are_refused() {
     assert_refused(&moved, &ChangeKind::FieldChanged("Name".into()));
 }
 
+/// The base document with fields `A`, with no kids, and `B`, with text field `G` as its kid.
+fn parent_form() -> Vec<u8> {
+    edit(&base_pdf(), |prev, new| {
+        let a = new.add_object(dictionary! {
+            "T" => Object::string_literal("A"), "Kids" => Vec::<Object>::new(),
+        });
+        let b = new.new_object_id();
+        let ap = appearance(new, "");
+        let g = new.add_object(dictionary! {
+            "Type" => "Annot", "Subtype" => "Widget", "FT" => "Tx",
+            "T" => Object::string_literal("G"), "F" => 4, "P" => page(prev), "Parent" => b,
+            "Rect" => vec![150.into(), 100.into(), 250.into(), 120.into()],
+            "AP" => dictionary! { "N" => ap },
+        });
+        add_annot(prev, new, g);
+        let kids = vec![Object::from(g)];
+        let field = dictionary! { "T" => Object::string_literal("B"), "Kids" => kids };
+        new.set_object(b, Object::Dictionary(field));
+        let r = root(prev);
+        let mut c = dict(prev, r);
+        c.set(
+            "AcroForm",
+            dictionary! {
+                "Fields" => vec![Object::from(a), Object::from(b)],
+                "DA" => Object::string_literal("/Helv 0 Tf 0 g"),
+            },
+        );
+        new.set_object(r, Object::Dictionary(c));
+    })
+}
+
+/// `B.G` of [`parent_form`], locked by the signature, renamed by edits to other fields alone:
+/// listed among `A`'s kids too (its own parent still `B`), named after the first list it's on
+/// it would be `A.G`; or `B` renamed `C`. Each is refused as a change to `B.G`, and filling it
+/// in is judged by the name it was signed with. Filling it in was allowed, as filling in a
+/// field the lock doesn't name.
+#[test]
+fn a_field_renamed_by_changes_to_other_fields_is_refused() {
+    let b = locked_by(&parent_form(), lock("Include", &["B.G"], None));
+    let moved = (ChangeKind::FieldChanged("B.G".into()), Some(Refusal::Never));
+    let mut wrong = Vec::new();
+    for (case, other) in [("listed under A", "A"), ("B renamed C", "B")] {
+        for filled in [false, true] {
+            let e = edit(&b, |prev, new| {
+                let id = titled(prev, other);
+                let mut d = dict(prev, id);
+                match other {
+                    "A" => d.set("Kids", vec![Object::from(titled(prev, "G"))]),
+                    _ => d.set("T", Object::string_literal("C")),
+                }
+                new.set_object(id, Object::Dictionary(d));
+                if filled {
+                    let g = titled(prev, "G");
+                    let mut d = dict(prev, g);
+                    let ap = appearance(new, "BT (Jane) Tj ET");
+                    d.set("V", Object::string_literal("Jane"));
+                    d.set("AP", dictionary! { "N" => ap });
+                    new.set_object(g, Object::Dictionary(d));
+                }
+            });
+            let got = changes(&e);
+            if !got.contains(&moved) || got.iter().any(|(_, r)| r.is_none()) || report(&e).all_ok()
+            {
+                wrong.push(format!("{case}, filled {filled}: {got:?}"));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 #[test]
 fn actions_and_scripts_are_refused() {
     let b = approve(&base_pdf());

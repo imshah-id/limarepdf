@@ -2498,6 +2498,10 @@ impl<'a> Judge<'a> {
                 Some(o) => {
                     if o.signed && (!f.signed || o.name != f.name) {
                         self.push(never(ChangeKind::SignatureChanged(o.name.clone()), None));
+                    } else if o.parent != f.parent || o.name != f.name {
+                        // Moved, or renamed by a change to a field above it: a lock naming it
+                        // would no longer.
+                        self.push(never(ChangeKind::FieldChanged(o.name.clone()), None));
                     } else if o.sig != f.sig {
                         // Made part of a signature field, or no longer, by a list of kids or
                         // fields changing: its signing would go unjudged.
@@ -2510,7 +2514,7 @@ impl<'a> Judge<'a> {
                     // Part of a field added in this step.
                     Some(p) if !self.or.fields.contains_key(&p) => {}
                     Some(p) => {
-                        let name = self.nr.fields[&p].name.clone();
+                        let name = self.or.fields[&p].name.clone();
                         self.push(never(ChangeKind::FieldChanged(name), None));
                     }
                     None if f.sig => {
@@ -2588,11 +2592,12 @@ impl<'a> Judge<'a> {
         }
     }
 
+    /// Field `owner`'s name before this step (what a lock names), or its new name if it's new.
     fn field_name(&self, owner: ObjectId) -> String {
-        self.nr
+        self.or
             .fields
             .get(&owner)
-            .or_else(|| self.or.fields.get(&owner))
+            .or_else(|| self.nr.fields.get(&owner))
             .map(|f| f.name.clone())
             .unwrap_or_default()
     }

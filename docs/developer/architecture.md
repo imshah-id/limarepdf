@@ -1615,7 +1615,10 @@ report follows, or a value on a widget the report doesn't read, is refused
 was allowed before, `a_signature_on_a_fields_widget_is_refused`). A field made part of a signature field, or no
 longer, by a list of kids or fields changing is refused, as its signing would go unjudged: a widget moved under one
 and given a made-up signature was reported as nothing before
-(`a_widget_moved_under_a_signature_field_and_signed_is_refused`). Trust is in `trust.rs`: the trust
+(`a_widget_moved_under_a_signature_field_and_signed_is_refused`). So is a field listed under another field, or
+renamed by a change to one above it, as a lock naming it would no longer, and filling it in is judged by the name it
+had: a locked field listed under another was reported as nothing before, and filled in, allowed
+(`a_field_renamed_by_changes_to_other_fields_is_refused`). Trust is in `trust.rs`: the trust
 list file (`trust.txt`
 in the settings folder, whose location `limarepdf_core::settings_dir` gives both the app and the command line), and
 the chain search from a signer's certificate to a trusted authority over the certificates the signature and the
