@@ -1578,7 +1578,12 @@ lists' changes is reported; each change is reported once a page. Two pages shari
 more added after signing: 16,022,008 objects compared before, at most 5,000 now
 (`signature_changes_compare_each_annots_list_once`). A hundred pages sharing a list of 100 fields' widgets, emptied
 after signing: 10,000 changes, so refused at a limit of 5,000
-(`annotation_changes_on_each_page_count_against_the_steps`). Trust is in `trust.rs`: the trust list file (`trust.txt`
+(`annotation_changes_on_each_page_count_against_the_steps`). Assigning roles looks through each list held in an
+object once a version too, and walks the annotations written in place in a list again for each page that has it, a
+step for each object in them. A thousand pages sharing a list of 1,000 comments, one more added after signing:
+2,001,000 entries looked at before, at most 5,000 now (`roles_look_through_a_list_pages_share_once`); a hundred
+pages sharing 100 written in place: refused at a limit of 50,000
+(`annotations_in_a_shared_list_cost_steps_on_each_page`). Trust is in `trust.rs`: the trust list file (`trust.txt`
 in the settings folder, whose location `limarepdf_core::settings_dir` gives both the app and the command line), and
 the chain search from a signer's certificate to a trusted authority over the certificates the signature and the
 document's `/DSS` carry, with RFC 5280's checks at the signing time, including certificate policy processing; each

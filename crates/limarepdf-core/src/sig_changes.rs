@@ -1688,6 +1688,7 @@ impl Roles {
             seen: HashSet::new(),
             todo: Vec::new(),
             steps: 0,
+            lists: HashMap::new(),
         };
         w.push(catalog, Kind::Catalog, catalog);
         for (key, kind) in [(&b"Info"[..], Kind::Info), (b"Encrypt", Kind::Encrypt)] {
@@ -1809,6 +1810,9 @@ struct Walker<'v, 'r> {
     seen: HashSet<(ObjectId, Kind, ObjectId)>,
     todo: Vec<(ObjectId, Kind, ObjectId)>,
     steps: usize,
+    /// The annotations written inside each `/Annots` array held in an object, as
+    /// [`Walker::written_in`] found them.
+    lists: HashMap<ObjectId, (Vec<(usize, Kind)>, usize)>,
 }
 
 impl Walker<'_, '_> {
@@ -1871,16 +1875,17 @@ impl Walker<'_, '_> {
                                 if let Ok(r) = val.as_reference() {
                                     self.push(r, Kind::AnnotsArray, id);
                                 }
-                                // Annotations written inside the array; the others are
-                                // pushed as annotations already.
-                                for e in v.array(val).into_iter().flatten() {
-                                    if let Object::Dictionary(_) = e {
-                                        let nk = match annot_class(v, Some(e)) {
-                                            AnnotClass::Comment => Kind::CommentPart,
-                                            _ => Kind::OtherAnnotPart,
-                                        };
-                                        self.walk(e, nk, id, Some(k.as_slice()));
-                                    }
+                                // Annotations written inside the array, a step for each
+                                // object in them; the others are pushed as annotations
+                                // already.
+                                let list = v.array(val).map(Vec::as_slice).unwrap_or_default();
+                                let (inside, size) = self.written_in(list, v.array_holder(val));
+                                self.steps += size;
+                                if self.steps > limit {
+                                    return Err("the document is too complex to check".into());
+                                }
+                                for (i, nk) in inside {
+                                    self.walk(&list[i], nk, id, Some(k.as_slice()));
                                 }
                             }
                             _ => self.walk_entry(val, Kind::PageContent, id, k),
@@ -1955,6 +1960,38 @@ impl Walker<'_, '_> {
         Ok(())
     }
 
+    /// The annotations written inside the `/Annots` array `list` (their positions and
+    /// kinds), and the objects in them ([`nodes`]). A list held in an object (`holder`),
+    /// which pages may share, is looked through once.
+    fn written_in(
+        &mut self,
+        list: &[Object],
+        holder: Option<ObjectId>,
+    ) -> (Vec<(usize, Kind)>, usize) {
+        if let Some(known) = holder.and_then(|h| self.lists.get(&h)) {
+            #[cfg(test)]
+            tests::LOOKED.set(tests::LOOKED.get() + known.0.len());
+            return known.clone();
+        }
+        let mut found = (Vec::new(), 0);
+        for (i, e) in list.iter().enumerate() {
+            #[cfg(test)]
+            tests::LOOKED.set(tests::LOOKED.get() + 1);
+            if let Object::Dictionary(_) = e {
+                let kind = match annot_class(self.v, Some(e)) {
+                    AnnotClass::Comment => Kind::CommentPart,
+                    _ => Kind::OtherAnnotPart,
+                };
+                found.0.push((i, kind));
+                found.1 += nodes(e);
+            }
+        }
+        if let Some(h) = holder {
+            self.lists.insert(h, found.clone());
+        }
+        found
+    }
+
     /// The name trees: comment icon appearances, and the rest (destinations, scripts,
     /// embedded files) as document structure.
     fn names(&mut self, d: &Dictionary, owner: ObjectId) {
@@ -2016,6 +2053,16 @@ impl Walker<'_, '_> {
             }
             _ => {}
         }
+    }
+}
+
+/// The objects written in place in `o`, `o` included: those [`Walker::walk`] goes through.
+fn nodes(o: &Object) -> usize {
+    1 + match o {
+        Object::Array(a) => a.iter().map(nodes).sum(),
+        Object::Dictionary(d) => d.iter().map(|(_, v)| nodes(v)).sum(),
+        Object::Stream(s) => s.dict.iter().map(|(_, v)| nodes(v)).sum(),
+        _ => 0,
     }
 }
 
@@ -2742,6 +2789,8 @@ mod tests {
     thread_local! {
         /// Objects compared (`same_object`) on this thread.
         pub(super) static COMPARED: Cell<usize> = const { Cell::new(0) };
+        /// `/Annots` entries role assignment looked at on this thread.
+        pub(super) static LOOKED: Cell<usize> = const { Cell::new(0) };
     }
 
     fn square(n: usize) -> Dictionary {
@@ -2753,16 +2802,35 @@ mod tests {
         }
     }
 
-    /// Two pages sharing one `/Annots` array of `n` entries made by `entry`, then a revision
-    /// adding one more: the changes after the first version (kind, page, allowed), and the
-    /// objects compared finding them.
+    /// Changes found: (kind, page, allowed).
+    type Found = Vec<(ChangeKind, Option<usize>, bool)>;
+
+    /// `pages` pages sharing one `/Annots` array of `n` entries made by `entry`, then a
+    /// revision adding one more: the changes after the first version, the objects compared
+    /// finding them, and the entries role assignment looked at.
     fn shared_list_grown(
+        pages: usize,
         n: usize,
         entry: impl Fn(&mut Document, usize) -> Object,
-    ) -> (Vec<(ChangeKind, Option<usize>, bool)>, usize) {
+    ) -> (Found, usize, usize) {
+        let (signed, p) = shared_list(pages, n, entry);
+        COMPARED.set(0);
+        LOOKED.set(0);
+        let found = changes_since(&signed, &p);
+        (found, COMPARED.get(), LOOKED.get())
+    }
+
+    /// `pages` pages sharing one `/Annots` array of `n` entries made by `entry`, saved (to be
+    /// signed), and a revision of it adding one more.
+    fn shared_list(
+        pages: usize,
+        n: usize,
+        entry: impl Fn(&mut Document, usize) -> Object,
+    ) -> (Vec<u8>, Pdf) {
         let mut p = Pdf::new();
-        p.insert_blank(0, 300.0, 200.0).unwrap();
-        p.insert_blank(1, 300.0, 200.0).unwrap();
+        for i in 0..pages {
+            p.insert_blank(i, 300.0, 200.0).unwrap();
+        }
         let list: Vec<Object> = (0..n).map(|i| entry(&mut p.doc, i)).collect();
         let list = p.doc.add_object(list);
         for page in p.page_ids() {
@@ -2774,13 +2842,11 @@ mod tests {
         (p.doc.get_object_mut(list).and_then(Object::as_array_mut))
             .unwrap()
             .push(added);
-        COMPARED.set(0);
-        let found = changes_since(&signed, &p);
-        (found, COMPARED.get())
+        (signed, p)
     }
 
-    /// The changes after `signed` that `p`, a revision of it, makes: (kind, page, allowed).
-    fn changes_since(signed: &[u8], p: &Pdf) -> Vec<(ChangeKind, Option<usize>, bool)> {
+    /// The changes after `signed` that `p`, a revision of it, makes.
+    fn changes_since(signed: &[u8], p: &Pdf) -> Found {
         let bytes = append_revision(signed, &p.doc).unwrap().bytes;
         let whole = Pdf::from_bytes(&bytes, None).unwrap();
         let mut versions = Versions::new(&bytes, None, &whole);
@@ -2799,7 +2865,8 @@ mod tests {
     /// is compared with the one before once, by reference, and the change shows on each page.
     #[test]
     fn signature_changes_compare_each_annots_list_once() {
-        let (found, compared) = shared_list_grown(2_000, |d, i| d.add_object(square(i)).into());
+        let refer = |d: &mut Document, i| d.add_object(square(i)).into();
+        let (found, compared, _) = shared_list_grown(2, 2_000, refer);
         let added = |page| (ChangeKind::CommentAdded, Some(page), true);
         assert_eq!(found, [added(0), added(1)]);
         assert!(compared <= 5_000, "{compared} objects compared");
@@ -2810,7 +2877,38 @@ mod tests {
     /// to check.
     #[test]
     fn direct_annotations_past_the_step_count_are_too_complex_to_check() {
-        let (found, _) = shared_list_grown(3_000, |_, i| square(i).into());
+        let (found, _, _) = shared_list_grown(2, 3_000, |_, i| square(i).into());
+        let why = "the document is too complex to check".to_string();
+        assert_eq!(found, [(ChangeKind::Malformed(why), None, false)]);
+    }
+
+    /// A thousand pages sharing a list of 1,000 annotations, one more added after signing:
+    /// assigning roles looks through the list once a version, not once a page, and the
+    /// change shows on each page.
+    #[test]
+    fn roles_look_through_a_list_pages_share_once() {
+        let refer = |d: &mut Document, i| d.add_object(square(i)).into();
+        let (found, _, looked) = shared_list_grown(1_000, 1_000, refer);
+        let added: Vec<_> = (0..1_000)
+            .map(|page| (ChangeKind::CommentAdded, Some(page), true))
+            .collect();
+        assert_eq!(found, added);
+        assert!(looked <= 5_000, "{looked} entries looked at");
+    }
+
+    /// A hundred pages sharing a list of 100 annotations written into it directly, one more
+    /// added after signing: each page's roles walk them again, at a step for each of their
+    /// objects, so at 50,000 steps the document is too complex to check.
+    #[test]
+    fn annotations_in_a_shared_list_cost_steps_on_each_page() {
+        let direct = |_: &mut Document, i| square(i).into();
+        let (found, _, _) = shared_list_grown(100, 100, direct);
+        let added: Vec<_> = (0..100)
+            .map(|page| (ChangeKind::CommentAdded, Some(page), true))
+            .collect();
+        assert_eq!(found, added);
+        let (signed, p) = shared_list(100, 100, direct);
+        let (found, _) = budget_seam::with_limit(50_000, || changes_since(&signed, &p));
         let why = "the document is too complex to check".to_string();
         assert_eq!(found, [(ChangeKind::Malformed(why), None, false)]);
     }
