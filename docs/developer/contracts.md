@@ -157,7 +157,9 @@ and `settle` (`editor/replace_all.rs`), which hold its copy.
   once.
 - Redaction refuses before changing anything when it can't follow all it would have to remove: a form field
   touching a mark in a form nested more than 32 deep; a parent tree nested more than 32 deep or past 100,000
-  parts; a page too complex to read; or drawings too complex to follow. The walk over the drawings has a budget,
+  parts; a page too complex to read; annotations too many to look at ("drawing the annotations": each entry of
+  a page's `/Annots`, for each marked page, is a step of `annot_ap::STEPS`, 2²⁴); or drawings too complex to
+  follow. The walk over the drawings has a budget,
   `reach::STEPS`: 2²² (4,194,304) steps, 32 times the most any of the 1,080 corpus files that open takes
   (129,066, `pdfjs/issue6692.pdf`, measured 2026-11-04 with the budget lifted). It runs before the change; the
   walk after it is allowed twice that, plus the objects added.
@@ -196,7 +198,8 @@ and `settle` (`editor/replace_all.rs`), which hold its copy.
   `a_parent_tree_nested_too_deep_is_refused_unchanged`, `a_parent_tree_too_large_to_search_is_refused_unchanged`,
   `a_widget_under_a_mark_in_a_form_nested_too_deep_is_refused_unchanged`) and `too_complex.rs`'s
   `a_redaction_over_a_page_too_complex_to_read_changes_nothing`.
-- Core `annots.rs`: `redacting_where_an_annotation_placed_by_its_points_is_drawn_removes_it` (PB-114).
+- Core `annots.rs`: `redacting_where_an_annotation_placed_by_its_points_is_drawn_removes_it` (PB-114), and
+  `redacting_charges_each_entry_each_marked_page_looks_at` (annotations too many to look at are refused).
 - Core `pages_removed.rs`, for deleting, extracting and splitting:
   `what_only_the_pages_that_went_drew_goes_from_what_they_share`;
   `pages_whose_own_objects_the_file_keeps_another_way_are_refused` (each route, and no part written);

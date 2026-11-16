@@ -93,11 +93,13 @@ const WHAT: &str = "drawing the annotations";
 /// The steps drawing annotations may take ([`Work`]): 256 for each annotation, one for each
 /// point read, each byte of text read (a stamp's name, `/DA`, `/DS`, a text box's text each
 /// time it is checked for what its font can't write or set; a stream's own bytes and what
-/// its filters give, [`Work::decode`]) and each byte drawn, and two more for each byte of a
-/// text box's text set. Annotations can share their points and text, which each draws
-/// again, so the steps count everything drawn, however often. 2²⁴: 200 times the most the
-/// render corpus's annotations take with their own drawings taken away (83,771,
-/// `pdfjs/issue15292.pdf`), drawn in at most about 3 s (architecture.md, after `annot_rect`).
+/// its filters give, [`Work::decode`]) and each byte drawn, two more for each byte of a
+/// text box's text set, and one for each entry of a page's `/Annots` that redaction looks
+/// at for each marked page (`Pdf::annots_under`). Annotations can share their points and
+/// text, which each draws again, so the steps count everything drawn, however often. 2²⁴:
+/// 200 times the most the render corpus's annotations take with their own drawings taken
+/// away (83,771, `pdfjs/issue15292.pdf`), drawn in at most about 3 s (architecture.md,
+/// after `annot_rect`).
 const STEPS: u64 = 1 << 24;
 /// The steps an annotation takes before its points and text.
 const EACH: u64 = 256;

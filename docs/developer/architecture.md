@@ -1411,12 +1411,13 @@ for each of its marks, so P pages sharing M marks are refused past the budget, n
 a mark has no `/Rect`. Applying finds the annotations under the marks the same way (`annots_under`), before anything
 changes and once for all the marked pages, within the drawing budget (above): each list is read once however many
 marked pages share it, and each entry each marked page looks at is charged a step, as is drawing one placed by its
-points, so P marked pages sharing N entries are refused ("drawing the annotations") before the drawings are checked,
-not read P × N times. They go once, after every page (`Pdf::take_out`, each list changed once, with the replies to
-them, `Pdf::replies` and `with_replies`, and their pop-ups), and the fields of the widgets among them are pruned
-once (`prune_fields`); each page counts those going with it, one gone with an earlier page not again. Before, each
-marked page read its list and every page's list for the replies, and changed its own: 50 marked pages sharing a
-list of 1,000 entries read 140,328 entries more than 2 did. What needs only what each annotation is picks ids by
+points, so P marked pages sharing N entries are refused past the budget ("drawing the annotations") before the
+drawings are checked, not read P × N times. They go once, after every page (`Pdf::take_out`, each list changed
+once, with the replies to them, `Pdf::replies` and `with_replies`, and their pop-ups), and the fields of the widgets
+among them are pruned once (`prune_fields`); each page counts those going with it, one gone with an earlier page not
+again. Before, each marked page read its list and every page's list for the replies, and changed its own: 50 marked
+pages sharing a list of 1,000 entries read 140,328 entries more than 2 did.
+What needs only what each annotation is picks ids by
 kind, building no entry (`annotations_of_kind`): sanitising's comments and attachments, and the marks applying
 redaction removes. The count of marks for the marks banner, the Redact pane and the questions before saving and
 applying (`redaction_mark_count`, by `count_of_kind`, never refused) reads each list once: each mark with a `/Rect`
