@@ -16,6 +16,7 @@
 //! recognise. Links between structures (a bookmark pointing to a page, a tag pointing to an
 //! annotation) don't make the target part of the linking structure.
 
+use crate::budget;
 use crate::sig_verify::{is_white, FieldLock, Lexer, Permissions, Tok, Versions};
 use crate::Pdf;
 use lopdf::xref::XrefEntry;
@@ -1511,10 +1512,15 @@ struct FieldInfo {
 }
 
 /// The most nodes walked in the page tree or the form, and the most steps assigning
-/// roles or comparing a version's annotation lists with the next's; beyond that the
-/// document is refused as too complex to check.
+/// roles or comparing a version's annotation lists with the next's (and showing their
+/// changes on each page); beyond that the document is refused as too complex to check.
 const MAX_NODES: usize = 500_000;
 const MAX_STEPS: usize = 4_000_000;
+
+/// [`MAX_STEPS`], or a test's limit ([`budget::limit`]).
+fn max_steps() -> usize {
+    budget::limit(MAX_STEPS as u64) as usize
+}
 
 /// Keys that link to an annotation or field elsewhere without containing it.
 const LINK_KEYS: [&[u8]; 12] = [
@@ -1814,9 +1820,10 @@ impl Walker<'_, '_> {
     }
 
     fn run(&mut self) -> Result<(), String> {
+        let limit = max_steps();
         while let Some((id, kind, owner)) = self.todo.pop() {
             self.steps += 1;
-            if self.steps > MAX_STEPS {
+            if self.steps > limit {
                 return Err("the document is too complex to check".into());
             }
             let v = self.v;
@@ -2081,30 +2088,44 @@ impl Judge<'_> {
     }
 
     /// Annotations added to, removed from or reordered on each page. Each pair of lists
-    /// (before and after) is compared once, however many pages have it, within
-    /// [`MAX_STEPS`]; past them the document is too complex to check.
+    /// (before and after) is compared once, however many pages have it, and its changes
+    /// cost a step for each page they show on, within [`MAX_STEPS`]; past that the document
+    /// is too complex to check, and no list's changes are reported.
     fn annotations(&mut self) {
         let (or, nr) = (self.or, self.nr);
+        let limit = max_steps();
         let mut steps = 0;
         let mut compared: HashMap<(usize, usize), Vec<Seen>> = HashMap::new();
+        // Each page with its pair.
+        let mut pages: Vec<(usize, (usize, usize))> = Vec::new();
+        let mut within = true;
         for (i, page) in nr.pages.iter().enumerate() {
             let Some(&before) = or.page_annots.get(page) else {
                 continue;
             };
-            let after = nr.page_annots[page];
-            let found = match compared.entry((before, after)) {
-                std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
-                std::collections::hash_map::Entry::Vacant(e) => {
-                    let (b, a) = (&or.annot_lists[before], &nr.annot_lists[after]);
-                    let Some(found) = self.list_changes(b, a, &mut steps) else {
-                        let why = "the document is too complex to check".to_string();
-                        self.push(never(ChangeKind::Malformed(why), None));
-                        return;
-                    };
-                    e.insert(found)
-                }
-            };
-            for s in found.iter() {
+            let pair = (before, nr.page_annots[page]);
+            if let std::collections::hash_map::Entry::Vacant(e) = compared.entry(pair) {
+                let (b, a) = (&or.annot_lists[pair.0], &nr.annot_lists[pair.1]);
+                let Some(found) = self.list_changes(b, a, &mut steps, limit) else {
+                    within = false;
+                    break;
+                };
+                e.insert(found);
+            }
+            steps += compared[&pair].len();
+            if steps > limit {
+                within = false;
+                break;
+            }
+            pages.push((i, pair));
+        }
+        if !within {
+            let why = "the document is too complex to check".to_string();
+            self.push(never(ChangeKind::Malformed(why), None));
+            return;
+        }
+        for (i, pair) in pages {
+            for s in &compared[&pair] {
                 self.push(Seen {
                     page: Some(i),
                     ..s.clone()
@@ -2114,7 +2135,7 @@ impl Judge<'_> {
     }
 
     /// What changed between a page's annotations `before` and `after`, each change once and
-    /// without the page; `None` past [`MAX_STEPS`]. Each entry costs a step; one referred to
+    /// without the page; `None` past `limit` steps. Each entry costs a step; one referred to
     /// is looked for by its reference, and one written in place (which the format doesn't
     /// allow) is compared with those in place in the other list, a step each.
     fn list_changes(
@@ -2122,10 +2143,11 @@ impl Judge<'_> {
         before: &[Object],
         after: &[Object],
         steps: &mut usize,
+        limit: usize,
     ) -> Option<Vec<Seen>> {
         let (old, new) = (self.old, self.new);
         *steps += before.len() + after.len();
-        if *steps > MAX_STEPS {
+        if *steps > limit {
             return None;
         }
         // For each entry of `list`, whether `other` has it too.
@@ -2142,7 +2164,7 @@ impl Judge<'_> {
                     e => {
                         for x in &in_place {
                             *steps += 1;
-                            if *steps > MAX_STEPS {
+                            if *steps > limit {
                                 return None;
                             }
                             if same_object(x, e) {
@@ -2712,6 +2734,7 @@ fn sign_seen(f: &FieldInfo, new_visible: Option<bool>) -> Seen {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::budget::budget_seam;
     use crate::incremental::append_revision;
     use lopdf::dictionary;
     use std::cell::Cell;
@@ -2751,20 +2774,25 @@ mod tests {
         (p.doc.get_object_mut(list).and_then(Object::as_array_mut))
             .unwrap()
             .push(added);
-        let bytes = append_revision(&signed, &p.doc).unwrap().bytes;
+        COMPARED.set(0);
+        let found = changes_since(&signed, &p);
+        (found, COMPARED.get())
+    }
+
+    /// The changes after `signed` that `p`, a revision of it, makes: (kind, page, allowed).
+    fn changes_since(signed: &[u8], p: &Pdf) -> Vec<(ChangeKind, Option<usize>, bool)> {
+        let bytes = append_revision(signed, &p.doc).unwrap().bytes;
         let whole = Pdf::from_bytes(&bytes, None).unwrap();
         let mut versions = Versions::new(&bytes, None, &whole);
         let sig = Signed {
             end: signed.len(),
             locks: None,
         };
-        COMPARED.set(0);
         let found = analyse(&mut versions, &[sig], None);
-        let found = found[0]
+        found[0]
             .iter()
             .map(|c| (c.kind.clone(), c.page, c.allowed()))
-            .collect();
-        (found, COMPARED.get())
+            .collect()
     }
 
     /// Two pages sharing a list of 2,000 annotations, one more added after signing: the list
@@ -2785,5 +2813,45 @@ mod tests {
         let (found, _) = shared_list_grown(3_000, |_, i| square(i).into());
         let why = "the document is too complex to check".to_string();
         assert_eq!(found, [(ChangeKind::Malformed(why), None, false)]);
+    }
+
+    /// 100 pages sharing a list of 100 fields' widgets, emptied after signing with the fields
+    /// kept: each field changed shows on each page, 10,000 changes. Each costs a step, so
+    /// with 5,000 steps the document is too complex to check.
+    #[test]
+    fn annotation_changes_on_each_page_count_against_the_steps() {
+        let mut p = Pdf::new();
+        for i in 0..100 {
+            p.insert_blank(i, 300.0, 200.0).unwrap();
+        }
+        let widgets: Vec<Object> = (0..100)
+            .map(|i| {
+                let w = dictionary! {
+                    "Type" => "Annot",
+                    "Subtype" => "Widget",
+                    "FT" => "Tx",
+                    "T" => Object::string_literal(format!("f{i}")),
+                    "Rect" => vec![10.into(), 10.into(), 20.into(), 20.into()],
+                };
+                p.doc.add_object(w).into()
+            })
+            .collect();
+        let list = p.doc.add_object(widgets.clone());
+        for page in p.page_ids() {
+            p.doc.get_dictionary_mut(page).unwrap().set("Annots", list);
+        }
+        let form = p.doc.add_object(dictionary! { "Fields" => widgets });
+        p.doc.catalog_mut().unwrap().set("AcroForm", form);
+        let signed = p.snapshot().unwrap();
+        let mut p = Pdf::from_bytes(&signed, None).unwrap();
+        p.doc.objects.insert(list, Object::Array(Vec::new()));
+
+        let found = changes_since(&signed, &p);
+        let first = (ChangeKind::FieldChanged("f0".into()), Some(0), false);
+        assert_eq!((found.len(), &found[0]), (10_000, &first));
+        let (found, _) = budget_seam::with_limit(5_000, || changes_since(&signed, &p));
+        let why = "the document is too complex to check".to_string();
+        let refused = (ChangeKind::Malformed(why), None, false);
+        assert_eq!((found.len(), &found[0]), (1, &refused));
     }
 }

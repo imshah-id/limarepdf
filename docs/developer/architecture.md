@@ -1571,15 +1571,18 @@ count as a new change), then compares each signed version with the next,
 judging every object that differs by each role it plays (page content, comment, form field, signature, document
 structure) against the signer's permissions. Each version keeps each `/Annots` list once, however many pages share
 it, and each pair of lists (before and after) is compared once: its entries are looked for by their references, and
-those written in place (which the format doesn't allow) among each other, each entry of each pair and each
-comparison a step, within `MAX_STEPS` (4,000,000) a version, past which the later version is too complex to check
-(never allowed, as when assigning roles passes its limits); each change is reported once. Two pages sharing a list
-of 2,000 comments, one more added after signing: 16,022,008 objects compared before, at most 5,000 now
-(`signature_changes_compare_each_annots_list_once`). Trust is in `trust.rs`: the trust list file (`trust.txt` in the
-settings folder, whose location `limarepdf_core::settings_dir` gives both the app and the command line), and the chain
-search from a signer's certificate to a trusted authority over the certificates the signature and the document's
-`/DSS` carry, with RFC 5280's checks at the signing time, including certificate policy processing; each link's
-signature is checked over the certificate as written (`cms_check::check_cert_signature`). Signatures and
+those written in place (which the format doesn't allow) among each other. Each entry of each pair, each comparison,
+and each change found for each page it shows on is a step, within `MAX_STEPS` (4,000,000) a version, past which the
+later version is too complex to check (never allowed, as when assigning roles passes its limits) and none of the
+lists' changes is reported; each change is reported once a page. Two pages sharing a list of 2,000 comments, one
+more added after signing: 16,022,008 objects compared before, at most 5,000 now
+(`signature_changes_compare_each_annots_list_once`). A hundred pages sharing a list of 100 fields' widgets, emptied
+after signing: 10,000 changes, so refused at a limit of 5,000
+(`annotation_changes_on_each_page_count_against_the_steps`). Trust is in `trust.rs`: the trust list file (`trust.txt`
+in the settings folder, whose location `limarepdf_core::settings_dir` gives both the app and the command line), and
+the chain search from a signer's certificate to a trusted authority over the certificates the signature and the
+document's `/DSS` carry, with RFC 5280's checks at the signing time, including certificate policy processing; each
+link's signature is checked over the certificate as written (`cms_check::check_cert_signature`). Signatures and
 certificates read their algorithm through one function, `cms_check::scheme`: an RSA-PSS algorithm whose parameters
 are left out or NULL gives *can't check* (RFC 4055 requires them; only an empty list means the defaults), while an
 RSA-PSS-only key with no parameters has no limits (`pss_key_limits`, RFC 4055 section 1.2). Trust is applied after
