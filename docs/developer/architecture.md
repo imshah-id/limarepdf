@@ -1618,7 +1618,10 @@ and given a made-up signature was reported as nothing before
 (`a_widget_moved_under_a_signature_field_and_signed_is_refused`). So is a field listed under another field, or
 renamed by a change to one above it, as a lock naming it would no longer, and filling it in is judged by the name it
 had: a locked field listed under another was reported as nothing before, and filled in, allowed
-(`a_field_renamed_by_changes_to_other_fields_is_refused`). Trust is in `trust.rs`: the trust
+(`a_field_renamed_by_changes_to_other_fields_is_refused`). Each kind of change to a field is found once a page,
+however many of its keys or parts change, and its name copied only then: a field named with 64 KB and 1,000 keys
+changed, and one with 1,000 parts changed, were found 1,000 times each before
+(`a_fields_change_is_found_once_however_many_keys_or_parts_change`). Trust is in `trust.rs`: the trust
 list file (`trust.txt`
 in the settings folder, whose location `limarepdf_core::settings_dir` gives both the app and the command line), and
 the chain search from a signer's certificate to a trusted authority over the certificates the signature and the

@@ -1360,6 +1360,7 @@ fn compare_versions(
         nr: &new_roles,
         listed,
         out: Vec::new(),
+        pushed: HashSet::new(),
     };
     j.trailer();
     j.pages();
@@ -2190,6 +2191,18 @@ struct Judge<'a> {
     /// The fields whose signatures the report lists.
     listed: &'a HashSet<ObjectId>,
     out: Vec<Seen>,
+    /// The fields' changes pushed (field, kind of change, page), each once.
+    pushed: HashSet<(ObjectId, FieldChange, Option<usize>)>,
+}
+
+/// A kind of change to a field, pushed once a page for each field: its name may be long, and
+/// many of its keys or parts may change.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum FieldChange {
+    Changed,
+    Filled,
+    MadeReadOnly,
+    SignatureChanged,
 }
 
 /// Field dictionary entries filling in may change: the value, its appearance, the
@@ -2201,6 +2214,22 @@ const SIGN_KEYS: [&[u8]; 4] = [b"V", b"AP", b"AS", b"M"];
 impl<'a> Judge<'a> {
     fn push(&mut self, s: Seen) {
         self.out.push(s);
+    }
+
+    /// Field `owner`'s `change` on `page`, pushed once: its name is copied only then.
+    fn push_field(&mut self, owner: ObjectId, change: FieldChange, page: Option<usize>) {
+        if !self.pushed.insert((owner, change, page)) {
+            return;
+        }
+        let name = self.field_name(owner);
+        let fill = |kind| seen(kind, page, Need::Fill(Some(name.clone())));
+        let s = match change {
+            FieldChange::Changed => never(ChangeKind::FieldChanged(name), page),
+            FieldChange::SignatureChanged => never(ChangeKind::SignatureChanged(name), page),
+            FieldChange::Filled => fill(ChangeKind::FieldFilled(name.clone())),
+            FieldChange::MadeReadOnly => fill(ChangeKind::FieldMadeReadOnly(name.clone())),
+        };
+        self.push(s);
     }
 
     /// The keys whose values differ between two dictionaries.
@@ -2497,15 +2526,15 @@ impl<'a> Judge<'a> {
             match self.or.fields.get(id) {
                 Some(o) => {
                     if o.signed && (!f.signed || o.name != f.name) {
-                        self.push(never(ChangeKind::SignatureChanged(o.name.clone()), None));
+                        self.push_field(*id, FieldChange::SignatureChanged, None);
                     } else if o.parent != f.parent || o.name != f.name {
                         // Moved, or renamed by a change to a field above it: a lock naming it
                         // would no longer.
-                        self.push(never(ChangeKind::FieldChanged(o.name.clone()), None));
+                        self.push_field(*id, FieldChange::Changed, None);
                     } else if o.sig != f.sig {
                         // Made part of a signature field, or no longer, by a list of kids or
                         // fields changing: its signing would go unjudged.
-                        self.push(never(ChangeKind::FieldChanged(o.name.clone()), None));
+                        self.push_field(*id, FieldChange::Changed, None);
                     } else if !o.signed && f.signed {
                         self.push(self.signing(*id, f, None));
                     }
@@ -2513,10 +2542,7 @@ impl<'a> Judge<'a> {
                 None => match f.parent {
                     // Part of a field added in this step.
                     Some(p) if !self.or.fields.contains_key(&p) => {}
-                    Some(p) => {
-                        let name = self.or.fields[&p].name.clone();
-                        self.push(never(ChangeKind::FieldChanged(name), None));
-                    }
+                    Some(p) => self.push_field(p, FieldChange::Changed, None),
                     None if f.sig => {
                         // The whole new field: whether anything in it is signed, shows or acts.
                         let tree = added.get(id).map(Vec::as_slice).unwrap_or_default();
@@ -2672,7 +2698,6 @@ impl<'a> Judge<'a> {
                 self.push(never(ChangeKind::AnnotationChanged, page))
             }
             Kind::Field => {
-                let name = self.field_name(owner);
                 let keys = match dicts {
                     Some((a, b)) => Self::differing(a, b),
                     None => vec![b"Type".to_vec()],
@@ -2683,25 +2708,17 @@ impl<'a> Judge<'a> {
                         filled = true;
                     } else if k == b"Ff" && dicts.is_some_and(|(a, b)| self.only_read_only(a, b)) {
                         // Signing a field that locks others makes them read-only (Acrobat).
-                        self.push(seen(
-                            ChangeKind::FieldMadeReadOnly(name.clone()),
-                            page,
-                            Need::Fill(Some(name.clone())),
-                        ));
+                        self.push_field(owner, FieldChange::MadeReadOnly, page);
                     } else if k != b"Kids" {
-                        self.push(never(ChangeKind::FieldChanged(name.clone()), page));
+                        self.push_field(owner, FieldChange::Changed, page);
                     }
                 }
                 if filled {
-                    self.push(fill_seen(&name, page));
+                    self.push_field(owner, FieldChange::Filled, page);
                 }
             }
-            Kind::FieldPart => {
-                let name = self.field_name(owner);
-                self.push(fill_seen(&name, page));
-            }
+            Kind::FieldPart => self.push_field(owner, FieldChange::Filled, page),
             Kind::SigField => {
-                let name = self.field_name(owner);
                 let was_signed = self.or.fields.get(&owner).is_some_and(|f| f.signed);
                 let keys = match dicts {
                     Some((a, b)) => Self::differing(a, b),
@@ -2710,39 +2727,34 @@ impl<'a> Judge<'a> {
                 let is_signed = self.nr.fields.get(&owner).is_some_and(|f| f.signed);
                 for k in keys {
                     if was_signed {
-                        self.push(never(ChangeKind::SignatureChanged(name.clone()), page));
+                        self.push_field(owner, FieldChange::SignatureChanged, page);
                     } else if k == b"F"
                         && is_signed
                         && dicts.is_some_and(|(a, b)| only_locked(a, b))
                     {
                         // Acrobat locks the widget it signs.
                     } else if !SIGN_KEYS.contains(&k.as_slice()) && k != b"Kids" {
-                        self.push(never(ChangeKind::FieldChanged(name.clone()), page));
+                        self.push_field(owner, FieldChange::Changed, page);
                     } else if !is_signed {
                         // Changed, but not signed.
-                        self.push(never(ChangeKind::FieldChanged(name.clone()), page));
+                        self.push_field(owner, FieldChange::Changed, page);
                     }
                 }
             }
             Kind::SigFieldPart => {
-                let name = self.field_name(owner);
                 let was_signed = self.or.fields.get(&owner).is_some_and(|f| f.signed);
                 let is_signed = self.nr.fields.get(&owner).is_some_and(|f| f.signed);
                 if was_signed {
-                    self.push(never(ChangeKind::SignatureChanged(name), page));
+                    self.push_field(owner, FieldChange::SignatureChanged, page);
                 } else if !is_signed {
-                    self.push(never(ChangeKind::FieldChanged(name), page));
+                    self.push_field(owner, FieldChange::Changed, page);
                 }
                 // Otherwise part of signing the field, reported with the fields.
             }
             Kind::SigDict | Kind::SigPart => {
-                let name = self.field_name(owner);
-                self.push(never(ChangeKind::SignatureChanged(name), page));
+                self.push_field(owner, FieldChange::SignatureChanged, page)
             }
-            Kind::FieldMeta => {
-                let name = self.field_name(owner);
-                self.push(never(ChangeKind::FieldChanged(name), page));
-            }
+            Kind::FieldMeta => self.push_field(owner, FieldChange::Changed, page),
             Kind::Action => self.push(never(ChangeKind::Actions, page)),
             Kind::Perms => match dicts {
                 Some((a, b)) => self.perms(a, b),
@@ -2887,14 +2899,6 @@ fn only_locked(a: &Dictionary, b: &Dictionary) -> bool {
         (Some(x), Some(y)) => x & !y == 0 && (y & !x) & !(128 | 512) == 0,
         _ => false,
     }
-}
-
-fn fill_seen(name: &str, page: Option<usize>) -> Seen {
-    seen(
-        ChangeKind::FieldFilled(name.to_string()),
-        page,
-        Need::Fill(Some(name.to_string())),
-    )
 }
 
 /// A field signed (`new_visible` set when the field was added in the same step).
@@ -3433,6 +3437,50 @@ mod tests {
             (vec![top.into()], last)
         });
         assert_eq!(changes_since(&signed, &p), plain);
+    }
+
+    /// A field named with 64 KB whose 1,000 other entries change after signing, and one whose
+    /// 1,000 parts do: each field's change is found once, its name copied once, not once a key
+    /// or a part (1,000 times each before, 64 MB a field and twice that with what it needs).
+    #[test]
+    fn a_fields_change_is_found_once_however_many_keys_or_parts_change() {
+        let (a, b) = ("a".repeat(65_536), "b".repeat(65_536));
+        let mut p = Pdf::new();
+        p.insert_blank(0, 300.0, 200.0).unwrap();
+        let mut keyed = dictionary! { "FT" => "Tx", "T" => Object::string_literal(a.as_str()) };
+        for i in 0..1_000 {
+            keyed.set(format!("K{i}"), 0);
+        }
+        let keyed = p.doc.add_object(keyed);
+        let parts: Vec<ObjectId> = (0..1_000)
+            .map(|_| p.doc.add_object(dictionary! { "N" => 0 }))
+            .collect();
+        let list: Vec<Object> = parts.iter().map(|&r| r.into()).collect();
+        let named = Object::string_literal(b.as_str());
+        let held = dictionary! { "FT" => "Tx", "T" => named, "X" => list };
+        let held = p.doc.add_object(held);
+        let fields = vec![Object::from(keyed), held.into()];
+        let form = p.doc.add_object(dictionary! { "Fields" => fields });
+        p.doc.catalog_mut().unwrap().set("AcroForm", form);
+        let signed = p.snapshot().unwrap();
+        let mut p = Pdf::from_bytes(&signed, None).unwrap();
+        let d = p.doc.get_dictionary_mut(keyed).unwrap();
+        for i in 0..1_000 {
+            d.set(format!("K{i}"), 1);
+        }
+        for &r in &parts {
+            p.doc.get_dictionary_mut(r).unwrap().set("N", 1);
+        }
+        let bytes = append_revision(&signed, &p.doc).unwrap().bytes;
+        let whole = Pdf::from_bytes(&bytes, None).unwrap();
+        let mut versions = Versions::new(&bytes, None, &whole);
+        let end = signed.len();
+        let (listed, mut cache) = (listed(&whole), HashMap::new());
+        let raw = changes_after(&mut versions, &bytes, end, &[end], &listed, &mut cache);
+        let count = |kind: ChangeKind| raw.iter().filter(|s| s.kind == kind).count();
+        let changed = count(ChangeKind::FieldChanged(a));
+        let filled = count(ChangeKind::FieldFilled(b));
+        assert_eq!((changed, filled), (1, 1));
     }
 
     /// A thousand fields each listing the same 1,000 kids, themselves, with no area on the
