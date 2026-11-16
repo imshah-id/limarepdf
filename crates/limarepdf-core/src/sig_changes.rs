@@ -1689,6 +1689,8 @@ impl Roles {
             todo: Vec::new(),
             steps: 0,
             lists: HashMap::new(),
+            found: HashMap::new(),
+            done: HashSet::new(),
         };
         w.push(catalog, Kind::Catalog, catalog);
         for (key, kind) in [(&b"Info"[..], Kind::Info), (b"Encrypt", Kind::Encrypt)] {
@@ -1813,6 +1815,11 @@ struct Walker<'v, 'r> {
     /// The annotations written inside each `/Annots` array held in an object, as
     /// [`Walker::written_in`] found them.
     lists: HashMap<ObjectId, (Vec<(usize, Kind)>, usize)>,
+    /// The references in each object walked as a kind, and the kinds they get, as
+    /// [`Walker::refs`] found them.
+    found: HashMap<(ObjectId, Kind), Vec<(ObjectId, Kind)>>,
+    /// The objects whose entries were given their parts, by kind.
+    done: HashSet<(ObjectId, Kind)>,
 }
 
 impl Walker<'_, '_> {
@@ -1839,6 +1846,21 @@ impl Walker<'_, '_> {
                 Object::Stream(s) => Some(&s.dict),
                 _ => None,
             };
+            // These give an object's entries their parts with the object as owner, so
+            // another owner reaching it as the same kind adds nothing.
+            let owns = matches!(
+                kind,
+                Kind::PageNode
+                    | Kind::Comment
+                    | Kind::OtherAnnot
+                    | Kind::Field
+                    | Kind::SigField
+                    | Kind::AcroForm
+                    | Kind::Names
+            );
+            if owns && dict.is_some() && !self.done.insert((id, kind)) {
+                continue;
+            }
             match (kind, dict) {
                 (Kind::Catalog, Some(d)) => {
                     for (k, val) in d.iter() {
@@ -1954,7 +1976,31 @@ impl Walker<'_, '_> {
                     Kind::WidgetAnnot | Kind::PagesArray | Kind::AnnotsArray | Kind::FieldsArray,
                     _,
                 ) => {}
-                _ => self.walk(obj, kind, owner, None),
+                // An object reached from many owners is walked once a kind, a step; what it
+                // refers to is pushed again for each further owner, a step, or a step for
+                // each reference in it that owner reached already, if more.
+                _ => {
+                    let (found, again_for) = match self.found.remove(&(id, kind)) {
+                        Some(found) => (found, true),
+                        None => {
+                            let mut found = Vec::new();
+                            self.refs(obj, kind, None, &mut found);
+                            (found, false)
+                        }
+                    };
+                    let pushed = self.todo.len();
+                    for &(r, kind) in &found {
+                        self.push(r, kind, owner);
+                    }
+                    let again = found.len() - (self.todo.len() - pushed);
+                    self.found.insert((id, kind), found);
+                    if again_for {
+                        self.steps += again.saturating_sub(1);
+                        if self.steps > limit {
+                            return Err("the document is too complex to check".into());
+                        }
+                    }
+                }
             }
         }
         Ok(())
@@ -2010,8 +2056,21 @@ impl Walker<'_, '_> {
         self.walk(val, child_kind(kind, key), owner, Some(key));
     }
 
-    /// The references in `val` (a value of `kind`, under dictionary key `key`).
+    /// The references in `val` (a value of `kind`, under dictionary key `key`), pushed for
+    /// `owner`.
     fn walk(&mut self, val: &Object, kind: Kind, owner: ObjectId, key: Option<&[u8]>) {
+        let mut found = Vec::new();
+        self.refs(val, kind, key, &mut found);
+        for (r, kind) in found {
+            self.push(r, kind, owner);
+        }
+    }
+
+    /// The references in `val` (a value of `kind`, under dictionary key `key`) and the
+    /// kinds they get, added to `out`.
+    fn refs(&self, val: &Object, kind: Kind, key: Option<&[u8]>, out: &mut Vec<(ObjectId, Kind)>) {
+        #[cfg(test)]
+        tests::WALKED.set(tests::WALKED.get() + 1);
         match val {
             Object::Reference(r) => {
                 let r = *r;
@@ -2034,21 +2093,21 @@ impl Walker<'_, '_> {
                 } else {
                     kind
                 };
-                self.push(r, kind, owner);
+                out.push((r, kind));
             }
             Object::Array(a) => {
                 for e in a {
-                    self.walk(e, kind, owner, key);
+                    self.refs(e, kind, key, out);
                 }
             }
             Object::Dictionary(d) => {
                 for (k, v) in d.iter() {
-                    self.walk_entry(v, kind, owner, k);
+                    self.refs(v, child_kind(kind, k), Some(k), out);
                 }
             }
             Object::Stream(s) => {
                 for (k, v) in s.dict.iter() {
-                    self.walk_entry(v, kind, owner, k);
+                    self.refs(v, child_kind(kind, k), Some(k), out);
                 }
             }
             _ => {}
@@ -2056,7 +2115,7 @@ impl Walker<'_, '_> {
     }
 }
 
-/// The objects written in place in `o`, `o` included: those [`Walker::walk`] goes through.
+/// The objects written in place in `o`, `o` included: those [`Walker::refs`] goes through.
 fn nodes(o: &Object) -> usize {
     1 + match o {
         Object::Array(a) => a.iter().map(nodes).sum(),
@@ -2791,6 +2850,8 @@ mod tests {
         pub(super) static COMPARED: Cell<usize> = const { Cell::new(0) };
         /// `/Annots` entries role assignment looked at on this thread.
         pub(super) static LOOKED: Cell<usize> = const { Cell::new(0) };
+        /// Objects role assignment walked through on this thread.
+        pub(super) static WALKED: Cell<usize> = const { Cell::new(0) };
     }
 
     fn square(n: usize) -> Dictionary {
@@ -2951,5 +3012,209 @@ mod tests {
         let why = "the document is too complex to check".to_string();
         let refused = (ChangeKind::Malformed(why), None, false);
         assert_eq!((found.len(), &found[0]), (1, &refused));
+    }
+
+    /// `pages` pages sharing the resources `shared` makes, saved (to be signed), and a
+    /// revision of it changing the dictionary `shared` names after them.
+    fn shared_resources(
+        pages: usize,
+        shared: impl Fn(&mut Document) -> (ObjectId, ObjectId),
+    ) -> (Vec<u8>, Pdf) {
+        let mut p = Pdf::new();
+        for i in 0..pages {
+            p.insert_blank(i, 300.0, 200.0).unwrap();
+        }
+        let (res, changed) = shared(&mut p.doc);
+        for page in p.page_ids() {
+            p.doc
+                .get_dictionary_mut(page)
+                .unwrap()
+                .set("Resources", res);
+        }
+        let signed = p.snapshot().unwrap();
+        let mut p = Pdf::from_bytes(&signed, None).unwrap();
+        (p.doc.get_dictionary_mut(changed).unwrap()).set("Changed", true);
+        (signed, p)
+    }
+
+    /// A thousand pages sharing resources that hold a list of 1,000 numbers, changed after
+    /// signing: the change shows on each page, and assigning roles walks the list once a
+    /// version, not once a page.
+    #[test]
+    fn roles_walk_what_pages_share_once() {
+        let shared = |d: &mut Document| {
+            let junk: Vec<Object> = (0..1_000i64).map(Object::from).collect();
+            let res = d.add_object(dictionary! { "Junk" => junk });
+            (res, res)
+        };
+        let (signed, p) = shared_resources(1_000, shared);
+        WALKED.set(0);
+        let found = changes_since(&signed, &p);
+        let walked = WALKED.get();
+        let changed: Found = (0..1_000)
+            .map(|page| (ChangeKind::PageContent, Some(page), false))
+            .collect();
+        assert_eq!(found, changed);
+        assert!(walked <= 50_000, "{walked} objects walked");
+    }
+
+    /// A hundred pages sharing resources of 100 objects that each refer to the same 100
+    /// others, one of those changed after signing: each page reaches each of the 100 again
+    /// through each of the 100, a step each time, so at 100,000 steps the document is too
+    /// complex to check.
+    #[test]
+    fn references_reached_again_cost_steps() {
+        let shared = |d: &mut Document| {
+            let ends: Vec<ObjectId> = (0..100i64)
+                .map(|j| d.add_object(dictionary! { "N" => j }))
+                .collect();
+            let list: Vec<Object> = ends.iter().map(|&end| end.into()).collect();
+            let mut res = Dictionary::new();
+            for i in 0..100 {
+                let middle = d.add_object(dictionary! { "Junk" => list.clone() });
+                res.set(format!("R{i}"), middle);
+            }
+            (d.add_object(res), ends[0])
+        };
+        let (signed, p) = shared_resources(100, shared);
+        let found = changes_since(&signed, &p);
+        let changed: Found = (0..100)
+            .map(|page| (ChangeKind::PageContent, Some(page), false))
+            .collect();
+        assert_eq!(found, changed);
+        let (found, _) = budget_seam::with_limit(100_000, || changes_since(&signed, &p));
+        let why = "the document is too complex to check".to_string();
+        assert_eq!(found, [(ChangeKind::Malformed(why), None, false)]);
+    }
+
+    /// The last object assigning roles reaches, reached from the form first, refers 5,000
+    /// times to one the catalog reached already: a step each, so at 2,000 steps the document
+    /// is too complex to check.
+    #[test]
+    fn references_reached_again_last_cost_steps() {
+        let mut p = Pdf::new();
+        p.insert_blank(0, 300.0, 200.0).unwrap();
+        let x = p.doc.new_object_id();
+        let y = p.doc.add_object(vec![Object::from(x); 5_000]);
+        p.doc.objects.insert(x, dictionary! { "Y" => y }.into());
+        let form = p.doc.add_object(dictionary! { "XFA" => x });
+        let root = p.doc.trailer.get(b"Root").and_then(Object::as_reference);
+        let catalog = p.doc.get_dictionary_mut(root.unwrap()).unwrap();
+        catalog.set("Foo", x);
+        catalog.set("AcroForm", form);
+        let signed = p.snapshot().unwrap();
+        let mut p = Pdf::from_bytes(&signed, None).unwrap();
+        (p.doc.get_dictionary_mut(x).unwrap()).set("Changed", true);
+        let found = changes_since(&signed, &p);
+        assert!(
+            !found
+                .iter()
+                .any(|f| matches!(f.0, ChangeKind::Malformed(_))),
+            "{found:?}"
+        );
+        let (found, _) = budget_seam::with_limit(2_000, || changes_since(&signed, &p));
+        let why = "the document is too complex to check".to_string();
+        assert_eq!(found, [(ChangeKind::Malformed(why), None, false)]);
+    }
+
+    /// A structure element holding 5,000 marked pieces of a page, which the structure tree's
+    /// parent tree lists once for each, changed after signing: the catalog reaches it the
+    /// first time only, so the list is a step, and the check comes out the same within 1,000.
+    #[test]
+    fn a_parent_tree_listing_an_element_again_costs_a_step() {
+        let mut p = Pdf::new();
+        p.insert_blank(0, 300.0, 200.0).unwrap();
+        let page = p.page_ids()[0];
+        let tree = p.doc.new_object_id();
+        let marks: Vec<Object> = (0..5_000i64).map(Object::from).collect();
+        let element = p.doc.add_object(dictionary! {
+            "S" => "P",
+            "P" => tree,
+            "Pg" => page,
+            "K" => marks,
+        });
+        let parents = p.doc.add_object(vec![Object::from(element); 5_000]);
+        let nums = dictionary! { "Nums" => vec![Object::from(0i64), parents.into()] };
+        let root = dictionary! { "K" => element, "ParentTree" => nums };
+        p.doc.objects.insert(tree, root.into());
+        let catalog = p.doc.trailer.get(b"Root").and_then(Object::as_reference);
+        (p.doc.get_dictionary_mut(catalog.unwrap()).unwrap()).set("StructTreeRoot", tree);
+        let signed = p.snapshot().unwrap();
+        let mut p = Pdf::from_bytes(&signed, None).unwrap();
+        (p.doc.get_dictionary_mut(element).unwrap()).set("Changed", true);
+        let found = changes_since(&signed, &p);
+        assert!(
+            !found
+                .iter()
+                .any(|f| matches!(f.0, ChangeKind::Malformed(_))),
+            "{found:?}"
+        );
+        let (limited, _) = budget_seam::with_limit(1_000, || changes_since(&signed, &p));
+        assert_eq!(limited, found);
+    }
+
+    /// A page listing 1,000 annotations that are each an array holding the same dictionary of
+    /// 1,000 numbers, changed after signing: assigning roles walks the dictionary once a
+    /// version, not once for each array reaching it.
+    #[test]
+    fn parts_reached_through_many_arrays_are_walked_once() {
+        let mut p = Pdf::new();
+        p.insert_blank(0, 300.0, 200.0).unwrap();
+        let junk: Vec<Object> = (0..1_000i64).map(Object::from).collect();
+        let shared = p.doc.add_object(dictionary! { "Junk" => junk });
+        let list: Vec<Object> = (0..1_000)
+            .map(|_| p.doc.add_object(vec![Object::from(shared)]).into())
+            .collect();
+        let page = p.page_ids()[0];
+        p.doc.get_dictionary_mut(page).unwrap().set("Annots", list);
+        let signed = p.snapshot().unwrap();
+        let mut p = Pdf::from_bytes(&signed, None).unwrap();
+        (p.doc.get_dictionary_mut(shared).unwrap()).set("Changed", true);
+        WALKED.set(0);
+        let found = changes_since(&signed, &p);
+        let walked = WALKED.get();
+        assert_eq!(found, [(ChangeKind::AnnotationChanged, Some(0), false)]);
+        assert!(walked <= 50_000, "{walked} objects walked");
+    }
+
+    /// Three hundred pages on one article thread, a bead each: each page reaches every bead
+    /// through the thread's links, a step each, and reaching a bead's neighbour again adds
+    /// nothing to that, so the check comes out the same within 150,000 steps.
+    #[test]
+    fn a_thread_through_every_page_costs_a_step_a_bead() {
+        let mut p = Pdf::new();
+        for i in 0..300 {
+            p.insert_blank(i, 300.0, 200.0).unwrap();
+        }
+        let pages = p.page_ids();
+        let d = &mut p.doc;
+        let beads: Vec<ObjectId> = pages.iter().map(|_| d.new_object_id()).collect();
+        let thread = d.add_object(dictionary! { "F" => beads[0] });
+        for (i, (&bead, &page)) in beads.iter().zip(&pages).enumerate() {
+            let mut b = dictionary! {
+                "P" => page,
+                "N" => beads[(i + 1) % beads.len()],
+                "V" => beads[(i + beads.len() - 1) % beads.len()],
+            };
+            if i == 0 {
+                b.set("T", thread);
+            }
+            d.objects.insert(bead, b.into());
+            (d.get_dictionary_mut(page).unwrap()).set("B", vec![Object::from(bead)]);
+        }
+        let root = d.trailer.get(b"Root").and_then(Object::as_reference);
+        (d.get_dictionary_mut(root.unwrap()).unwrap()).set("Threads", vec![thread.into()]);
+        let signed = p.snapshot().unwrap();
+        let mut p = Pdf::from_bytes(&signed, None).unwrap();
+        (p.doc.get_dictionary_mut(thread).unwrap()).set("Changed", true);
+        let found = changes_since(&signed, &p);
+        assert!(
+            !found
+                .iter()
+                .any(|f| matches!(f.0, ChangeKind::Malformed(_))),
+            "{found:?}"
+        );
+        let (limited, _) = budget_seam::with_limit(150_000, || changes_since(&signed, &p));
+        assert_eq!(limited, found);
     }
 }

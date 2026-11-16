@@ -662,8 +662,9 @@ The full record, with the files used, is in [Testing](developer/testing.md#digit
   a step, as is each change found for each page it shows on, and each comparison of two annotations written into a
   list directly (which the format doesn't allow), so a page or two with a couple of thousand of those is enough.
   Giving parts, each object in such an annotation is a step for each page sharing its list, so a thousand pages
-  sharing 500 of them of ten objects each is enough there. Documents written as the format says come nowhere near
-  these.
+  sharing 500 of them of ten objects each is enough there; an object shared by many pages costs each page after the
+  first a step for each of its references that page reached already, so a hundred pages sharing resources of 100
+  objects that each refer to the same 500 others is enough as well. Ordinary documents come nowhere near these.
 - Files that PDF apps read differently (something uses a part the file deletes or doesn't list, or the file is
   damaged) are shown as the PDF standard says, which other apps may not do. Their signatures show *can't check*
   even where another app calls them valid, and LimarePDF signs such a file only by writing it out in full first, which it

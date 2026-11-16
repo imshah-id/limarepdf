@@ -1583,7 +1583,19 @@ object once a version too, and walks the annotations written in place in a list 
 step for each object in them. A thousand pages sharing a list of 1,000 comments, one more added after signing:
 2,001,000 entries looked at before, at most 5,000 now (`roles_look_through_a_list_pages_share_once`); a hundred
 pages sharing 100 written in place: refused at a limit of 50,000
-(`annotations_in_a_shared_list_cost_steps_on_each_page`). Trust is in `trust.rs`: the trust list file (`trust.txt`
+(`annotations_in_a_shared_list_cost_steps_on_each_page`). Anything else it reaches it walks once for each kind of
+role it plays, a step, keeping what an object refers to for the other pages and annotations that reach it; handing
+it on to each of those is a step, or one for each reference in the object that one had reached already, if more. A
+thousand pages sharing resources that hold 1,000 numbers, changed after signing: 2,025,006 objects walked before, at
+most 50,000 now (`roles_walk_what_pages_share_once`); a page listing 1,000 arrays that each hold the same dictionary
+of 1,000 numbers: 2,007,026 before, at most 50,000 now (`parts_reached_through_many_arrays_are_walked_once`); a
+hundred pages sharing 100 objects that each refer to the same 100 others: refused at a limit of 100,000
+(`references_reached_again_cost_steps`); an array of 5,000 references to one object, reached from the form and then
+last of all from the catalog: refused at a limit of 2,000 (`references_reached_again_last_cost_steps`); a structure
+tree's parent tree listing an element once for each of its 5,000 marked pieces, reached by the catalog alone: a step,
+the same within 1,000 (`a_parent_tree_listing_an_element_again_costs_a_step`); an article thread through 300 pages
+still a step a bead a page (`a_thread_through_every_page_costs_a_step_a_bead`). Trust is in `trust.rs`: the trust
+list file (`trust.txt`
 in the settings folder, whose location `limarepdf_core::settings_dir` gives both the app and the command line), and
 the chain search from a signer's certificate to a trusted authority over the certificates the signature and the
 document's `/DSS` carry, with RFC 5280's checks at the signing time, including certificate policy processing; each
