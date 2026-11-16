@@ -278,17 +278,21 @@ fn extra_field(b: &[u8], kid: bool, extra: impl FnOnce(&mut Document) -> Diction
             add_annot(prev, new, w);
             w
         };
-        let r = root(prev);
-        let mut c = dict(prev, r);
-        // A file not yet signed may have no form.
-        let mut form = (c.get(b"AcroForm").and_then(Object::as_dict).cloned()).unwrap_or_default();
-        let mut fields =
-            (form.get(b"Fields").and_then(Object::as_array).cloned()).unwrap_or_default();
-        fields.push(top.into());
-        form.set("Fields", fields);
-        c.set("AcroForm", form);
-        new.set_object(r, Object::Dictionary(c));
+        list_field(prev, new, top);
     })
+}
+
+/// Field `top` listed last in the form's `/Fields`.
+fn list_field(prev: &Document, new: &mut Document, top: ObjectId) {
+    let r = root(prev);
+    let mut c = dict(prev, r);
+    // A file not yet signed may have no form.
+    let mut form = (c.get(b"AcroForm").and_then(Object::as_dict).cloned()).unwrap_or_default();
+    let mut fields = (form.get(b"Fields").and_then(Object::as_array).cloned()).unwrap_or_default();
+    fields.push(top.into());
+    form.set("Fields", fields);
+    c.set("AcroForm", form);
+    new.set_object(r, Object::Dictionary(c));
 }
 
 // ---------------------------------------------------------------- allowed changes
@@ -773,6 +777,49 @@ fn a_new_signature_field_s_actions_are_refused() {
             if got != want || report(&b).all_ok() {
                 wrong.push(format!("{what} after {after}: {got:?}"));
             }
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// A signature field added after signing with a text field of its own among its kids: the
+/// text field is a field added, which nothing allows, listed beside the signature field. It was
+/// reported as nothing before, the signature field's adding allowed after an approval or a
+/// certification allowing signing.
+#[test]
+fn a_field_inside_a_new_signature_field_is_refused() {
+    let held = ChangeKind::FieldAdded("Extra.Text".into());
+    let held = (held, Some(Refusal::Never));
+    let signed = [
+        (approve(&base_pdf()), "an approval"),
+        (certify(&base_pdf(), 2), "P2"),
+        (certify(&base_pdf(), 1), "P1"),
+    ];
+    let mut wrong = Vec::new();
+    for (signed, after) in signed {
+        let b = edit(&signed, |prev, new| {
+            let top = new.new_object_id();
+            let w = new.add_object(dictionary! {
+                "Type" => "Annot", "Subtype" => "Widget", "P" => page(prev), "Parent" => top,
+                "Rect" => vec![Object::from(0); 4],
+            });
+            let t = new.add_object(dictionary! {
+                "Type" => "Annot", "Subtype" => "Widget", "P" => page(prev), "Parent" => top,
+                "Rect" => vec![Object::from(0); 4],
+                "FT" => "Tx", "T" => Object::string_literal("Text"),
+            });
+            add_annot(prev, new, w);
+            add_annot(prev, new, t);
+            let kids = vec![Object::from(w), t.into()];
+            let field = dictionary! {
+                "FT" => "Sig", "T" => Object::string_literal("Extra"), "Kids" => kids,
+            };
+            new.set_object(top, Object::Dictionary(field));
+            list_field(prev, new, top);
+        });
+        let got = changes(&b);
+        if !got.contains(&held) || report(&b).all_ok() {
+            wrong.push(format!("after {after}: {got:?}"));
         }
     }
     assert!(wrong.is_empty(), "{wrong:#?}");

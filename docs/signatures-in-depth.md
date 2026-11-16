@@ -592,7 +592,8 @@ is refused for the action, even where adding the field is allowed: the field is 
 action. Signing in a field counts as signing only when LimarePDF lists that signature, since nothing else checks it:
 one it doesn't list (in a field nested more than 32 levels deep, say, or on one of a field's widgets rather than the
 field itself) is refused as a signature it can't check. A form field moved into a signature field or out of one,
-moved under another field, or renamed by a change to a field above it is refused too.
+moved under another field, or renamed by a change to a field above it is refused too, and so is a signature field
+added with a field of another kind inside it (a text field, say), as nothing would judge filling it in.
 
 LimarePDF reads the later additions with its own strict reader rather than the lenient one it uses to open files, and
 refuses as malformed:

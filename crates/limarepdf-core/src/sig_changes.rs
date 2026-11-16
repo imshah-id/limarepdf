@@ -2546,6 +2546,15 @@ impl<'a> Judge<'a> {
                     None if f.sig => {
                         // The whole new field: whether anything in it is signed, shows or acts.
                         let tree = added.get(id).map(Vec::as_slice).unwrap_or_default();
+                        let nr = self.nr;
+                        let sig = |p: Option<ObjectId>| {
+                            p.and_then(|p| nr.fields.get(&p)).is_some_and(|p| p.sig)
+                        };
+                        for (_, n) in tree.iter().filter(|(_, n)| !n.sig && sig(n.parent)) {
+                            // A field of another kind inside it, which nothing would judge
+                            // filling in.
+                            self.push(never(ChangeKind::FieldAdded(n.name.clone()), None));
+                        }
                         let visible = tree.iter().any(|(_, f)| f.visible);
                         if let Some((i, _)) = tree.iter().find(|(i, _)| self.acts(**i)) {
                             let page = self.nr.annots.get(*i).copied();
