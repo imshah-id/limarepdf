@@ -382,9 +382,10 @@ impl Pdf {
 
     /// Every redaction mark, on each page that lists it, without [`MAX_ANNOTS`], placed by
     /// `place`: a mark several pages list is applied on each. Each list's entries are looked
-    /// at once however many pages share it, within the reading budget ([`Place::look`]),
-    /// and only marks are built; a page whose list was looked at before is charged a step
-    /// for each of its marks, each placed there again. None is built once `place` is done.
+    /// at once however many pages share it, or times the page tree lists a page writing it
+    /// in, within the reading budget ([`Place::look`]), and only marks are built; a page
+    /// whose list was looked at before is charged a step for each of its marks, each placed
+    /// there again. None is built once `place` is done.
     pub(crate) fn every_mark(&self, place: &mut Place) -> Vec<Annot> {
         let mut layers = self.layers_off();
         let mut found: HashMap<ObjectId, Rc<[ObjectId]>> = HashMap::new();
@@ -393,7 +394,7 @@ impl Pdf {
             let Some((at, list)) = self.annots_at(page) else {
                 continue;
             };
-            let marks = match at.and_then(|at| found.get(&at)) {
+            let marks = match found.get(&at.unwrap_or(page)) {
                 Some(marks) => {
                     place.look(marks.len());
                     marks.clone()
@@ -410,9 +411,7 @@ impl Pdf {
                             })
                         })
                         .collect();
-                    if let Some(at) = at {
-                        found.insert(at, marks.clone());
-                    }
+                    found.insert(at.unwrap_or(page), marks.clone());
                     marks
                 }
             };
@@ -767,7 +766,8 @@ impl Pdf {
     /// The `/Annots` arrays of `pages`, each once however many of them share it, with the
     /// index in `pages` of the first that lists it and its object: for passes over every
     /// page's annotations, which would otherwise read a list once a page sharing it. One a
-    /// page writes in is its alone.
+    /// page writes in is its alone, read once however many times the page tree lists the
+    /// page.
     pub(crate) fn each_annots<'a>(
         &'a self,
         pages: &'a [ObjectId],
@@ -775,7 +775,7 @@ impl Pdf {
         let mut seen = HashSet::new();
         (pages.iter().enumerate()).filter_map(move |(i, &page)| {
             let (at, list) = self.annots_at(page)?;
-            if at.is_some_and(|at| !seen.insert(at)) {
+            if !seen.insert(at.unwrap_or(page)) {
                 return None;
             }
             #[cfg(test)]
@@ -1154,6 +1154,48 @@ mod tests {
             }),
         ];
         assert_eq!(got, [(0, true); 6]);
+    }
+
+    /// One page the page tree lists `n` times, writing in its own `/Annots` array of `k`
+    /// squares without a drawing, the first made a redaction mark.
+    fn listed_many_times(n: usize, k: usize) -> Pdf {
+        let (mut p, first) = sharing_annots(1, k);
+        let d = p.doc.get_dictionary_mut(first).unwrap();
+        d.set("Subtype", "Redact");
+        let page = p.page_ids()[0];
+        let list = p.annots_array(page).unwrap().to_vec();
+        let d = p.doc.get_dictionary_mut(page).unwrap();
+        d.set("Annots", list);
+        let tree = d.get(b"Parent").and_then(Object::as_reference).unwrap();
+        let t = p.doc.get_dictionary_mut(tree).unwrap();
+        t.set("Kids", vec![Object::from(page); n]);
+        t.set("Count", n as i64);
+        assert_eq!(p.page_count(), n);
+        p
+    }
+
+    /// A page the page tree lists many times has the `/Annots` array it writes in read once
+    /// a pass, as pages sharing one array do: listing the annotations, counting the marks and
+    /// finding them read no more of it with the page listed 1,000 times than twice. Each
+    /// time the page is listed still shows the mark.
+    #[test]
+    fn a_page_listed_many_times_has_its_annotations_read_once_a_pass() {
+        let read = |n, f: &dyn Fn(&Pdf) -> bool| {
+            let p = listed_many_times(n, 1_000);
+            ENTRIES_READ.set(0);
+            let worked = f(&p);
+            (ENTRIES_READ.get(), worked)
+        };
+        let past_two = |f: &dyn Fn(&Pdf) -> bool| {
+            let ((two, _), (many, worked)) = (read(2, f), read(1_000, f));
+            (many.saturating_sub(two), worked)
+        };
+        let got = [
+            past_two(&|p| p.annotations().len() == 1_000),
+            past_two(&|p| p.redaction_mark_count() == 1),
+            past_two(&|p| p.redaction_marks().is_ok_and(|m| m.len() == p.page_count())),
+        ];
+        assert_eq!(got, [(0, true); 3]);
     }
 
     /// Printing or flattening pages that share their annotations draws each once: 100 pages

@@ -1395,9 +1395,10 @@ areas unknown), never changed: a double-click doesn't open one for typing (`writ
 Delete. Changing one reads it alone (`Pdf::annotation`, as the listings list it but within budgets of its own,
 as the app does to type in a comment), so `change_annotation` refuses only when that one alone is past the
 budget, rather than write what is shown over its text. Deleting one (`Pdf::remove_annotation`, from the Comments
-view or the page) reads no other annotation. The listings read each page's list once however many pages share it
-(`each_annots`), and list each annotation once, on the first page that lists it: the Comments view and `annot
-list` give it one card or line, under that page, and each page still shows it (`page_annotations`).
+view or the page) reads no other annotation. The listings read each page's list once however many pages share it,
+or times the page tree lists a page that writes its list in (`each_annots`, keyed by the list's object or else the
+page's), and list each annotation once, on the first page that lists it: the Comments view and `annot list` give it
+one card or line, under that page, and each page still shows it (`page_annotations`).
 `annotation_ids_on` gives what some pages list, for the Comments view's This page and `annot list --pages` and
 `annot remove --pages`, so one that pages 2 and 3 both list is chosen by either. Before, P pages sharing a list of
 N entries built P × min(N, 10,000) entries, each about 330 B even unread. What removes information reads every
