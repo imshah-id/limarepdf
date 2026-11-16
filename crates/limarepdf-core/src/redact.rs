@@ -1223,10 +1223,11 @@ impl Pdf {
     }
 
     /// The areas the document's redaction marks cover: (page, box in displayed-page
-    /// points, y down), one per marked area. Every mark counts, not only those shown. Marks
-    /// are placed as [`Pdf::annotations`] places them.
+    /// points, y down), one per marked area. Every mark counts, not only those shown, on
+    /// each page that lists it. Marks are placed and read as [`Pdf::annotations`] places
+    /// and reads them.
     pub fn redaction_marks(&self) -> Vec<(usize, [f32; 4])> {
-        marks_of(self.every_annotation(&mut Place::drawn()))
+        marks_of(self.every_mark(&mut Place::drawn()))
     }
 
     /// Apply the document's redaction marks: remove everything under them as
@@ -1236,8 +1237,8 @@ impl Pdf {
     pub fn apply_redactions(&mut self) -> Result<RedactReport> {
         self.atomically(|p| {
             p.own_direct_annots()?;
-            let mut place = Place::drawn();
-            let marks = marks_of(p.every_annotation(&mut place));
+            let mut place = Place::drawn().stopping();
+            let marks = marks_of(p.every_mark(&mut place));
             place.whole()?;
             if marks.is_empty() {
                 bail!("the document has no redaction marks");
@@ -1677,8 +1678,9 @@ impl Pdf {
 
     /// Look for the removed text, and the alternative text `alts` taken off, elsewhere: on
     /// any page, in the alternative text of what the pages draw (`reach`, a walk after the
-    /// change), in bookmarks, comments, form fields and the document information. Refused
-    /// when the comments are too many or too long to read ([`crate::TooComplex`]).
+    /// change), in bookmarks, comments (each named by the first page that lists it), form
+    /// fields and the document information. Refused when the comments are too many or too
+    /// long to read ([`crate::TooComplex`]), none read past that.
     fn find_elsewhere(
         &self,
         report: &RedactReport,
@@ -1719,7 +1721,7 @@ impl Pdf {
                 fold(&b.title),
             ));
         }
-        let mut place = Place::own();
+        let mut place = Place::own().stopping();
         for a in self.every_annotation(&mut place) {
             let all = format!("{} {} {}", a.contents, a.author, a.subject);
             other.push((format!("a comment on page {}", a.page + 1), fold(&all)));

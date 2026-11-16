@@ -451,7 +451,7 @@ fn removing_takes_replies_and_popups_too() {
         dictionary! {},
     );
     add(&mut p, 0, "Link", [0.0, 0.0, 10.0, 10.0], dictionary! {});
-    let n = p.remove_annotations(|a| a.id == note).unwrap();
+    let n = p.remove_annotations(None, |a| a.id == note).unwrap();
     assert_eq!(n, 2);
     let left = p.annotations();
     assert_eq!(left.len(), 1);
@@ -460,11 +460,11 @@ fn removing_takes_replies_and_popups_too() {
     let annots = p.doc.get_dictionary(pg).unwrap().get(b"Annots").unwrap();
     assert_eq!(annots.as_array().unwrap().len(), 2, "square and link stay");
     assert_eq!(
-        p.remove_annotations(|a| a.kind == AnnotKind::Square)
+        p.remove_annotations(None, |a| a.kind == AnnotKind::Square)
             .unwrap(),
         1
     );
-    assert_eq!(p.remove_annotations(|_| true).unwrap(), 0);
+    assert_eq!(p.remove_annotations(None, |_| true).unwrap(), 0);
 }
 
 #[test]
@@ -1678,7 +1678,7 @@ fn replies_are_listed_but_not_drawn() {
     assert_eq!(ink(&mut p, [0, 0, 300, 200]), before, "nothing more drawn");
     assert!(p.add_reply(note, "  ", "").is_err());
     // Deleting what it answers takes the reply too.
-    assert_eq!(p.remove_annotations(|a| a.id == note).unwrap(), 2);
+    assert_eq!(p.remove_annotations(None, |a| a.id == note).unwrap(), 2);
 }
 
 /// Batch 42 (ENH-40): the pages comments are on, found by the pages listing them: draft
@@ -1694,7 +1694,7 @@ fn annotations_are_found_by_the_pages_listing_them() {
     assert_eq!(pages(&p), [Some(1), Some(0), None]);
     p.reorder(&[1, 0]).unwrap();
     assert_eq!(pages(&p), [Some(0), Some(1), None]);
-    p.remove_annotations(|a| a.id == first).unwrap();
+    p.remove_annotations(None, |a| a.id == first).unwrap();
     assert_eq!(pages(&p), [Some(0), None, None]);
 }
 

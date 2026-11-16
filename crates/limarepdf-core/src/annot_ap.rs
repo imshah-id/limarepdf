@@ -111,12 +111,13 @@ pub(crate) fn work() -> Work {
 
 /// What reading listed annotations is called when its budget refuses it.
 const READING: &str = "reading the annotations";
-/// The steps reading listed annotations may take ([`Place::read`]): 64 for each
-/// annotation, one for each point and ink stroke read and each byte of text (a stream's as
-/// drawing charges it). Annotations can share their points and text, which each reads
-/// again, so the steps count everything read, however often. 2²⁴: 2,295 times the most
-/// the render corpus's annotations take (7,310, `pdfjs/issue12579.pdf`), read in at most
-/// about 1 s (architecture.md, after `annot_rect`).
+/// The steps reading listed annotations may take ([`Place::read`]): one for each entry of a
+/// page's `/Annots` a listing looks at ([`Place::look`]), 64 for each annotation, one for
+/// each point and ink stroke read and each byte of text (a stream's as drawing charges it).
+/// Annotations can share their points and text, which each reads again, so the steps count
+/// everything read, however often. 2²⁴: 2,242 times the most the render corpus's
+/// annotations take (7,480, `pdfjs/issue12579.pdf`), read in at most about 1 s
+/// (architecture.md, after `annot_rect`).
 const READ_STEPS: u64 = 1 << 24;
 /// The steps reading an annotation takes before its points and text.
 const READ_EACH: u64 = 64;
@@ -129,10 +130,12 @@ pub(crate) struct Place {
     work: Option<Work>,
     /// The budget's refusal, once it is spent.
     spent: Option<TooComplex>,
-    /// The budget for reading them, made when the first is read.
+    /// The budget for reading them, made when the first entry is looked at.
     read: Option<Work>,
     /// The reading budget's refusal, once it is spent.
     unread: Option<TooComplex>,
+    /// None is built past a refusal ([`Place::done`]).
+    stop: bool,
 }
 
 impl Place {
@@ -143,6 +146,7 @@ impl Place {
             spent: None,
             read: None,
             unread: None,
+            stop: false,
         }
     }
 
@@ -153,7 +157,32 @@ impl Place {
             spent: None,
             read: None,
             unread: None,
+            stop: false,
         }
+    }
+
+    /// As this, building none past the first refusal of either budget: for passes
+    /// [`Place::whole`] refuses then, which would build the rest for nothing.
+    pub(crate) fn stopping(self) -> Place {
+        Place { stop: true, ..self }
+    }
+
+    /// Stopping, and past a refusal: build no more.
+    pub(crate) fn done(&self) -> bool {
+        self.stop && (self.spent.is_some() || self.unread.is_some())
+    }
+
+    /// Looking at `n` entries of a page's `/Annots` charged to the reading budget, a step
+    /// each, before they are looked at: once it is spent, none after them is read.
+    pub(crate) fn look(&mut self, n: usize) {
+        if self.unread.is_none() {
+            self.unread = self.reading().take(n as u64).err();
+        }
+    }
+
+    /// The reading budget.
+    fn reading(&mut self) -> &mut Work {
+        (self.read).get_or_insert_with(|| Work::new(READING, budget::limit(READ_STEPS)))
     }
 
     /// `f` reading an annotation's points and text within the budget: `None` once it is
@@ -165,7 +194,7 @@ impl Place {
         if self.unread.is_some() {
             return None;
         }
-        let work = (self.read).get_or_insert_with(|| Work::new(READING, budget::limit(READ_STEPS)));
+        let work = self.reading();
         match work.take(READ_EACH).and_then(|()| f(work)) {
             Ok(t) => Some(t),
             Err(e) => {

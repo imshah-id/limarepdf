@@ -133,6 +133,8 @@ impl Tab {
             r.read_at = self.revision;
         }
         let list = self.comments.as_ref().map_or(&[][..], |(_, l)| l);
+        // Those the page being read lists, one listed on an earlier page that does too among them.
+        let on = (now.page).map(|p| self.pdf.annotation_ids_on(&[p]).unwrap_or_default());
         let all = thread_order(list);
         let mut order = Vec::with_capacity(all.len());
         let mut k = 0;
@@ -144,7 +146,7 @@ impl Tab {
             let a = &list[all[k].0];
             let passes = !now.kinds.contains(&a.label())
                 && !now.authors.contains(&author_name(a))
-                && now.page.is_none_or(|p| p == a.page);
+                && on.as_ref().is_none_or(|on| on.contains(&a.id));
             let found = now.query.is_empty()
                 || all[k..end].iter().any(|&(i, _)| {
                     let b = &list[i];
@@ -683,8 +685,9 @@ impl Tab {
 
     /// Previous or Next comment: the card before or after the selected one, as the Comments
     /// view lists them with its filter and search, selected with its mark shown; from
-    /// nothing selected, the first on or after the page being read, or the last on or
-    /// before it. What to say when there is none.
+    /// nothing selected, the first on or after the page being read (one listed on an earlier
+    /// page that it lists too among those on it), or the last on or before it. What to say
+    /// when there is none.
     pub fn step_comment(&mut self, forward: bool) -> Option<&'static str> {
         let order = self.shown_order();
         if order.is_empty() {
@@ -710,8 +713,10 @@ impl Tab {
             }
             None => {
                 let page = self.current;
+                let on = self.pdf.annotation_ids_on(&[page]).unwrap_or_default();
                 let next = match forward {
-                    true => order.iter().find(|&&(i, _)| list[i].page >= page),
+                    true => (order.iter())
+                        .find(|&&(i, _)| list[i].page >= page || on.contains(&list[i].id)),
                     false => order.iter().rev().find(|&&(i, _)| list[i].page <= page),
                 };
                 match (next, forward) {

@@ -1,5 +1,6 @@
 //! `limarepdf-cli annot` past the budget for reading the annotations (WP-04): `annot list`
-//! lists the rest marked too large to show, and `annot remove` refuses, writing nothing.
+//! lists the rest marked too large to show, and `annot remove` refuses, writing nothing. An
+//! annotation several pages list is listed once, and chosen by `--pages` naming any of them.
 
 use limarepdf_core::{budget_seam, Pdf};
 use std::path::{Path, PathBuf};
@@ -85,4 +86,42 @@ fn removing_annotations_past_the_reading_budget_is_refused() {
         );
         assert!(!dir.join("out.pdf").exists(), "{pick:?} wrote");
     }
+}
+
+/// A note pages 2 and 3 list, the third sharing the second's `/Annots`: listed once, on page
+/// 2, whichever of them `--pages` names, and removed by `--pages 3`.
+#[test]
+fn a_note_two_pages_list_is_listed_once_and_chosen_by_either() {
+    let dir = folder("annotations-shared");
+    let mut pdf = Pdf::new();
+    for i in 0..3 {
+        pdf.insert_blank(i, 400.0, 400.0).unwrap();
+    }
+    pdf.add_note(1, (100.0, 100.0), [1.0, 1.0, 0.0], "Walrus one", "Tester")
+        .unwrap();
+    let ids = pdf.page_ids();
+    let page = pdf.doc.get_dictionary(ids[1]).unwrap();
+    let list = page.get(b"Annots").unwrap();
+    let list = pdf.doc.dereference(list).unwrap().1.clone();
+    let list = pdf.doc.add_object(list);
+    for &page in &ids[1..] {
+        let page = pdf.doc.get_dictionary_mut(page).unwrap();
+        page.set("Annots", list);
+    }
+    std::fs::write(dir.join("in.pdf"), pdf.to_bytes().unwrap()).unwrap();
+    for (pages, on) in [("1-3", &[2][..]), ("2", &[2]), ("3", &[2]), ("1", &[])] {
+        let args = ["annot", "list", "in.pdf", "--json", "--pages", pages];
+        let out = run(&dir, u64::MAX, &args);
+        assert!(out.status.success(), "{out:?}");
+        let rows: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        let rows = rows.as_array().unwrap();
+        let listed: Vec<_> = rows.iter().filter_map(|r| r["page"].as_u64()).collect();
+        assert_eq!(listed, on, "--pages {pages}");
+    }
+    let args = ["annot", "remove", "in.pdf", "-o", "out.pdf", "--pages", "3"];
+    let out = run(&dir, u64::MAX, &args);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.starts_with("removed 1 annotation(s)"), "{out:?}");
+    let left = Pdf::open(dir.join("out.pdf"), None).unwrap();
+    assert!(left.annotations().is_empty());
 }

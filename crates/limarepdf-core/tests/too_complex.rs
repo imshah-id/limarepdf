@@ -815,8 +815,9 @@ fn a_text_box_s_style_is_read_once_and_listed_as_drawn() {
     annotate(&mut p, d);
     let (listed, taken) = budget_seam::with_limit(u64::MAX, || p.annotations());
     let colour = listed[0].text_style.map(|s| s.color);
-    // Drawing none; reading 64 for the annotation, then its `/DA`, `/DS` and text.
-    let read = vec![0, 64 + 1_000 + ds.len() as u64 + 5];
+    // Drawing none; reading one for its entry in `/Annots`, 64 for the annotation, then its
+    // `/DA`, `/DS` and text.
+    let read = vec![0, 1 + 64 + 1_000 + ds.len() as u64 + 5];
     assert_eq!((colour, taken), (Some([1.0, 0.0, 0.0]), read));
 }
 
@@ -946,14 +947,15 @@ fn removing_annotations_past_the_reading_budget_is_refused() {
     list.insert(0, Object::Dictionary(note));
     pd.set("Annots", list);
     let before = p.state_before();
-    let (e, _) =
-        budget_seam::with_limit(200_000, || p.remove_annotations(|a| a.author == "Someone"));
+    let (e, _) = budget_seam::with_limit(200_000, || {
+        p.remove_annotations(None, |a| a.author == "Someone")
+    });
     let e = e.expect_err("refused");
     let too = e.downcast_ref::<TooComplex>().expect("too complex");
     assert_eq!(too.what, "reading the annotations", "{e:#}");
     assert_eq!(p.state_since(&before), []);
     let (done, _) = budget_seam::with_limit(2_000_000, || {
-        p.remove_annotations(|a| a.contents == long_text())
+        p.remove_annotations(None, |a| a.contents == long_text())
     });
     assert_eq!(done.unwrap(), 20);
 }
@@ -973,7 +975,8 @@ fn an_annotation_past_the_reading_budget_is_deleted_by_itself() {
         "IRT" => Object::Reference(last.id),
     };
     annotate(&mut p, reply);
-    let (e, _) = budget_seam::with_limit(200_000, || p.remove_annotations(|a| a.id == last.id));
+    let (e, _) =
+        budget_seam::with_limit(200_000, || p.remove_annotations(None, |a| a.id == last.id));
     assert!(e.is_err());
     let (done, _) = budget_seam::with_limit(200_000, || p.remove_annotation(last.id));
     assert_eq!(done.unwrap(), 2);

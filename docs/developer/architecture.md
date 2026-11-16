@@ -1283,8 +1283,8 @@ pen strokes smoothed into curves, typed names as the glyph outlines of a bundled
 flattens just those annotations, after looking at every page without changing it (`Pdf::plan_page`), so an item
 it can't place (no `/Rect`, or no drawing with a box) is refused with nothing changed, not removed undrawn
 (PB-112). Counting and locking them (`Pdf::sign_items`, `lock_sign_items`) walk every
-annotation a page lists (`all_annot_refs`, PB-02), not the 10,000 the app shows, as removal does; so does
-finding an annotation's page when it has no `/P` (`annot_page`). The app's saved signatures and the Create
+annotation the pages list (`listed_annots`, each list once however many pages share it; PB-02), not the 10,000 the
+app shows, as removal does; so does finding an annotation's page when it has no `/P` (`annot_page`). The app's saved signatures and the Create
 signature window are in `crates/limarepdf-gui/src/signing.rs`; every preview button is a white card that the
 preview's paper fills (`paper_button`, PB-09), with a 2-point outline always drawn (clear, the border colour
 under the pointer from the last frame's response, the accent when chosen), as a white fill hides the flat
@@ -1382,8 +1382,9 @@ most 2.1 s (long text boxes shown), the drawings save in at most 2 s, and the mo
 the limit (13 s to draw, 109 s to compress when saved); 64 steps an annotation let 207,000 tiny text boxes take
 1.5 GiB; and one step a byte of text set let short ones take 4.5 s to show.
 
-Reading the listed annotations has a budget of its own (`annot_ap::READ_STEPS`, `Place::read`; WP-04): 64 steps
-for each annotation (`READ_EACH`), one for each point and ink stroke read and each byte of text (its comment,
+Reading the listed annotations has a budget of its own (`annot_ap::READ_STEPS`, `Place::read`; WP-04): one step
+for each entry of a page's `/Annots` a listing looks at (`Place::look`, the list charged before any is looked at),
+64 for each annotation (`READ_EACH`), one for each point and ink stroke read and each byte of text (its comment,
 author, subject and name, and a text box's `/DA` and `/DS`, read once for its style by `box_geometry`, as it is
 drawn: a text box whose colour is only in `/DS` is listed in that colour, where only `/DA` was read before). Past
 it, the listings list the rest `Annot::unread`: their date, flags, colour, opacity, box and what they reply to are
@@ -1394,17 +1395,25 @@ areas unknown), never changed: a double-click doesn't open one for typing (`writ
 Delete. Changing one reads it alone (`Pdf::annotation`, as the listings list it but within budgets of its own,
 as the app does to type in a comment), so `change_annotation` refuses only when that one alone is past the
 budget, rather than write what is shown over its text. Deleting one (`Pdf::remove_annotation`, from the Comments
-view or the page) reads no other annotation. What removes
-information reads every annotation and refuses past the budget (`Place::whole`): `remove_annotations` (`annot
-remove`, choosing by author), applying redaction (the marks' areas) and its search for the removed text in the
-comments (`find_elsewhere`). What needs only what each annotation is reads nothing more (`Place::kinds`):
-sanitising's comments and attachments, and the marks applying redaction removes. `annot list` marks one "too
-large to show" (`"unread": true` in JSON). `READ_STEPS` is 2²⁴: 2,295 times the corpus maximum, 7,310 steps
-(`pdfjs/issue12579.pdf`, 85 annotations; the 1,086 files that open, measured 2026-11-15 with the budget lifted).
-Timed in an optimised build (the `ci-test` profile) on made-up pages just under the limit, ink strokes sharing
-their points are the dearest: listed in 0.8 s and removed in 1.0 s (0.05 µs a step). 262,144 annotations with
-nothing to read are listed in 0.3 s and removed in 0.7 s, and 250,406 short notes use 745 MiB, the document
-included; every other case takes at most 0.5 s.
+view or the page) reads no other annotation. The listings read each page's list once however many pages share it
+(`each_annots`), and list each annotation once, on the first page that lists it: the Comments view and `annot
+list` give it one card or line, under that page, and each page still shows it (`page_annotations`).
+`annotation_ids_on` gives what some pages list, for the Comments view's This page and `annot list --pages` and
+`annot remove --pages`, so one that pages 2 and 3 both list is chosen by either. Before, P pages sharing a list of
+N entries built P × min(N, 10,000) entries, each about 330 B even unread. What removes information reads every
+annotation and refuses past the budget (`Place::whole`), building none past the first refusal (`Place::stopping`,
+`Place::done`): `remove_annotations` (`annot remove`, choosing by author), applying redaction (the marks' areas)
+and its search for the removed text in the comments (`find_elsewhere`). The marks (`every_mark`, for applying,
+the marks banner and the warning before saving) are found by kind in each page's list, looked through once however
+many pages share it, and only they are built; the banner's count reads on past a refusal, one past it at its own
+`/Rect`, so no mark goes uncounted. What needs only what each annotation is picks ids by kind, building no entry
+(`annotations_of_kind`): sanitising's comments and attachments, and the marks applying redaction removes. `annot
+list` marks one "too large to show" (`"unread": true` in JSON). `READ_STEPS` is 2²⁴: 2,242 times the corpus
+maximum, 7,480 steps (`pdfjs/issue12579.pdf`, 85 annotations; the 1,086 files that open, measured 2026-11-15 with
+the budget lifted). Timed in an optimised build (the `ci-test` profile) on made-up pages just under the limit, ink
+strokes sharing their points are the dearest: listed in 0.7 s and removed in 0.9 s (0.04 µs a step). 258,111
+annotations with nothing to read are removed in 0.8 s and 246,723 short notes in 0.7 s (the listings list at most
+10,000 a page); every other case takes at most 0.6 s, and twice the limit is refused within 1.1 s.
 
 Links (ENH-17) are `links.rs`, kept apart from comments: `AnnotKind::of` leaves them out, so they are never in
 the Comments view or `Pdf::annotations`. `Pdf::page_links` reads every link of a page with an area: its id
@@ -2143,9 +2152,9 @@ every file a command reads besides the document (a picture, a password file, for
 certificate, the digital ID used) and refuses an output that is one of them (PB-139). The contract, its tests and
 limits: [contracts](contracts.md#file-identity-and-destinations).
 
-Listing annotations (`Pdf::annotations`, and `every_annotation` for the redaction marks counted after every change
-and before every save) passes each page's id to `annotations_in`; looked up by number (`page_id_at`, which builds
-the page list) it went through the page tree once a page, 63 ms on 300 pages (batch 37).
+Listing annotations (`Pdf::annotations`, and `every_mark` for the redaction marks counted after every change and
+before every save) takes the pages' ids from one list (`placed_pages`); looked up by number (`page_id_at`, which
+builds the page list) it went through the page tree once a page, 63 ms on 300 pages (batch 37).
 
 Crash recovery copies are kept by `crates/limarepdf-gui/src/recovery.rs`, in a private
 per-user state folder with one subfolder per running app, which holds a locked `lock` file while the app runs. A tab's

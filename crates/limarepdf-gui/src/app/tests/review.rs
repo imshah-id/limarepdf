@@ -698,6 +698,36 @@ fn the_filter_shows_comments_by_type_author_and_page() {
     assert_eq!(count(&tree).as_deref(), Some("3 of 5 comments"));
 }
 
+/// A comment two pages list, the second sharing the first's `/Annots`, is listed once, on
+/// the first, and This page shows it on either: on the second as one that page lists, which
+/// Next goes to from nothing selected there.
+#[test]
+fn this_page_shows_a_comment_an_earlier_page_also_lists() {
+    let ctx = test_ctx();
+    let ty = Typist::new(&ctx);
+    let mut pdf = blank(2);
+    let one = note(&mut pdf, 0, 100.0, "Walrus one", "Tester");
+    let ids = pdf.page_ids();
+    let page = pdf.doc.get_dictionary(ids[0]).unwrap();
+    let list = page.get(b"Annots").unwrap();
+    let list = pdf.doc.dereference(list).unwrap().1.clone();
+    let list = pdf.doc.add_object(list);
+    for page in ids {
+        let page = pdf.doc.get_dictionary_mut(page).unwrap();
+        page.set("Annots", list);
+    }
+    let mut app = comments_tab(&ty, pdf);
+    let tree = calm(&mut app, &ty);
+    assert_eq!(listed(&tree), ["Walrus one"], "listed once");
+    app.tabs[0].go_to(1);
+    open_filter(&mut app, &ty);
+    let tree = tick(&mut app, &ty, "This page", Role::RadioButton);
+    assert_eq!(listed(&tree), ["Walrus one"], "This page");
+    close_filter(&mut app, &ty);
+    let said = run(&mut app, &ty, Act::NextComment);
+    assert_eq!((said, chosen(&app)), (None, Some(one)), "Next from nothing");
+}
+
 /// PB-41: the search box's hint is whole at the side panel's width, beside Filter: it is
 /// "Search" alone, as the box is in the Comments view; a screen reader still hears "Search
 /// comments".

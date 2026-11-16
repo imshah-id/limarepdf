@@ -310,7 +310,7 @@ fn a_reply_past_those_shown_goes_with_its_comment() {
     }
     set_annots(&mut p, list);
 
-    assert_eq!(p.remove_annotations(|a| a.id == gone).unwrap(), 2);
+    assert_eq!(p.remove_annotations(None, |a| a.id == gone).unwrap(), 2);
     let s = Saved::of(&mut p);
     s.assert_gone(&["MARKER-GONE"]);
     s.assert_kept(&["MARKER-OTHER", "MARKER-OTHER-REPLY"]);

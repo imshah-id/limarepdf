@@ -1253,7 +1253,8 @@ fn a_deleted_comment_stays_deleted_without_being_written_again() {
     let a = save(&s, note);
     let mut p = Pdf::from_bytes(&a.bytes, None).unwrap();
     assert_eq!(
-        p.remove_annotations(|x| x.kind == AnnotKind::Note).unwrap(),
+        p.remove_annotations(None, |x| x.kind == AnnotKind::Note)
+            .unwrap(),
         1
     );
     let b = append_edits(&a.bytes, &p).unwrap();
