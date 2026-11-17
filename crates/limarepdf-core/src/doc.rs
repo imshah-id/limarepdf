@@ -96,6 +96,9 @@ const PAGES_MENDED: &str = "its list of pages is damaged, and LimarePDF rebuilt 
 /// Why a document is refused when no pages can be found in it.
 const NO_PAGES: &str =
     "LimarePDF can't find any pages in it (there are no pages, or the file is damaged)";
+/// Why a document is refused when its page tree is too damaged to mend.
+const PAGES_TOO_COMPLEX: &str =
+    "its list of pages is damaged in a way too complex for LimarePDF to rebuild";
 
 /// Document information dictionary fields.
 #[derive(Default, Clone, Debug, PartialEq, Eq)]
@@ -169,6 +172,7 @@ impl Pdf {
         };
         // The page tree is mended in the rebuilt file rather than in lopdf's reading, so that
         // the pages' content is found too when the table's offsets are wrong.
+        let mut too_complex = false;
         let repaired = rebuilt.and_then(|mut p| {
             crate::repair::unpack_object_streams(&mut p.doc);
             // The trailers may name no catalog, or the wrong object.
@@ -177,8 +181,16 @@ impl Pdf {
                 p.doc.trailer.set("Root", root);
             }
             let mut why = REPAIRED;
-            if p.page_count() == 0 && crate::repair::mend_page_tree(&mut p.doc, bytes) {
-                why = PAGES_MENDED;
+            if p.page_count() == 0 {
+                match crate::repair::mend_page_tree(&mut p.doc, bytes) {
+                    Ok(true) => why = PAGES_MENDED,
+                    Ok(false) => {}
+                    // Part mended: not a document to open.
+                    Err(_) => {
+                        too_complex = true;
+                        return None;
+                    }
+                }
             }
             (p.page_count() > 0).then_some((p, why))
         });
@@ -186,6 +198,7 @@ impl Pdf {
             Some(r) => r,
             // lopdf's own rebuild.
             None if pages > 0 => (opened.map_err(cannot_open)?, REPAIRED),
+            None if too_complex => bail!("cannot open PDF: {PAGES_TOO_COMPLEX}"),
             // Rather than an empty document, which other readers wouldn't show either.
             None => {
                 opened.map_err(cannot_open)?;

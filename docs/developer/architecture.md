@@ -1224,10 +1224,15 @@ loop so names come out as `sig_changes` gives them), and a widget more than one 
 (`Walk::claimed`; it went to each before); a node of no kind (`field_kind`) is no field and takes neither the list
 nor a widget, so the field listing them after it still does
 (`flattening_draws_a_value_whose_widget_a_node_of_no_kind_lists`); `value_nodes` passes over it. `repair.rs`'s
-`mend_page_tree` mends such a list once, into one new object the nodes sharing it all take, so a page written there
-is a kid of the first node's, and reads the bytes' object headers once (`object_lines`) for the kids that aren't page nodes
+`mend_page_tree` queues the kids such a list gives by reference again only from a node nearer the top, so at most
+once a depth; each node takes its own copy of a list with pages written in it, so that each has pages of its own,
+inheriting from it (sharing one copy left lopdf, which reads no more of a page list than the file has objects,
+short of pages), and a file whose copies would take more than `MAX_SHARED_KIDS_COPIES` (64 MiB) is refused. It
+reads the bytes' object headers once (`object_lines`) for the kids that aren't page nodes
 (`fields_sharing_their_kids_are_walked_once`, `widgets_shared_by_fields_go_to_the_first`,
-`page_tree_nodes_sharing_their_kids_are_mended_once`, `kids_that_are_no_page_are_looked_for_in_one_pass`).
+`page_tree_nodes_sharing_their_kids_queue_them_once`, `shared_kids_are_queued_again_only_from_nearer_the_top`,
+`nodes_sharing_a_list_with_pages_written_in_it_each_give_their_pages_their_size`,
+`nodes_sharing_a_list_too_large_to_copy_for_each_are_refused`, `kids_that_are_no_page_are_looked_for_in_one_pass`).
 
 Deleting pages, extracting and splitting are held to redaction's promise (PB-137, D-22 (a)). `drawn_before` walks
 the document's drawings first (`Pdf::reach`) and keeps what was drawn and painted, and the subset drawn for certain
