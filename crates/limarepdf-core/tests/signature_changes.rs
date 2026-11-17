@@ -297,12 +297,26 @@ fn list_field(prev: &Document, new: &mut Document, top: ObjectId) {
 
 /// Field `top` moved first in the form's `/Fields`, the rest kept in order.
 fn list_first(prev: &Document, new: &mut Document, top: ObjectId) {
+    relist(prev, new, |fields| {
+        fields.retain(|f| f.as_reference().ok() != Some(top));
+        fields.insert(0, top.into());
+    });
+}
+
+/// Field `top` no longer listed in the form's `/Fields`.
+fn unlist(prev: &Document, new: &mut Document, top: ObjectId) {
+    relist(prev, new, |fields| {
+        fields.retain(|f| f.as_reference().ok() != Some(top))
+    });
+}
+
+/// The form's `/Fields` changed by `change`.
+fn relist(prev: &Document, new: &mut Document, change: impl FnOnce(&mut Vec<Object>)) {
     let r = root(prev);
     let mut c = dict(prev, r);
     let mut form = c.get(b"AcroForm").unwrap().as_dict().unwrap().clone();
     let mut fields = form.get(b"Fields").unwrap().as_array().unwrap().clone();
-    fields.retain(|f| f.as_reference().ok() != Some(top));
-    fields.insert(0, top.into());
+    change(&mut fields);
     form.set("Fields", fields);
     c.set("AcroForm", form);
     new.set_object(r, Object::Dictionary(c));
@@ -1137,6 +1151,161 @@ fn a_widget_moved_out_of_a_signature_field_is_refused() {
             if !got.contains(&moved) || report(&e).all_ok() {
                 wrong.push(format!("shared {shared}, after {after}: {got:?}"));
             }
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// The base document with text field `T`, a widget of its own on the page, and empty signature
+/// field `B`, whose kids are in an array of their own: `T` if `inside`, `B` alone listed in the
+/// form; none if not, `T` listed first.
+fn typed_and_signature_field(inside: bool) -> Vec<u8> {
+    edit(&base_pdf(), |prev, new| {
+        let b = new.new_object_id();
+        let mut t = dictionary! {
+            "Type" => "Annot", "Subtype" => "Widget", "F" => 4, "P" => page(prev),
+            "Rect" => vec![150.into(), 100.into(), 250.into(), 140.into()],
+            "FT" => "Tx", "T" => Object::string_literal("T"),
+        };
+        if inside {
+            t.set("Parent", b);
+        }
+        let t = new.add_object(t);
+        add_annot(prev, new, t);
+        let kids: Vec<Object> = if inside { vec![t.into()] } else { Vec::new() };
+        let kids = new.add_object(kids);
+        let (n, kids) = (Object::string_literal("B"), Object::from(kids));
+        let field = dictionary! { "FT" => "Sig", "T" => n, "Kids" => kids };
+        new.set_object(b, Object::Dictionary(field));
+        let fields = match inside {
+            true => vec![Object::from(b)],
+            false => vec![Object::from(t), b.into()],
+        };
+        let r = root(prev);
+        let mut c = dict(prev, r);
+        c.set("AcroForm", dictionary! { "Fields" => fields });
+        new.set_object(r, Object::Dictionary(c));
+    })
+}
+
+/// `T` of [`typed_and_signature_field`] moved into `B` or out of it by edits to lists of kids
+/// and fields alone (listed in its new place only, or in both, the new one first):
+/// refused as a change to `T`'s field, after an approval and after a certification allowing no
+/// changes. Its own type keeps it a text field, so only its parent and name changing show the
+/// move; before they were compared, it was reported as nothing.
+#[test]
+fn a_typed_field_moved_into_or_out_of_a_signature_field_is_refused() {
+    let mut wrong = Vec::new();
+    for inside in [false, true] {
+        let form = typed_and_signature_field(inside);
+        for (after, signed) in [("an approval", approve(&form)), ("P1", certify(&form, 1))] {
+            for both in [false, true] {
+                let e = edit(&signed, |prev, new| {
+                    let (t, b) = (titled(prev, "T"), titled(prev, "B"));
+                    let kids = dict(prev, b).get(b"Kids").unwrap().as_reference().unwrap();
+                    match (inside, both) {
+                        (false, false) => {
+                            new.set_object(kids, vec![Object::from(t)]);
+                            unlist(prev, new, t);
+                        }
+                        (false, true) => {
+                            new.set_object(kids, vec![Object::from(t)]);
+                            list_first(prev, new, b);
+                        }
+                        (true, false) => {
+                            new.set_object(kids, Vec::<Object>::new());
+                            list_field(prev, new, t);
+                        }
+                        (true, true) => list_first(prev, new, t),
+                    }
+                });
+                let name = if inside { "B.T" } else { "T" };
+                let moved = (ChangeKind::FieldChanged(name.into()), Some(Refusal::Never));
+                let got = changes(&e);
+                if !got.contains(&moved) || report(&e).all_ok() {
+                    let case = format!("inside {inside}, after {after}, both {both}");
+                    wrong.push(format!("{case}: {got:?}"));
+                }
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// The base document with signature field `Signature1`, its widget `W` on the page, and empty
+/// signature field `S2`: the kids of each in an array of their own if `arrays` (`S2`'s none),
+/// else `Signature1`'s listed in it and `S2` with none.
+fn two_signature_fields(arrays: bool) -> Vec<u8> {
+    edit(&base_pdf(), |prev, new| {
+        let s1 = new.new_object_id();
+        let w = new.add_object(dictionary! {
+            "Type" => "Annot", "Subtype" => "Widget", "F" => 4, "P" => page(prev), "Parent" => s1,
+            "Rect" => vec![150.into(), 100.into(), 250.into(), 140.into()],
+        });
+        add_annot(prev, new, w);
+        let mut first = dictionary! { "FT" => "Sig", "T" => Object::string_literal("Signature1") };
+        let mut second = dictionary! { "FT" => "Sig", "T" => Object::string_literal("S2") };
+        let kids = vec![Object::from(w)];
+        if arrays {
+            first.set("Kids", new.add_object(kids));
+            second.set("Kids", new.add_object(Vec::<Object>::new()));
+        } else {
+            first.set("Kids", kids);
+        }
+        new.set_object(s1, Object::Dictionary(first));
+        let s2 = new.add_object(second);
+        let r = root(prev);
+        let mut c = dict(prev, r);
+        let fields = vec![Object::from(s1), s2.into()];
+        c.set("AcroForm", dictionary! { "Fields" => fields });
+        new.set_object(r, Object::Dictionary(c));
+    })
+}
+
+/// `W` of [`two_signature_fields`] made `S2`'s once `Signature1` is signed, by edits to the
+/// arrays of kids alone, or by `S2` listed first and then signed with `W` as its kid: refused
+/// as a change to `Signature1`'s field, as the signature would show as `S2`'s. `W` holds no
+/// value, so only its parent and name changing show the move; before they were compared, it
+/// was allowed.
+#[test]
+fn a_signed_fields_widget_moved_to_another_signature_field_is_refused() {
+    let moved = ChangeKind::FieldChanged("Signature1".into());
+    let mut wrong = Vec::new();
+    for arrays in [true, false] {
+        let f = Field {
+            existing: true,
+            ..Field::default()
+        };
+        let form = two_signature_fields(arrays);
+        let signed = sign(&form, &id("rsa3072"), &f, &Cms::default());
+        let e = if arrays {
+            edit(&signed, |prev, new| {
+                let kids = |field| {
+                    let d = dict(prev, titled(prev, field));
+                    d.get(b"Kids").unwrap().as_reference().unwrap()
+                };
+                let (from, to) = (kids("Signature1"), kids("S2"));
+                let w = prev.get_object(from).unwrap().as_array().unwrap()[0].clone();
+                new.set_object(from, Vec::<Object>::new());
+                new.set_object(to, vec![w]);
+            })
+        } else {
+            let first = edit(&signed, |prev, new| {
+                list_first(prev, new, titled(prev, "S2"))
+            });
+            let d = Document::load_mem(&first).unwrap();
+            let w = first_kid(&d, titled(&d, "Signature1"));
+            let f = Field {
+                name: "S2",
+                existing: true,
+                widget: dictionary! { "Kids" => vec![Object::from(w)] },
+                ..Field::default()
+            };
+            sign(&first, &id("p256"), &f, &Cms::default())
+        };
+        let got = changes(&e);
+        if !got.contains(&(moved.clone(), Some(Refusal::Never))) || report(&e).all_ok() {
+            wrong.push(format!("arrays {arrays}: {got:?}"));
         }
     }
     assert!(wrong.is_empty(), "{wrong:#?}");

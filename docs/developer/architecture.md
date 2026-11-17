@@ -1619,9 +1619,12 @@ as filling in another field: a widget moved under one and given a made-up signat
 other field's is refused too (`a_widget_moved_out_of_a_signature_field_is_refused`). So is a field listed under
 another field, or renamed by a change to one above it, as a lock naming it would no longer, and filling it in is
 judged by the name it had: a locked field listed under another was reported as nothing before, and filled in, allowed
-(`a_field_renamed_by_changes_to_other_fields_is_refused`). Each kind of change to a field is found once a page,
-however many of its keys or parts change, and its name copied only then: a field named with 64 KB and 1,000 keys
-changed, and one with 1,000 parts changed, were found 1,000 times each before
+(`a_field_renamed_by_changes_to_other_fields_is_refused`); a text field moved into a signature field or out of one
+was reported as nothing too (`a_typed_field_moved_into_or_out_of_a_signature_field_is_refused`), and a signed
+field's widget moved to another signature field, its signature then shown as that field's, allowed
+(`a_signed_fields_widget_moved_to_another_signature_field_is_refused`). Each kind of change to a field is found
+once a page, however many of its keys or parts change, and its name copied only then: a field named with 64 KB and
+1,000 keys changed, and one with 1,000 parts changed, were found 1,000 times each before
 (`a_fields_change_is_found_once_however_many_keys_or_parts_change`). A signature field added with a field of another
 kind inside it is refused for that field, as nothing would judge filling it in: a text field inside one was allowed
 with it before, after an approval or a certification allowing form filling
