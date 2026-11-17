@@ -2555,8 +2555,8 @@ impl<'a> Judge<'a> {
                             p.and_then(|p| nr.fields.get(&p)).is_some_and(|p| p.sig)
                         };
                         for (_, n) in tree.iter().filter(|(_, n)| !n.sig && sig(n.parent)) {
-                            // A field of another kind inside it, which nothing would judge
-                            // filling in.
+                            // A field of another kind added inside it: never allowed, as when
+                            // added on its own.
                             self.push(never(ChangeKind::FieldAdded(n.name.clone()), None));
                         }
                         let visible = tree.iter().any(|(_, f)| f.visible);

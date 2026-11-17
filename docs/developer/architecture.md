@@ -1633,8 +1633,8 @@ field's widget moved to another signature field, its signature then shown as tha
 once a page, however many of its keys or parts change, and its name copied only then: a field named with 64 KB and
 1,000 keys changed, and one with 1,000 parts changed, were found 1,000 times each before
 (`a_fields_change_is_found_once_however_many_keys_or_parts_change`). A signature field added with a field of another
-kind inside it is refused for that field, as nothing would judge filling it in: a text field inside one was allowed
-with it before, after an approval or a certification allowing form filling
+kind inside it is refused for that field, as adding one is never allowed, on its own or not: a text field inside one
+was allowed with it before, after an approval or a certification allowing form filling
 (`a_field_inside_a_new_signature_field_is_refused`). Trust is in `trust.rs`: the trust
 list file (`trust.txt`
 in the settings folder, whose location `limarepdf_core::settings_dir` gives both the app and the command line), and
