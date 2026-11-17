@@ -1615,9 +1615,13 @@ accessor: 2,000 new signature fields, about 4,000,000 looks before, 4,000 now
 checks it, and every signed node of a new field is judged, not only the first: one nested past the 32 levels the
 report follows, or a value on a widget the report doesn't read, is refused
 (`a_signature_the_report_doesnt_list_is_refused`, `a_new_signature_the_report_doesnt_list_is_refused`; the widget's
-was allowed before, `a_signature_on_a_fields_widget_is_refused`). A field made part of a signature field, or no
-longer, by a list of kids or fields changing is refused, as its signing would go unjudged, or its changes be judged
-as filling in another field: a widget moved under one and given a made-up signature was reported as nothing before
+was allowed before, `a_signature_on_a_fields_widget_is_refused`). A field signed before and moved into a new signature
+field isn't taken for that field's signing: an untitled one listed first around a document timestamp was reported as
+the timestamp's signing, its adding not at all, and after a certification allowing no changes was allowed until
+fields' parents were compared (`a_new_signature_field_holding_an_earlier_signature_is_no_signing`). A field made part
+of a signature field, or no longer, by a list of kids or fields changing is refused, as its signing would go
+unjudged, or its changes be judged as filling in another field: a widget moved under one and given a made-up
+signature was reported as nothing before
 (`a_widget_moved_under_a_signature_field_and_signed_is_refused`), and one moved out of one and filled in as the
 other field's is refused too (`a_widget_moved_out_of_a_signature_field_is_refused`). So is a field listed under
 another field, or renamed by a change to one above it, as a lock naming it would no longer, and filling it in is

@@ -2564,8 +2564,11 @@ impl<'a> Judge<'a> {
                             let page = self.nr.annots.get(*i).copied();
                             self.push(never(ChangeKind::Actions, page));
                         }
+                        // Signed in this step: one signed before and moved into it is judged
+                        // by its parent changing, not taken for this field's signing.
+                        let old = |i: &ObjectId| self.or.fields.contains_key(i);
                         let mut signed = false;
-                        for (i, s) in tree.iter().filter(|(_, f)| f.signed) {
+                        for (i, s) in tree.iter().filter(|(i, f)| f.signed && !old(i)) {
                             self.push(self.signing(**i, s, Some(visible)));
                             signed = true;
                         }

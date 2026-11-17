@@ -1311,6 +1311,51 @@ fn a_signed_fields_widget_moved_to_another_signature_field_is_refused() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// Signed, timestamped, then an untitled signature field added and listed first with the
+/// timestamp's field among its kids (and a valued text field too, `hidden`): the field added is
+/// judged as one, refused after a certification or a lock allowing no changes, and the
+/// timestamp's field moved, never allowed. Before, the timestamp found in the new field was
+/// taken for its signing, and the field added went unreported.
+#[test]
+fn a_new_signature_field_holding_an_earlier_signature_is_no_signing() {
+    let form = form(&["Name"]);
+    let locked = locked_by(&form, lock("All", &[], Some(1)));
+    let signed = [
+        (certify(&form, 1), "P1", true),
+        (locked, "a P1 lock", true),
+        (approve(&form), "an approval", false),
+    ];
+    let added = ChangeKind::SignatureFieldAdded("".into());
+    let moved = ChangeKind::FieldChanged("Timestamp1".into());
+    let mut wrong = Vec::new();
+    for (signed, after, refused) in signed {
+        let stamped = timestamp(&signed, true);
+        for hidden in [false, true] {
+            let b = edit(&stamped, |prev, new| {
+                let w = new.new_object_id();
+                let mut kids = vec![Object::from(titled(prev, "Timestamp1"))];
+                if hidden {
+                    let t = new.add_object(dictionary! {
+                        "FT" => "Tx", "T" => Object::string_literal("Hidden"),
+                        "V" => Object::string_literal("1,000,000"), "Parent" => w,
+                    });
+                    kids.push(t.into());
+                }
+                let field = dictionary! { "FT" => "Sig", "Kids" => kids };
+                new.set_object(w, Object::Dictionary(field));
+                list_first(prev, new, w);
+            });
+            let got = changes(&b);
+            let judged = (got.iter()).any(|(k, r)| *k == added && r.is_some() == refused);
+            let never = got.contains(&(moved.clone(), Some(Refusal::Never)));
+            if !judged || !never || report(&b).all_ok() {
+                wrong.push(format!("hidden {hidden} after {after}: {got:?}"));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 #[test]
 fn a_change_undone_before_the_next_signature_still_counts() {
     let b = approve(&base_pdf());
