@@ -1524,6 +1524,15 @@ struct FieldInfo {
     visible: bool,
 }
 
+impl FieldInfo {
+    /// Its name, copied for a change found.
+    fn copied_name(&self) -> String {
+        #[cfg(test)]
+        tests::NAMES_COPIED.set(tests::NAMES_COPIED.get() + 1);
+        self.name.clone()
+    }
+}
+
 /// The most nodes walked in the page tree or the form, and the most steps walking them (a
 /// kid listed, or 64 bytes of a field's name), assigning roles or comparing a version's
 /// annotation lists with the next's (and showing their changes on each page); beyond that
@@ -2396,8 +2405,15 @@ impl<'a> Judge<'a> {
         };
         let in_after = in_other(before, after, steps)?;
         let in_before = in_other(after, before, steps)?;
-        let removed = (before.iter().zip(&in_after)).filter_map(|(e, &k)| (!k).then_some(e));
-        let added = (after.iter().zip(&in_before)).filter_map(|(e, &k)| (!k).then_some(e));
+        // An entry referring again to what one before it did changes nothing more: judged
+        // once, a field's name isn't copied for each.
+        let (mut gone, mut new_ids) = (HashSet::new(), HashSet::new());
+        let removed = (before.iter().zip(&in_after))
+            .filter_map(|(e, &k)| (!k).then_some(e))
+            .filter(|e| e.as_reference().ok().is_none_or(|id| gone.insert(id)));
+        let added = (after.iter().zip(&in_before))
+            .filter_map(|(e, &k)| (!k).then_some(e))
+            .filter(|e| e.as_reference().ok().is_none_or(|id| new_ids.insert(id)));
 
         let mut out: Vec<Seen> = Vec::new();
         let mut once: HashSet<(ChangeKind, Need)> = HashSet::new();
@@ -2416,10 +2432,10 @@ impl<'a> Judge<'a> {
                     match field {
                         // Taken off the page but still a field.
                         Some(f) if kept && f.signed => {
-                            push(never(ChangeKind::SignatureChanged(f.name.clone()), None))
+                            push(never(ChangeKind::SignatureChanged(f.copied_name()), None))
                         }
                         Some(f) if kept => {
-                            push(never(ChangeKind::FieldChanged(f.name.clone()), None))
+                            push(never(ChangeKind::FieldChanged(f.copied_name()), None))
                         }
                         // A field removed is reported with the fields.
                         Some(_) => {}
@@ -2447,7 +2463,7 @@ impl<'a> Judge<'a> {
                         Some((id, f)) => {
                             let root = self.field_root(id);
                             if self.or.fields.contains_key(&root) {
-                                push(never(ChangeKind::FieldChanged(f.name.clone()), None));
+                                push(never(ChangeKind::FieldChanged(f.copied_name()), None));
                             }
                         }
                         None => push(never(ChangeKind::AnnotationChanged, None)),
@@ -2691,13 +2707,11 @@ impl<'a> Judge<'a> {
 
     /// Field `owner`'s name before this step (what a lock names), or its new name if it's new.
     fn field_name(&self, owner: ObjectId) -> String {
-        #[cfg(test)]
-        tests::NAMES_COPIED.set(tests::NAMES_COPIED.get() + 1);
         self.or
             .fields
             .get(&owner)
             .or_else(|| self.nr.fields.get(&owner))
-            .map(|f| f.name.clone())
+            .map(FieldInfo::copied_name)
             .unwrap_or_default()
     }
 
@@ -3012,7 +3026,7 @@ mod tests {
         pub(super) static RECT_READ: Cell<usize> = const { Cell::new(0) };
         /// Fields of the newer version `Judge::fields` looked at, on this thread.
         pub(super) static FIELDS_LOOKED: Cell<usize> = const { Cell::new(0) };
-        /// Field names `Judge::field_name` copied, on this thread.
+        /// Field names copied for changes found (`FieldInfo::copied_name`), on this thread.
         pub(super) static NAMES_COPIED: Cell<usize> = const { Cell::new(0) };
     }
 
@@ -3594,6 +3608,65 @@ mod tests {
         ];
         assert_eq!(found, [1; 7]);
         assert_eq!(copied, 7, "names copied");
+    }
+
+    /// A page listing a text field's and a signed signature field's widgets 1,000 times each,
+    /// fields named with 64 KB, taken off it after signing with the fields kept, and another
+    /// text field's widget from before put on it 1,000 times. Each change is found once, its
+    /// name copied once, not once an entry (1,000 times each before, 64 MB a field).
+    #[test]
+    fn a_widget_listed_again_and_again_is_judged_once() {
+        let name = |c: char| c.to_string().repeat(65_536);
+        let widget = |c: char| {
+            dictionary! {
+                "Type" => "Annot", "Subtype" => "Widget", "T" => Object::string_literal(name(c)),
+                "Rect" => vec![10.into(), 10.into(), 20.into(), 20.into()],
+            }
+        };
+        let mut p = Pdf::new();
+        p.insert_blank(0, 300.0, 200.0).unwrap();
+        let doc = &mut p.doc;
+        let value = doc.add_object(dictionary! { "Type" => "Sig" });
+        let (mut a, mut b, mut c) = (widget('a'), widget('b'), widget('c'));
+        a.set("FT", "Tx");
+        b.extend(&dictionary! { "FT" => "Sig", "V" => value });
+        c.set("FT", "Tx");
+        let [a, b, c] = [a, b, c].map(|w| doc.add_object(w));
+        let fields: Vec<Object> = [a, b, c].iter().map(|&f| f.into()).collect();
+        let form = doc.add_object(dictionary! { "Fields" => fields });
+        doc.catalog_mut().unwrap().set("AcroForm", form);
+        let times = |w: ObjectId| vec![Object::from(w); 1_000];
+        let list = doc.add_object([times(a), times(b)].concat());
+        let page = p.page_ids()[0];
+        p.doc.get_dictionary_mut(page).unwrap().set("Annots", list);
+        let signed = p.snapshot().unwrap();
+        let mut p = Pdf::from_bytes(&signed, None).unwrap();
+        p.doc.objects.insert(list, Object::Array(times(c)));
+
+        NAMES_COPIED.set(0);
+        let found = changes_since(&signed, &p);
+        let copied = NAMES_COPIED.get();
+        // Each change, its name cut to its first letter and length.
+        let brief = |found: &[(ChangeKind, Option<usize>, bool)]| -> Vec<String> {
+            let cut = |n: &String| format!("{}.. {}", &n[..n.len().min(1)], n.len());
+            let brief = |k: &ChangeKind| match k {
+                ChangeKind::FieldChanged(n) => format!("FieldChanged({})", cut(n)),
+                ChangeKind::SignatureChanged(n) => format!("SignatureChanged({})", cut(n)),
+                k => format!("{k:?}").chars().take(80).collect(),
+            };
+            (found.iter())
+                .map(|(k, page, ok)| format!("{}, {page:?}, {ok}", brief(k)))
+                .collect()
+        };
+        let refused = |kind| (kind, Some(0), false);
+        let want = [
+            refused(ChangeKind::FieldChanged(name('a'))),
+            refused(ChangeKind::FieldChanged(name('c'))),
+            refused(ChangeKind::SignatureChanged(name('b'))),
+        ];
+        assert_eq!(brief(&found), brief(&want));
+        assert_eq!(found, want);
+        assert_eq!(copied, 3, "names copied");
     }
 
     /// A thousand fields each listing the same 1,000 kids, themselves, with no area on the

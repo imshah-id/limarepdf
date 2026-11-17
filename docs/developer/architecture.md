@@ -1646,7 +1646,11 @@ before (`a_field_s_parent_other_than_its_listing_is_refused`). Each kind of
 change to a field is found once a page, however many of its keys or parts change, and its name copied only then:
 text and signature fields named with 64 KB, signed or not, with 1,000 keys or parts changed (a seed value's or a
 signature's too), were found 1,000 times each before, and the test counts the names copied, one a field
-(`a_fields_change_is_found_once_however_many_keys_or_parts_change`). A signature field added with a field of another
+(`a_fields_change_is_found_once_however_many_keys_or_parts_change`). So is a widget a page's `/Annots` lists again
+and again: an entry referring again to what one before it did is judged once a side, where a page listing a text
+field's and a signed signature field's widgets 1,000 times each, named with 64 KB and taken off after signing, and
+another field's put on 1,000 times, copied each name once an entry before, 3,000 in all
+(`a_widget_listed_again_and_again_is_judged_once`). A signature field added with a field of another
 kind inside it is refused for that field, as adding one is never allowed, on its own or not: a text field inside one
 was allowed with it before, after an approval or a certification allowing form filling
 (`a_field_inside_a_new_signature_field_is_refused`). Trust is in `trust.rs`: the trust
