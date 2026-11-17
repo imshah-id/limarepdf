@@ -1515,6 +1515,8 @@ struct FieldInfo {
     parent: Option<ObjectId>,
     /// The top of its field tree.
     root: ObjectId,
+    /// The field it is part of: itself when titled, else its parent's (a widget kid's field).
+    field: ObjectId,
     sig: bool,
     /// For a signature field: it holds a signature.
     signed: bool,
@@ -1689,6 +1691,10 @@ impl Roles {
             };
             let up = parent.and_then(|p| r.fields.get(&p));
             let partial = d.get(b"T").ok().and_then(|t| v.pdf.text_value(t));
+            let field = match (&partial, up) {
+                (None, Some(p)) => p.field,
+                _ => id,
+            };
             let name = match (partial, up) {
                 (Some(t), Some(p)) if !p.name.is_empty() => format!("{}.{t}", p.name),
                 (Some(t), _) => t,
@@ -1714,6 +1720,7 @@ impl Roles {
                     name,
                     parent,
                     root,
+                    field,
                     sig,
                     signed: sig && value.is_some(),
                     timestamp: sig && timestamp,
@@ -2253,6 +2260,13 @@ enum FieldChange {
 const FILL_KEYS: [&[u8]; 6] = [b"V", b"AP", b"AS", b"RV", b"I", b"M"];
 /// Signature field entries signing may change.
 const SIGN_KEYS: [&[u8]; 4] = [b"V", b"AP", b"AS", b"M"];
+
+/// Whether the field node `id` holds a signature in `roles`, itself or, for a widget kid,
+/// the field it is part of (signing sets the field's `/V` and locks and draws its widgets).
+fn signed_field(roles: &Roles, id: ObjectId) -> bool {
+    let signed = |id: &ObjectId| roles.fields.get(id).is_some_and(|f| f.signed);
+    signed(&id) || roles.fields.get(&id).is_some_and(|f| signed(&f.field))
+}
 
 impl<'a> Judge<'a> {
     fn push(&mut self, s: Seen) {
@@ -2806,12 +2820,12 @@ impl<'a> Judge<'a> {
             }
             Kind::FieldPart => self.push_field(owner, FieldChange::Filled, page),
             Kind::SigField => {
-                let was_signed = self.or.fields.get(&owner).is_some_and(|f| f.signed);
+                let was_signed = signed_field(self.or, owner);
                 let keys = match dicts {
                     Some((a, b)) => Self::differing(a, b),
                     None => vec![b"Type".to_vec()],
                 };
-                let is_signed = self.nr.fields.get(&owner).is_some_and(|f| f.signed);
+                let is_signed = signed_field(self.nr, owner);
                 for k in keys {
                     if was_signed {
                         self.push_field(owner, FieldChange::SignatureChanged, page);
@@ -2829,8 +2843,8 @@ impl<'a> Judge<'a> {
                 }
             }
             Kind::SigFieldPart => {
-                let was_signed = self.or.fields.get(&owner).is_some_and(|f| f.signed);
-                let is_signed = self.nr.fields.get(&owner).is_some_and(|f| f.signed);
+                let was_signed = signed_field(self.or, owner);
+                let is_signed = signed_field(self.nr, owner);
                 if was_signed {
                     self.push_field(owner, FieldChange::SignatureChanged, page);
                 } else if !is_signed {

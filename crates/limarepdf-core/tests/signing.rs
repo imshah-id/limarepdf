@@ -427,6 +427,80 @@ fn signs_an_empty_signature_field() {
     assert!(w.has(b"AP"));
 }
 
+/// `bytes`, a document [`form_doc`] made, with the field `name` split in two: the field,
+/// and its widget a kid of its own.
+fn kid_widget(bytes: &[u8], name: &str) -> Vec<u8> {
+    let mut p = Pdf::from_bytes(bytes, None).unwrap();
+    let w = named(&p, name);
+    let widget = p.doc.get_dictionary_mut(w).unwrap();
+    let ft = widget.remove(b"FT").unwrap();
+    let t = widget.remove(b"T").unwrap();
+    let field = dictionary! { "FT" => ft, "T" => t, "Kids" => vec![w.into()] };
+    let f = p.doc.add_object(field);
+    p.doc.get_dictionary_mut(w).unwrap().set("Parent", f);
+    let form = form_of(&mut p);
+    let mut fields = form.get(b"Fields").unwrap().as_array().unwrap().clone();
+    for e in &mut fields {
+        if e.as_reference().ok() == Some(w) {
+            *e = f.into();
+        }
+    }
+    form.set("Fields", fields);
+    p.snapshot().unwrap()
+}
+
+/// A signature field whose widget is a kid of its own is signed after an approval and after
+/// a certification allowing form filling, the earlier signature allowing it; a later change
+/// to the widget's drawing changes the signature. Before, the widget locked and drawn in
+/// signing were taken for changes to an unsigned field, and the signing refused.
+#[test]
+fn signs_a_field_whose_widget_is_a_kid() {
+    let doc = kid_widget(&form_doc(&[("Approver", None)], false), "Approver");
+    let approved = sign(&doc, &req(rsa(), new_box(2))).bytes;
+    let mut r = req(rsa(), new_box(2));
+    r.certify = Some(Permissions::FormFilling);
+    let certified = sign(&doc, &r).bytes;
+    for first in [approved, certified] {
+        let s = sign(&first, &req(p256(), field("Approver")));
+        let rep = newest_is_good(&s.bytes, p256());
+        assert_eq!(rep.signatures[1].fields, ["Approver"]);
+        let changes = &rep.signatures[0].changes;
+        assert!(rep.signatures[0].changes_allowed(), "{changes:?}");
+        assert_eq!(kinds(&rep, 0), [ChangeKind::Signed("Approver".into())]);
+
+        // The signed drawing redrawn, in place or replaced.
+        for in_place in [true, false] {
+            let later = save(&s.bytes, |p| {
+                let page = p.page_ids()[0];
+                let annots = p.doc.get_dictionary(page).unwrap().get(b"Annots").unwrap();
+                let kid = (annots.as_array().unwrap().iter())
+                    .filter_map(|a| a.as_reference().ok())
+                    .find(|&a| p.doc.get_dictionary(a).unwrap().has(b"Parent"))
+                    .unwrap();
+                let ap = p.doc.get_dictionary(kid).unwrap().get(b"AP").unwrap();
+                let look = ap.as_dict().unwrap().get(b"N").unwrap();
+                let look = look.as_reference().unwrap();
+                let content = b"0 0 10 10 re f".to_vec();
+                if in_place {
+                    let s = p.doc.get_object_mut(look).unwrap().as_stream_mut().unwrap();
+                    s.set_content(content);
+                } else {
+                    let s = p.doc.get_object(look).unwrap().as_stream().unwrap();
+                    let new = lopdf::Stream::new(s.dict.clone(), content);
+                    let new = p.doc.add_object(new);
+                    let kid = p.doc.get_dictionary_mut(kid).unwrap();
+                    kid.set("AP", dictionary! { "N" => new });
+                }
+            });
+            let rep = report(&later.bytes);
+            let changed = ChangeKind::SignatureChanged("Approver".into());
+            let got = kinds(&rep, 1);
+            assert!(got.contains(&changed), "in place {in_place}: {got:?}");
+            assert!(!rep.signatures[1].changes_allowed());
+        }
+    }
+}
+
 #[test]
 fn refuses_fields_it_cant_sign() {
     let doc = form_doc(&[("Approver", None)], false);

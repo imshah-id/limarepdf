@@ -1298,6 +1298,38 @@ fn a_signature_on_a_fields_widget_is_refused() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// An empty signature field whose widget is a kid with a drawing of its own, signed after an
+/// approval and after a certification allowing form filling (made up), the kid's drawing
+/// redrawn in place as it is signed: allowed. It was refused, the drawing taken for a change
+/// to an unsigned field.
+#[test]
+fn signing_redraws_a_widget_kids_own_drawing() {
+    let field = extra_field(&base_pdf(), true, |new| {
+        dictionary! { "AP" => dictionary! { "N" => appearance(new, "") } }
+    });
+    let want = [(ChangeKind::Signed("Extra".into()), None)];
+    let mut wrong = Vec::new();
+    for (signed, after) in [(approve(&field), "an approval"), (certify(&field, 2), "P2")] {
+        let b = edit(&signed, |prev, new| {
+            let top = titled(prev, "Extra");
+            let mut v = dict(prev, top);
+            v.set("V", new.add_object(dictionary! { "Type" => "Sig" }));
+            new.set_object(top, Object::Dictionary(v));
+            let kid = dict(prev, first_kid(prev, top));
+            let ap = kid.get(b"AP").unwrap().as_dict().unwrap();
+            let look = ap.get(b"N").unwrap().as_reference().unwrap();
+            let mut s = prev.get_object(look).unwrap().as_stream().unwrap().clone();
+            s.set_content(b"BT (Signed) Tj ET".to_vec());
+            new.set_object(look, Object::Stream(s));
+        });
+        let got = changes(&b);
+        if got != want {
+            wrong.push(format!("after {after}: {got:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// The base document with text field `A`, its widget `F` (titled if `named`) on the page, and
 /// after it empty signature field `B`, whose kids are in an array of their own: `F` again,
 /// `depth` untitled fields down, if `shared`; none if not.
