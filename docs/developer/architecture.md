@@ -1624,8 +1624,10 @@ unjudged, or its changes be judged as filling in another field: a widget moved u
 signature was reported as nothing before
 (`a_widget_moved_under_a_signature_field_and_signed_is_refused`), and one moved out of one and filled in as the
 other field's is refused too (`a_widget_moved_out_of_a_signature_field_is_refused`). So is a field listed under
-another field, or renamed by a change to one above it, as a lock naming it would no longer, and filling it in is
-judged by the name it had: a locked field listed under another was reported as nothing before, and filled in, allowed
+another field, even keeping its name, or renamed by a change to one above it or to a title in an object of its own, as
+a lock naming it would no longer, or what it takes from those above it would change, and filling it in is judged by
+the name it had: a locked field listed under another was reported as nothing before, and filled in, allowed, one
+moved under an untitled field reported as nothing, and one renamed through a title in an object of its own allowed
 (`a_field_renamed_by_changes_to_other_fields_is_refused`); a text field moved into a signature field or out of one
 was reported as nothing too (`a_typed_field_moved_into_or_out_of_a_signature_field_is_refused`), and a signed
 field's widget moved to another signature field, its signature then shown as that field's, allowed

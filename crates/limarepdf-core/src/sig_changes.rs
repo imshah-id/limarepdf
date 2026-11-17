@@ -2532,7 +2532,7 @@ impl<'a> Judge<'a> {
                         self.push_field(*id, FieldChange::SignatureChanged, None);
                     } else if o.parent != f.parent || o.name != f.name {
                         // Moved, or renamed by a change to a field above it: a lock naming it
-                        // would no longer.
+                        // would no longer, or what it takes from those above it would change.
                         self.push_field(*id, FieldChange::Changed, None);
                     } else if o.sig != f.sig {
                         // Made part of a signature field, or no longer, by a list of kids or

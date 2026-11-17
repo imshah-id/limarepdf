@@ -68,15 +68,16 @@ fn dict(d: &Document, id: ObjectId) -> Dictionary {
     d.get_object(id).unwrap().as_dict().unwrap().clone()
 }
 
-/// The object of the field (or annotation) titled `name`.
+/// The object of the field (or annotation) titled `name`, in it or in an object of its own.
 fn titled(d: &Document, name: &str) -> ObjectId {
     *d.objects
         .iter()
         .find(|(_, o)| {
             o.as_dict()
                 .ok()
-                .and_then(|d| d.get(b"T").ok())
-                .and_then(|t| t.as_str().ok())
+                .and_then(|o| o.get(b"T").ok())
+                .and_then(|t| d.dereference(t).ok())
+                .and_then(|(_, t)| t.as_str().ok())
                 .is_some_and(|t| t == name.as_bytes())
         })
         .unwrap()
@@ -653,23 +654,31 @@ fn new_fields_and_field_changes_are_refused() {
     assert_refused(&moved, &ChangeKind::FieldChanged("Name".into()));
 }
 
-/// The base document with fields `A`, with no kids, and `B`, with text field `G` as its kid.
-fn parent_form() -> Vec<u8> {
+/// The base document with fields `A`, with no kids, and `B`, with text field `G` and an
+/// untitled field with no kids as its kids; `indirect`, the titles of `B` and `G` each in an
+/// object of its own.
+fn parent_form(indirect: bool) -> Vec<u8> {
     edit(&base_pdf(), |prev, new| {
+        let title = |new: &mut Document, t: &str| match indirect {
+            true => new.add_object(Object::string_literal(t)).into(),
+            false => Object::string_literal(t),
+        };
         let a = new.add_object(dictionary! {
             "T" => Object::string_literal("A"), "Kids" => Vec::<Object>::new(),
         });
         let b = new.new_object_id();
         let ap = appearance(new, "");
+        let t = title(new, "G");
         let g = new.add_object(dictionary! {
             "Type" => "Annot", "Subtype" => "Widget", "FT" => "Tx",
-            "T" => Object::string_literal("G"), "F" => 4, "P" => page(prev), "Parent" => b,
+            "T" => t, "F" => 4, "P" => page(prev), "Parent" => b,
             "Rect" => vec![150.into(), 100.into(), 250.into(), 120.into()],
             "AP" => dictionary! { "N" => ap },
         });
         add_annot(prev, new, g);
-        let kids = vec![Object::from(g)];
-        let field = dictionary! { "T" => Object::string_literal("B"), "Kids" => kids };
+        let u = new.add_object(dictionary! { "Kids" => Vec::<Object>::new(), "Parent" => b });
+        let kids = vec![Object::from(g), Object::from(u)];
+        let field = dictionary! { "T" => title(new, "B"), "Kids" => kids };
         new.set_object(b, Object::Dictionary(field));
         let r = root(prev);
         let mut c = dict(prev, r);
@@ -684,39 +693,70 @@ fn parent_form() -> Vec<u8> {
     })
 }
 
-/// `B.G` of [`parent_form`], locked by the signature, renamed by edits to other fields alone:
-/// listed among `A`'s kids too (its own parent still `B`), named after the first list it's on
-/// it would be `A.G`; or `B` renamed `C`. Each is refused as a change to `B.G`, and filling it
-/// in is judged by the name it was signed with. Filling it in was allowed, as filling in a
-/// field the lock doesn't name.
+/// Field `id` as `new` has it so far, or else as `prev` has it, changed by `change`.
+fn change(prev: &Document, new: &mut Document, id: ObjectId, change: impl FnOnce(&mut Dictionary)) {
+    let mut d = (new.get_dictionary(id).cloned()).unwrap_or_else(|_| dict(prev, id));
+    change(&mut d);
+    new.set_object(id, Object::Dictionary(d));
+}
+
+/// Field `id` renamed `to`, in its title's object if the title has one of its own.
+fn rename(prev: &Document, new: &mut Document, id: ObjectId, to: &str) {
+    let to = Object::string_literal(to);
+    match dict(prev, id).get(b"T").unwrap().as_reference() {
+        Ok(t) => new.set_object(t, to),
+        Err(_) => change(prev, new, id, |d| d.set("T", to)),
+    }
+}
+
+/// `B.G` of [`parent_form`], locked by the signature, moved or renamed by edits to other fields
+/// or to titles in objects of their own alone: listed among `A`'s kids too (its own parent still
+/// `B`), named after the first list it's on it would be `A.G`; moved under `B`'s untitled kid,
+/// still named `B.G`; `B` renamed `C`; or `G` renamed `H`. Each is refused as a change to
+/// `B.G`, and filling it in is judged by the name it was signed with. Listed under `A`, filling
+/// it in was allowed, as filling in a field the lock doesn't name; moved under the untitled kid,
+/// so was moving it; with titles in objects of their own, so was renaming.
 #[test]
 fn a_field_renamed_by_changes_to_other_fields_is_refused() {
-    let b = locked_by(&parent_form(), lock("Include", &["B.G"], None));
     let moved = (ChangeKind::FieldChanged("B.G".into()), Some(Refusal::Never));
+    // `B`'s title in an object of its own changed is part of `B` changed: filling it in, which
+    // the lock allows, beside `B` renamed, which nothing does.
+    let title = (ChangeKind::FieldFilled("B".into()), None);
+    let cases = [
+        "listed under A",
+        "moved under the untitled kid",
+        "B renamed C",
+        "G renamed H",
+    ];
     let mut wrong = Vec::new();
-    for (case, other) in [("listed under A", "A"), ("B renamed C", "B")] {
-        for filled in [false, true] {
-            let e = edit(&b, |prev, new| {
-                let id = titled(prev, other);
-                let mut d = dict(prev, id);
-                match other {
-                    "A" => d.set("Kids", vec![Object::from(titled(prev, "G"))]),
-                    _ => d.set("T", Object::string_literal("C")),
+    for (indirect, titles) in [(false, "titles in fields"), (true, "titles apart")] {
+        let signed = locked_by(&parent_form(indirect), lock("Include", &["B.G"], None));
+        for (case, filled) in cases.iter().flat_map(|c| [(c, false), (c, true)]) {
+            let e = edit(&signed, |prev, new| {
+                let (a, b, g) = (titled(prev, "A"), titled(prev, "B"), titled(prev, "G"));
+                match *case {
+                    "listed under A" => change(prev, new, a, |d| d.set("Kids", vec![g.into()])),
+                    "moved under the untitled kid" => {
+                        let kids = dict(prev, b).get(b"Kids").unwrap().clone();
+                        let u = kids.as_array().unwrap()[1].as_reference().unwrap();
+                        change(prev, new, u, |d| d.set("Kids", vec![g.into()]));
+                        change(prev, new, b, |d| d.set("Kids", vec![u.into()]));
+                    }
+                    "B renamed C" => rename(prev, new, b, "C"),
+                    _ => rename(prev, new, g, "H"),
                 }
-                new.set_object(id, Object::Dictionary(d));
                 if filled {
-                    let g = titled(prev, "G");
-                    let mut d = dict(prev, g);
                     let ap = appearance(new, "BT (Jane) Tj ET");
-                    d.set("V", Object::string_literal("Jane"));
-                    d.set("AP", dictionary! { "N" => ap });
-                    new.set_object(g, Object::Dictionary(d));
+                    change(prev, new, g, |d| {
+                        d.set("V", Object::string_literal("Jane"));
+                        d.set("AP", dictionary! { "N" => ap });
+                    });
                 }
             });
             let got = changes(&e);
-            if !got.contains(&moved) || got.iter().any(|(_, r)| r.is_none()) || report(&e).all_ok()
-            {
-                wrong.push(format!("{case}, filled {filled}: {got:?}"));
+            let allowed = got.iter().any(|c| c.1.is_none() && *c != title);
+            if !got.contains(&moved) || allowed || report(&e).all_ok() {
+                wrong.push(format!("{titles}, {case}, filled {filled}: {got:?}"));
             }
         }
     }
