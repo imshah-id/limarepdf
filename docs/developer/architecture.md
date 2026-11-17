@@ -1221,9 +1221,11 @@ further, as `form_nodes` reads them: `value_nodes` and `field_goes` refuse a nod
 file has, is walked once, not once a node: in `forms.rs` a node listing it again takes its kids from that walk
 (`Walk::kids`, kept by depth so a shallower node still reaches kids too deep before, and walked again through a
 loop so names come out as `sig_changes` gives them), and a widget more than one field lists goes to the first
-(`Walk::claimed`; it went to each before); `value_nodes` passes over it. `repair.rs`'s `mend_page_tree` mends such a
-list once, into one new object the nodes sharing it all take, so a page written there is a kid of the first node's,
-and reads the bytes' object headers once (`object_lines`) for the kids that aren't page nodes
+(`Walk::claimed`; it went to each before); a node of no kind (`field_kind`) is no field and takes neither the list
+nor a widget, so the field listing them after it still does
+(`flattening_draws_a_value_whose_widget_a_node_of_no_kind_lists`); `value_nodes` passes over it. `repair.rs`'s
+`mend_page_tree` mends such a list once, into one new object the nodes sharing it all take, so a page written there
+is a kid of the first node's, and reads the bytes' object headers once (`object_lines`) for the kids that aren't page nodes
 (`fields_sharing_their_kids_are_walked_once`, `widgets_shared_by_fields_go_to_the_first`,
 `page_tree_nodes_sharing_their_kids_are_mended_once`, `kids_that_are_no_page_are_looked_for_in_one_pass`).
 

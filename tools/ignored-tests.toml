@@ -404,6 +404,14 @@ group = "G6"
 needs = ["pdftotext"]
 
 [[test]]
+name = "cross_check_a_value_whose_widget_a_node_of_no_kind_lists_with_poppler"
+crate = "limarepdf-core"
+target = "--test form_flatten"
+file = "crates/limarepdf-core/tests/form_flatten.rs"
+group = "G6"
+needs = ["pdftotext"]
+
+[[test]]
 name = "cross_check_upright_pictures_with_poppler"
 crate = "limarepdf-core"
 target = "--test import"

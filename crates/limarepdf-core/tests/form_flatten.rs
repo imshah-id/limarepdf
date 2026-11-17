@@ -1,9 +1,9 @@
 //! Flattening made-up forms: the drawing stays where it was, and the fields go.
 
-#[allow(dead_code)]
-#[path = "common/tool.rs"]
-mod tool;
+mod common;
 
+use common::saved::Saved;
+use common::tool;
 use limarepdf_core::print::{Orientation, PageSetup, Paper, PerSheet, Scale};
 use limarepdf_core::render::{self, Renderer};
 use limarepdf_core::{FieldValue, Pdf};
@@ -651,6 +651,67 @@ fn flattening_refuses_a_form_nested_too_deep_to_follow() {
     assert!(!has_form(&p));
     let back = Pdf::from_bytes(&p.to_bytes().unwrap(), None).unwrap();
     assert!(back.page_text(0).contains("DEEPVALUE"));
+}
+
+/// A form listing `x`, a node with a name but no kind, then the text field `t` holding
+/// "SHAREDVALUE": both list `t`'s widget on the first page, with no drawing, in an array of
+/// their own or, when `shared`, in one array object.
+fn widget_listed_by_no_field(shared: bool) -> Pdf {
+    let (mut p, _) = doc(Vec::new());
+    let w = p.doc.add_object(widget(dictionary! {
+        "Rect" => rect(10.0, 150.0, 150.0, 20.0), "F" => 4,
+    }));
+    place(&mut p, 0, w);
+    let kids: Object = match shared {
+        true => p.doc.add_object(vec![Object::Reference(w)]).into(),
+        false => vec![Object::Reference(w)].into(),
+    };
+    let x = p.doc.add_object(dictionary! {
+        "T" => text("x"), "Kids" => kids.clone(),
+    });
+    let t = p.doc.add_object(dictionary! {
+        "FT" => "Tx", "T" => text("t"), "V" => text("SHAREDVALUE"), "Kids" => kids,
+    });
+    p.doc.get_dictionary_mut(w).unwrap().set("Parent", t);
+    let form = p.doc.catalog().unwrap().get(b"AcroForm").unwrap();
+    let form = form.as_reference().unwrap();
+    let form = p.doc.get_dictionary_mut(form).unwrap();
+    form.set("Fields", vec![Object::Reference(x), Object::Reference(t)]);
+    p
+}
+
+/// A widget that a node of no kind lists too stays its field's, and flattening draws the
+/// field's value: the node took the widget first, so the field had none and flattening
+/// removed the value without drawing it, its check never seeing the widget.
+#[test]
+fn flattening_draws_a_value_whose_widget_a_node_of_no_kind_lists() {
+    for shared in [false, true] {
+        let mut p = widget_listed_by_no_field(shared);
+        let fields = p.form_fields();
+        assert_eq!(fields.len(), 1, "shared {shared}");
+        assert_eq!(fields[0].widgets.len(), 1, "shared {shared}");
+        assert_eq!(p.flatten_form(None).unwrap(), 1, "shared {shared}");
+        assert!(!has_form(&p));
+        let saved = Saved::of(&mut p);
+        assert!(saved.fields().is_empty(), "shared {shared}");
+        saved.assert_kept(&["SHAREDVALUE"]);
+        let back = Pdf::from_bytes(&saved.bytes, None).unwrap();
+        let text = back.page_text(0);
+        assert!(text.contains("SHAREDVALUE"), "shared {shared}: {text}");
+    }
+}
+
+/// Poppler reads the value [`flattening_draws_a_value_whose_widget_a_node_of_no_kind_lists`]
+/// draws. Opt-in: needs `pdftotext`.
+#[test]
+#[ignore]
+fn cross_check_a_value_whose_widget_a_node_of_no_kind_lists_with_poppler() {
+    for shared in [false, true] {
+        let mut p = widget_listed_by_no_field(shared);
+        p.flatten_form(None).unwrap();
+        let text = common::saved::tools::pdftotext(&p.to_bytes().unwrap());
+        assert!(text.contains("SHAREDVALUE"), "shared {shared}: {text}");
+    }
 }
 
 /// Paper the size of [`doc`]'s pages with no margins: a sheet is its page as it is.

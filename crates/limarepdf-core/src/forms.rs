@@ -134,6 +134,30 @@ struct Inherited {
     q: Option<i64>,
 }
 
+/// The kind of a terminal field that inherits `inh`, or `None` for a node of no kind, which
+/// is no field.
+fn field_kind(inh: &Inherited) -> Option<FieldKind> {
+    let ff = inh.ff;
+    Some(match inh.ft.as_deref()? {
+        b"Tx" => FieldKind::Text {
+            multiline: ff & MULTILINE != 0,
+            password: ff & PASSWORD != 0,
+            comb: ff & COMB != 0,
+            max_len: inh.max_len,
+        },
+        b"Btn" if ff & PUSH_BUTTON != 0 => FieldKind::Button,
+        b"Btn" if ff & RADIO != 0 => FieldKind::Radio,
+        b"Btn" => FieldKind::Check,
+        b"Ch" => FieldKind::Choice {
+            combo: ff & COMBO != 0,
+            editable: ff & EDIT != 0,
+            multi: ff & MULTI_SELECT != 0,
+        },
+        b"Sig" => FieldKind::Signature,
+        _ => return None,
+    })
+}
+
 /// Where a field is in the file, and what writing its value needs besides [`Field`].
 pub(crate) struct Node {
     /// The terminal field's dictionary, which holds `/V`.
@@ -468,6 +492,10 @@ impl Pdf {
             }
             return;
         }
+        // A node of no kind is no field: it takes neither its list nor its widgets.
+        let Some(kind) = field_kind(&inh) else {
+            return;
+        };
         take(w);
         // A widget that more than one field lists, as no well-made form has, goes to the
         // first.
@@ -484,17 +512,16 @@ impl Pdf {
             });
             ws
         };
-        if let Some(field) = self.make_field(name, d, &inh, &widgets, w) {
-            let node = Node {
-                id,
-                widgets,
-                da: inh.da,
-                q: inh.q.unwrap_or(0),
-                dv: inh.dv,
-                opt: inh.opt.map(|o| self.options(&o)).unwrap_or_default(),
-            };
-            w.out.push((field, node));
-        }
+        let field = self.make_field(name, d, kind, &inh, &widgets, w);
+        let node = Node {
+            id,
+            widgets,
+            da: inh.da,
+            q: inh.q.unwrap_or(0),
+            dv: inh.dv,
+            opt: inh.opt.map(|o| self.options(&o)).unwrap_or_default(),
+        };
+        w.out.push((field, node));
     }
 
     /// The kids a field tree node `d` lists: those with a name, or with no `/Rect`, are
@@ -521,34 +548,17 @@ impl Pdf {
         }
     }
 
-    /// A terminal field from its dictionary, what it inherits and its widgets.
+    /// A terminal field of `kind` from its dictionary, what it inherits and its widgets.
     fn make_field(
         &self,
         name: String,
         d: &Dictionary,
+        kind: FieldKind,
         inh: &Inherited,
         widgets: &[ObjectId],
         w: &mut Walk,
-    ) -> Option<Field> {
+    ) -> Field {
         let ff = inh.ff;
-        let kind = match inh.ft.as_deref()? {
-            b"Tx" => FieldKind::Text {
-                multiline: ff & MULTILINE != 0,
-                password: ff & PASSWORD != 0,
-                comb: ff & COMB != 0,
-                max_len: inh.max_len,
-            },
-            b"Btn" if ff & PUSH_BUTTON != 0 => FieldKind::Button,
-            b"Btn" if ff & RADIO != 0 => FieldKind::Radio,
-            b"Btn" => FieldKind::Check,
-            b"Ch" => FieldKind::Choice {
-                combo: ff & COMBO != 0,
-                editable: ff & EDIT != 0,
-                multi: ff & MULTI_SELECT != 0,
-            },
-            b"Sig" => FieldKind::Signature,
-            _ => return None,
-        };
         let opt = inh
             .opt
             .as_ref()
@@ -577,7 +587,7 @@ impl Pdf {
             FieldKind::Choice { .. } => opt,
             _ => Vec::new(),
         };
-        Some(Field {
+        Field {
             name,
             kind,
             value,
@@ -588,7 +598,7 @@ impl Pdf {
             text_size: inh.da.as_deref().map_or(0.0, |da| parse_da(da).1),
             font: self.da_font(inh.da.as_deref()),
             widgets: ws,
-        })
+        }
     }
 
     /// The font a value is set in for the `/DA` `da` when the font it names can't be used
