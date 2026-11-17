@@ -2533,7 +2533,8 @@ impl<'a> Judge<'a> {
                         self.push_field(*id, FieldChange::Changed, None);
                     } else if o.sig != f.sig {
                         // Made part of a signature field, or no longer, by a list of kids or
-                        // fields changing: its signing would go unjudged.
+                        // fields changing: its signing would go unjudged, or its changes be
+                        // judged as filling in another field.
                         self.push_field(*id, FieldChange::Changed, None);
                     } else if !o.signed && f.signed {
                         self.push(self.signing(*id, f, None));

@@ -295,6 +295,19 @@ fn list_field(prev: &Document, new: &mut Document, top: ObjectId) {
     new.set_object(r, Object::Dictionary(c));
 }
 
+/// Field `top` moved first in the form's `/Fields`, the rest kept in order.
+fn list_first(prev: &Document, new: &mut Document, top: ObjectId) {
+    let r = root(prev);
+    let mut c = dict(prev, r);
+    let mut form = c.get(b"AcroForm").unwrap().as_dict().unwrap().clone();
+    let mut fields = form.get(b"Fields").unwrap().as_array().unwrap().clone();
+    fields.retain(|f| f.as_reference().ok() != Some(top));
+    fields.insert(0, top.into());
+    form.set("Fields", fields);
+    c.set("AcroForm", form);
+    new.set_object(r, Object::Dictionary(c));
+}
+
 // ---------------------------------------------------------------- allowed changes
 
 #[test]
@@ -1045,15 +1058,7 @@ fn a_widget_moved_under_a_signature_field_and_signed_is_refused() {
                         d.set("Kids", Vec::<Object>::new());
                         new.set_object(a, Object::Dictionary(d));
                     } else {
-                        let r = root(prev);
-                        let mut c = dict(prev, r);
-                        let mut acro = c.get(b"AcroForm").unwrap().as_dict().unwrap().clone();
-                        let mut fields = acro.get(b"Fields").unwrap().as_array().unwrap().clone();
-                        fields.retain(|f| f.as_reference().ok() != Some(b));
-                        fields.insert(0, b.into());
-                        acro.set("Fields", fields);
-                        c.set("AcroForm", acro);
-                        new.set_object(r, Object::Dictionary(c));
+                        list_first(prev, new, b);
                     }
                     fake_sign(prev, new, f, stamp);
                 });
@@ -1063,6 +1068,73 @@ fn a_widget_moved_under_a_signature_field_and_signed_is_refused() {
                     let case = format!("depth {depth}, timestamp {stamp}, A drops it {drop}");
                     wrong.push(format!("{case}: {got:?}"));
                 }
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// The base document with empty signature field `B`, its widget `W` on the page, and text
+/// field `A`, whose kids are in an array of their own: `W` again if `shared`, `B` listed first
+/// so `W` is `B`'s; none if not, `A` listed first.
+fn widget_of_a_signature_field(shared: bool) -> Vec<u8> {
+    edit(&base_pdf(), |prev, new| {
+        let b = new.new_object_id();
+        let w = new.add_object(dictionary! {
+            "Type" => "Annot", "Subtype" => "Widget", "F" => 4, "P" => page(prev), "Parent" => b,
+            "Rect" => vec![150.into(), 100.into(), 250.into(), 140.into()],
+        });
+        add_annot(prev, new, w);
+        let (t, kids) = (Object::string_literal("B"), vec![Object::from(w)]);
+        let field = dictionary! { "FT" => "Sig", "T" => t, "Kids" => kids };
+        new.set_object(b, Object::Dictionary(field));
+        let kids: Vec<Object> = if shared { vec![w.into()] } else { Vec::new() };
+        let kids = new.add_object(kids);
+        let a = new.add_object(dictionary! {
+            "FT" => "Tx", "T" => Object::string_literal("A"), "Kids" => kids,
+        });
+        let fields = match shared {
+            true => vec![Object::from(b), a.into()],
+            false => vec![Object::from(a), b.into()],
+        };
+        let r = root(prev);
+        let mut c = dict(prev, r);
+        c.set("AcroForm", dictionary! { "Fields" => fields });
+        new.set_object(r, Object::Dictionary(c));
+    })
+}
+
+/// `W` of [`widget_of_a_signature_field`] made `A`'s by edits to lists of kids and fields alone
+/// (`A` listed first, or `A` listing it too), and filled in as `A`'s in the same revision:
+/// refused as a change to `B`'s field, after an approval and after a certification allowing
+/// form filling, either of which allows filling in `A`.
+#[test]
+fn a_widget_moved_out_of_a_signature_field_is_refused() {
+    let moved = (ChangeKind::FieldChanged("B".into()), Some(Refusal::Never));
+    let mut wrong = Vec::new();
+    for shared in [true, false] {
+        let form = widget_of_a_signature_field(shared);
+        for (after, signed) in [("an approval", approve(&form)), ("P2", certify(&form, 2))] {
+            let e = edit(&signed, |prev, new| {
+                let (a, b) = (titled(prev, "A"), titled(prev, "B"));
+                let w = first_kid(prev, b);
+                if shared {
+                    list_first(prev, new, a);
+                } else {
+                    let kids = dict(prev, a).get(b"Kids").unwrap().as_reference().unwrap();
+                    new.set_object(kids, vec![Object::from(w)]);
+                }
+                let mut d = dict(prev, a);
+                d.set("V", Object::string_literal("PAID"));
+                new.set_object(a, Object::Dictionary(d));
+                let ap = appearance(new, "BT (PAID) Tj ET");
+                let mut d = dict(prev, w);
+                d.set("AP", dictionary! { "N" => ap });
+                new.set_object(w, Object::Dictionary(d));
+            });
+            let got = changes(&e);
+            if !got.contains(&moved) || report(&e).all_ok() {
+                wrong.push(format!("shared {shared}, after {after}: {got:?}"));
             }
         }
     }

@@ -1613,11 +1613,12 @@ checks it, and every signed node of a new field is judged, not only the first: o
 report follows, or a value on a widget the report doesn't read, is refused
 (`a_signature_the_report_doesnt_list_is_refused`, `a_new_signature_the_report_doesnt_list_is_refused`; the widget's
 was allowed before, `a_signature_on_a_fields_widget_is_refused`). A field made part of a signature field, or no
-longer, by a list of kids or fields changing is refused, as its signing would go unjudged: a widget moved under one
-and given a made-up signature was reported as nothing before
-(`a_widget_moved_under_a_signature_field_and_signed_is_refused`). So is a field listed under another field, or
-renamed by a change to one above it, as a lock naming it would no longer, and filling it in is judged by the name it
-had: a locked field listed under another was reported as nothing before, and filled in, allowed
+longer, by a list of kids or fields changing is refused, as its signing would go unjudged, or its changes be judged
+as filling in another field: a widget moved under one and given a made-up signature was reported as nothing before
+(`a_widget_moved_under_a_signature_field_and_signed_is_refused`), and one moved out of one and filled in as the
+other field's is refused too (`a_widget_moved_out_of_a_signature_field_is_refused`). So is a field listed under
+another field, or renamed by a change to one above it, as a lock naming it would no longer, and filling it in is
+judged by the name it had: a locked field listed under another was reported as nothing before, and filled in, allowed
 (`a_field_renamed_by_changes_to_other_fields_is_refused`). Each kind of change to a field is found once a page,
 however many of its keys or parts change, and its name copied only then: a field named with 64 KB and 1,000 keys
 changed, and one with 1,000 parts changed, were found 1,000 times each before
