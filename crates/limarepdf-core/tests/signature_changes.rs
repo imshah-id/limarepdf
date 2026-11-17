@@ -1275,6 +1275,59 @@ fn a_signature_the_report_doesnt_list_is_refused() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// An empty signature field given, after a certification allowing no changes or after an
+/// approval and a document timestamp, the timestamp's signature or the first one, and a
+/// drawing: the report lists the earlier signature in it too, but nothing was signed in that
+/// step, so it's refused. It was allowed as that field's signing or timestamp. A copy of the
+/// timestamp's dictionary in an object of its own is a signature the report finds copied.
+#[test]
+fn an_earlier_signature_put_in_a_field_is_refused() {
+    let field = extra_field(&base_pdf(), false, |_| Dictionary::new());
+    let what = "a signature in field \"Extra\" it can't check";
+    let refused = (ChangeKind::Unrecognised(what.into()), Some(Refusal::Never));
+    let mut wrong = Vec::new();
+    for (signed, after) in [(certify(&field, 1), "P1"), (approve(&field), "an approval")] {
+        let stamped = timestamp(&signed, true);
+        for from in ["Timestamp1", "Signature1"] {
+            let b = edit(&stamped, |prev, new| {
+                let v = dict(prev, titled(prev, from)).get(b"V").unwrap().clone();
+                let extra = titled(prev, "Extra");
+                let mut d = dict(prev, extra);
+                let look = appearance(new, "BT (PAID) Tj ET");
+                d.set("V", v);
+                d.set("AP", dictionary! { "N" => look });
+                new.set_object(extra, Object::Dictionary(d));
+            });
+            let got = changes(&b);
+            let credited = |k: &ChangeKind| {
+                let in_extra = |n: &String| n == "Extra";
+                matches!(k, ChangeKind::Signed(n) | ChangeKind::DocumentTimestamp(n) if in_extra(n))
+            };
+            let fine = got.contains(&refused) && !got.iter().any(|(k, _)| credited(k));
+            if !fine || report(&b).all_ok() {
+                wrong.push(format!("after {after}, {from}'s: {got:?}"));
+            }
+        }
+        // A copy in an object of its own: a new signature, found copied.
+        let b = edit(&stamped, |prev, new| {
+            let stamp = dict(prev, titled(prev, "Timestamp1"));
+            let v = stamp.get(b"V").unwrap().as_reference().unwrap();
+            let copy = new.add_object(dict(prev, v));
+            let extra = titled(prev, "Extra");
+            let mut d = dict(prev, extra);
+            d.set("V", copy);
+            new.set_object(extra, Object::Dictionary(d));
+        });
+        let status = sig(&b, "Extra").status;
+        let copied = matches!(&status,
+            SigStatus::Broken(why) if why.contains("added after the version"));
+        if !copied || report(&b).all_ok() {
+            wrong.push(format!("after {after}, a copy: {status:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// A made-up signature on the widget of an empty signature field rather than on the field:
 /// the report reads a field's signature from the field, so it doesn't list this one, and with
 /// nothing to check it the signing is refused. It was allowed (after an ordinary signature,

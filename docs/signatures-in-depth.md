@@ -591,7 +591,8 @@ count as parts. A signature field added with an action on it or on its widget (o
 is refused for the action, even where adding the field is allowed: the field is listed as added beside the refused
 action. Signing in a field counts as signing only when LimarePDF lists that signature, since nothing else checks it:
 one it doesn't list (in a field nested more than 32 levels deep, say, or on one of a field's widgets rather than the
-field itself) is refused as a signature it can't check. A signature field's widgets are judged with the field,
+field itself) is refused as a signature it can't check, and so is an earlier signature put in a field, as nothing
+was signed there. A signature field's widgets are judged with the field,
 whether they are the field itself or kids of it: their drawing may change as the field is signed, and not after. A
 form field moved into a signature field or out of one,
 moved under another field or listed again under one, or renamed by a change to a field above it is refused too, and

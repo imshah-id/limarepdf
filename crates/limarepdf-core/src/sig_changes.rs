@@ -2558,9 +2558,14 @@ impl<'a> Judge<'a> {
     }
 
     /// Field `id`, signed in this step (`new_visible` as for [`sign_seen`]): signing only when
-    /// the report lists its signature, as nothing else checks it.
+    /// the report lists its signature, as nothing else checks it, and the signature's
+    /// dictionary is new in this step: an earlier signature put in it signs nothing here.
     fn signing(&self, id: ObjectId, f: &FieldInfo, new_visible: Option<bool>) -> Seen {
-        if self.listed.contains(&id) {
+        let earlier = match self.new.dict_of(id).and_then(|d| d.get(b"V").ok()) {
+            Some(Object::Reference(v)) => self.old.get(*v).is_some(),
+            _ => false,
+        };
+        if self.listed.contains(&id) && !earlier {
             return sign_seen(f, new_visible);
         }
         let what = format!("a signature in field \"{}\" it can't check", f.name);

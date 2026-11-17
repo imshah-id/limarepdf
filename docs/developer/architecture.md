@@ -1615,7 +1615,12 @@ accessor: 2,000 new signature fields, about 4,000,000 looks before, 4,000 now
 checks it, and every signed node of a new field is judged, not only the first: one nested past the 32 levels the
 report follows, or a value on a widget the report doesn't read, is refused
 (`a_signature_the_report_doesnt_list_is_refused`, `a_new_signature_the_report_doesnt_list_is_refused`; the widget's
-was allowed before, `a_signature_on_a_fields_widget_is_refused`). A widget that is a kid of a signature field is
+was allowed before, `a_signature_on_a_fields_widget_is_refused`). Nor does a field count as signed when its `/V`
+refers to a signature dictionary the version before the step has: an empty field given a document timestamp's or
+the first signature's, after a certification allowing no changes or an approval, was allowed as its timestamp or
+signing before, the report listing the earlier signature in both fields
+(`an_earlier_signature_put_in_a_field_is_refused`; a copy in an object of its own is a signature the report finds
+copied). A widget that is a kid of a signature field is
 judged by the field it's part of (`FieldInfo::field`), as signing sets the field's `/V` and draws and locks its
 widgets: signing such a field, empty, was refused before, the kid's new drawing taken for a change to an unsigned
 field, and a signing that redraws the kid's own drawing in place was too; that drawing redrawn after signing, in place
