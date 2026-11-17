@@ -1036,9 +1036,10 @@ fn two_parents(depth: usize, named: bool, shared: bool) -> Vec<u8> {
 
 /// `F` of [`two_parents`] made `B`'s by edits to lists of kids and fields alone (`A` listing
 /// it no more, or `B` listed first, `B` listing it too if it didn't), and given a made-up
-/// signature in the same revision: refused as a change to `A`'s field. Before, `F` turning
-/// into part of a signature field meant its signing was never judged, and nothing was
-/// reported: 33 levels down, past what the report lists, or listed by `B` only in the revision.
+/// signature in the same revision: refused as a change to `A`'s field. Before, listed by `B`
+/// only in the revision, `F`'s signing was never judged and nothing was reported; 33 levels
+/// down, past the 32 the form was followed to, `F` stayed `A`'s: refused as removed when `A`
+/// dropped it, or taken for `A.F` filled in when `B` came first, allowed after an approval.
 #[test]
 fn a_widget_moved_under_a_signature_field_and_signed_is_refused() {
     let mut wrong = Vec::new();
