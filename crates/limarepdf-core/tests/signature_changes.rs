@@ -1314,17 +1314,25 @@ fn a_signed_fields_widget_moved_to_another_signature_field_is_refused() {
 #[test]
 fn a_change_undone_before_the_next_signature_still_counts() {
     let b = approve(&base_pdf());
-    let rotate = |b: &[u8], r: i64| {
+    let rotate = |b: &[u8], r: Option<i64>| {
         edit(b, |prev, new| {
             let p = page(prev);
             let mut d = dict(prev, p);
-            d.set("Rotate", r);
+            match r {
+                Some(r) => d.set("Rotate", r),
+                None => _ = d.remove(b"Rotate"),
+            }
             new.set_object(p, Object::Dictionary(d));
         })
     };
-    // Turned, countersigned, turned back: the file ends as the first signer signed it,
-    // but the second signer signed something else.
-    let b = rotate(&countersign(&rotate(&b, 90), "Signature2", false), 0);
+    // Turned, countersigned, turned back: the page ends as the first signer signed it, but
+    // the second signer signed something else. Before, as the second signature ends just
+    // before the end of line its revision's end takes in, the first was checked against
+    // the end alone, and only the second signing was seen.
+    let turned = countersign(&rotate(&b, Some(90)), "Signature2", false);
+    let b = rotate(&turned, None);
+    let d = Document::load_mem(&b).unwrap();
+    assert!(!dict(&d, page(&d)).has(b"Rotate"));
     assert_refused(&b, &ChangeKind::PageContent);
     assert!(!sig(&b, "Signature2").changes_allowed());
 }

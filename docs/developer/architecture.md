@@ -1567,9 +1567,12 @@ so signed attributes are never re-encoded before checking. The cryptography is R
 appended revisions' cross-reference sections itself (lopdf corrects bad offsets and repairs broken tables, which
 would hide changes), checks that lopdf reads the same objects (in number order, so a revision with several faults
 always gives the same reason: saving compares the reasons before and after, and one naming another object would
-count as a new change), then compares each signed version with the next,
-judging every object that differs by each role it plays (page content, comment, form field, signature, document
-structure) against the signer's permissions. Each version keeps each `/Annots` list once, however many pages share
+count as a new change), then compares each signed version with the next (a later signature's version is one when only
+white space lies between its end and a revision's, either way round: one ending at `%%EOF`, before the end of line
+the revision's end takes in, wasn't, so a change made before it and undone after was missed,
+`a_change_undone_before_the_next_signature_still_counts`), judging every object that differs by each role it plays
+(page content, comment, form field, signature, document structure) against the signer's permissions. Each version
+keeps each `/Annots` list once, however many pages share
 it, and each pair of lists (before and after) is compared once: its entries are looked for by their references, and
 those written in place (which the format doesn't allow) among each other. Each entry of each pair, each comparison,
 and each change found for each page it shows on is a step, within `MAX_STEPS` (4,000,000) a version, past which the

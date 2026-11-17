@@ -325,6 +325,13 @@ fn changes_between(
         Ok(s) => s,
         Err(why) => return malformed(why),
     };
+    // A revision ends at `at` when only white space lies between, either way round: a
+    // signature may end at "%%EOF", before the end of line a revision's end takes in.
+    let ends_at = |s: &Section, at: usize| {
+        let (lo, hi) = (s.end.min(at), s.end.max(at));
+        bytes[lo..hi].iter().all(|&c| is_white(c))
+    };
+    let ends_by = |s: &Section, at: usize| s.end <= at || ends_at(s, at);
     // The versions to compare: this one, each later signed version that is one of the
     // revisions read, and the whole file.
     let mut anchors = vec![end];
@@ -332,11 +339,7 @@ fn changes_between(
         .iter()
         .copied()
         .filter(|&e| e > end && e < bytes.len())
-        .filter(|&e| {
-            sections
-                .iter()
-                .any(|s| s.end <= e && bytes[s.end..e].iter().all(|&c| is_white(c)))
-        })
+        .filter(|&e| sections.iter().any(|s| ends_at(s, e)))
         .collect();
     later.sort_unstable();
     later.dedup();
@@ -349,7 +352,7 @@ fn changes_between(
         // Newest first, as read.
         let between: Vec<&Section> = sections
             .iter()
-            .filter(|s| s.offset >= a && s.end <= b)
+            .filter(|s| s.offset >= a && ends_by(s, b))
             .collect();
         if between.is_empty() {
             continue;
@@ -360,7 +363,7 @@ fn changes_between(
         }
         let before: Vec<&Section> = sections
             .iter()
-            .filter(|s| s.offset >= end && s.end <= a)
+            .filter(|s| s.offset >= end && ends_by(s, a))
             .collect();
         let found = compare_versions(versions, end, a, b, &before, &between, listed);
         let stop = found
