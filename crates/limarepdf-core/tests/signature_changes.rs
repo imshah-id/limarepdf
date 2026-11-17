@@ -882,6 +882,134 @@ fn a_field_listed_again_is_refused() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// The base document with widget `G` on the page and its `/Parent` text field `B`, valued
+/// `old`: `B` listed nowhere, with `G` its kid, and `G` alone in `/Fields` (`G listed`) or
+/// `/Fields` empty (`G unlisted`); both in `/Fields`, `B` with no kids (`B listed apart`); or
+/// `B` alone in `/Fields`, with `G` its kid (`B listed`).
+fn parent_apart(shape: &str) -> Vec<u8> {
+    edit(&base_pdf(), |prev, new| {
+        let b = new.new_object_id();
+        let ap = appearance(new, "");
+        let g = new.add_object(dictionary! {
+            "Type" => "Annot", "Subtype" => "Widget", "T" => Object::string_literal("G"),
+            "F" => 4, "P" => page(prev), "Parent" => b,
+            "Rect" => vec![150.into(), 100.into(), 250.into(), 120.into()],
+            "AP" => dictionary! { "N" => ap },
+        });
+        add_annot(prev, new, g);
+        let apart = shape == "B listed apart";
+        let kids: Vec<Object> = if apart { vec![] } else { vec![g.into()] };
+        new.set_object(
+            b,
+            dictionary! {
+                "T" => Object::string_literal("B"), "FT" => "Tx",
+                "V" => Object::string_literal("old"), "Kids" => kids,
+            },
+        );
+        let fields: Vec<Object> = match shape {
+            "G listed" => vec![g.into()],
+            "G unlisted" => vec![],
+            "B listed" => vec![b.into()],
+            _ => vec![g.into(), b.into()],
+        };
+        let r = root(prev);
+        let mut c = dict(prev, r);
+        c.set(
+            "AcroForm",
+            dictionary! { "Fields" => fields, "DA" => Object::string_literal("/Helv 0 Tf 0 g") },
+        );
+        new.set_object(r, Object::Dictionary(c));
+    })
+}
+
+/// A widget's `/Parent` other than the field listing it, which readers following `/Parent`
+/// take its name, type, value and actions from: `B` of [`parent_apart`], listed nowhere,
+/// renamed and refilled, refilled, made a list, or given a script. Each is refused after a
+/// certification, an approval or a lock naming the widget either way, as a change to field
+/// `G`, or to an annotation with `G` not in `/Fields`; so is filling `G` in, named `B.G` by
+/// such readers, with `B` listed nowhere or listed apart. Only filling `G` in after a lock
+/// naming `G` or a certification allowing no changes was refused before. With `B` listed and
+/// `G` its kid, filling `G` in is still allowed after a certification allowing it or an
+/// approval.
+#[test]
+fn a_field_s_parent_other_than_its_listing_is_refused() {
+    // An edit to `B`'s dictionary.
+    type FieldEdit = fn(&mut Dictionary);
+    let edits: [(&str, FieldEdit); 4] = [
+        ("B renamed C and refilled", |d| {
+            d.set("T", Object::string_literal("C"));
+            d.set("V", Object::string_literal("new"));
+        }),
+        ("B refilled", |d| d.set("V", Object::string_literal("new"))),
+        ("B made a list", |d| d.set("FT", "Ch")),
+        ("B given a script", |d| {
+            let js = Object::string_literal("app.alert(1)");
+            let action = dictionary! { "S" => "JavaScript", "JS" => js };
+            d.set("AA", dictionary! { "F" => action });
+        }),
+    ];
+    let signers = [
+        "P1",
+        "P2",
+        "an approval",
+        "a lock naming B.G",
+        "a lock naming G",
+    ];
+    let sign = |b: &[u8], signer: &str| match signer {
+        "P1" => certify(b, 1),
+        "P2" => certify(b, 2),
+        "an approval" => approve(b),
+        "a lock naming B.G" => locked_by(b, lock("Include", &["B.G"], None)),
+        _ => locked_by(b, lock("Include", &["G"], None)),
+    };
+    let mut wrong = Vec::new();
+    for shape in ["G listed", "G unlisted", "B listed apart", "B listed"] {
+        let want = match shape {
+            "G unlisted" => (ChangeKind::AnnotationChanged, Some(Refusal::Never)),
+            _ => (ChangeKind::FieldChanged("G".into()), Some(Refusal::Never)),
+        };
+        for signer in signers {
+            let signed = sign(&parent_apart(shape), signer);
+            // `B` listed is a field of its own, its changes judged as such.
+            let edits = if shape.starts_with("B listed") {
+                &[][..]
+            } else {
+                &edits[..]
+            };
+            for (what, edit_b) in edits {
+                let e = edit(&signed, |prev, new| {
+                    let parent = dict(prev, titled(prev, "G")).get(b"Parent").cloned();
+                    change(prev, new, parent.unwrap().as_reference().unwrap(), edit_b);
+                });
+                let got = changes(&e);
+                let allowed = got.iter().any(|c| c.1.is_none());
+                if !got.contains(&want) || allowed || report(&e).all_ok() {
+                    wrong.push(format!("{shape}, {what} after {signer}: {got:?}"));
+                }
+            }
+            if shape != "G unlisted" {
+                let e = edit(&signed, |prev, new| {
+                    let ap = appearance(new, "BT (Jane) Tj ET");
+                    change(prev, new, titled(prev, "G"), |d| {
+                        d.set("V", Object::string_literal("Jane"));
+                        d.set("AP", dictionary! { "N" => ap });
+                    });
+                });
+                let got = changes(&e);
+                let mistaken = match shape {
+                    "B listed" if ["P2", "an approval"].contains(&signer) => !report(&e).all_ok(),
+                    "B listed" => false,
+                    _ => !got.contains(&want) || report(&e).all_ok(),
+                };
+                if mistaken {
+                    wrong.push(format!("{shape}, G filled after {signer}: {got:?}"));
+                }
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 #[test]
 fn actions_and_scripts_are_refused() {
     let b = approve(&base_pdf());

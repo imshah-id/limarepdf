@@ -594,7 +594,9 @@ one it doesn't list (in a field nested more than 32 levels deep, say, or on one 
 field itself) is refused as a signature it can't check. A form field moved into a signature field or out of one,
 moved under another field or listed again under one, or renamed by a change to a field above it is refused too, and
 so is a signature field added with a field of another kind inside it (a text field, say), as adding one is never
-allowed, on its own or not. A signature field added around one signed earlier counts as added, not as signed.
+allowed, on its own or not. So is any change to a field whose `/Parent` names a field other than the one listing it,
+or to that field when nothing else lists it, as readers that go by `/Parent` would give it another name, type or
+value. A signature field added around one signed earlier counts as added, not as signed.
 
 LimarePDF reads the later additions with its own strict reader rather than the lenient one it uses to open files, and
 refuses as malformed:

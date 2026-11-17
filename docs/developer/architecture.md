@@ -1636,7 +1636,13 @@ the one it's named by, or no longer, is refused too, as a reader going by that l
 listed again under another field, an untitled one or a signature field, kept or added, was reported as nothing before,
 as only the listing a field is named by was compared, and a new signature field's widget listed under another field
 too, or in `/Fields` too, allowed, now refused as a change to that field or as a field added; a field listed twice by
-the same field or by `/Fields` is the same either way, and allowed (`a_field_listed_again_is_refused`). Each kind of
+the same field or by `/Fields` is the same either way, and allowed (`a_field_listed_again_is_refused`). A field whose
+`/Parent` names another than the field listing it, which readers following `/Parent` name it by and take its type,
+value and actions from, is walked as all a change to it (`FieldMeta`), so that `/Parent`, when recorded nowhere, is
+part of it too, as is one an annotation not in `/Fields` names: such a parent renamed, refilled, made a list or given
+a script was reported as nothing before, and the widget filled in allowed after an approval, a certification allowing
+filling in or a lock naming it as that parent's kid; a widget whose `/Parent` is the field listing it is filled in as
+before (`a_field_s_parent_other_than_its_listing_is_refused`). Each kind of
 change to a field is found once a page, however many of its keys or parts change, and its name copied only then:
 text and signature fields named with 64 KB, signed or not, with 1,000 keys or parts changed (a seed value's or a
 signature's too), were found 1,000 times each before, and the test counts the names copied, one a field

@@ -1980,7 +1980,19 @@ impl Walker<'_, '_> {
                     };
                     for (k, val) in d.iter() {
                         match k.as_slice() {
-                            b"P" | b"Parent" | b"IRT" => {}
+                            b"P" | b"IRT" => {}
+                            // A parent recorded nowhere names a widget for readers following
+                            // `/Parent`, and gives it a type, value and actions.
+                            b"Parent" => {
+                                let up = val.as_reference().ok().filter(|r| {
+                                    !self.r.fields.contains_key(r)
+                                        && !self.r.annots.contains_key(r)
+                                        && v.dict_of(*r).is_some()
+                                });
+                                if let Some(r) = up {
+                                    self.push(r, part, id);
+                                }
+                            }
                             b"Popup" => {
                                 if let Ok(r) = val.as_reference() {
                                     if !self.r.fields.contains_key(&r) {
@@ -2000,7 +2012,19 @@ impl Walker<'_, '_> {
                     };
                     for (k, val) in d.iter() {
                         match k.as_slice() {
-                            b"Parent" | b"P" => {}
+                            b"P" => {}
+                            // Readers following `/Parent` name the field, and take its type,
+                            // value and actions, from what it names: one other than the field
+                            // listing it makes the field all a change to it, and walked so, a
+                            // parent recorded nowhere (and its own) part of it.
+                            b"Parent" => {
+                                let up =
+                                    val.as_reference().ok().filter(|r| v.dict_of(*r).is_some());
+                                let listing = self.r.fields.get(&id).and_then(|f| f.parent);
+                                if up.is_some_and(|r| Some(r) != listing) {
+                                    self.push(id, Kind::FieldMeta, id);
+                                }
+                            }
                             b"Kids" => {
                                 if let Ok(r) = val.as_reference() {
                                     self.push(r, Kind::FieldsArray, id);
