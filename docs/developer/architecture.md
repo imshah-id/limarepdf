@@ -1217,7 +1217,15 @@ alike; PB-04); content none of these places counts as on a page that went, so it
 removal being refused. Object references (`OBJR`) aren't marked content and keep their old test. Form field walks
 share one depth rule (PB-05): fields at most `forms::MAX_DEPTH` (32) below the top field, their widgets one level
 further, as `form_nodes` reads them: `value_nodes` and `field_goes` refuse a node with kids deeper than that, and
-`orphan_widgets` a widget with more than 33 parents.
+`orphan_widgets` a widget with more than 33 parents. A `/Kids` array object that many nodes list, as no well-made
+file has, is walked once, not once a node: in `forms.rs` a node listing it again takes its kids from that walk
+(`Walk::kids`, kept by depth so a shallower node still reaches kids too deep before, and walked again through a
+loop so names come out as `sig_changes` gives them), and a widget more than one field lists goes to the first
+(`Walk::claimed`; it went to each before); `value_nodes` passes over it. `repair.rs`'s `mend_page_tree` mends such a
+list once, into one new object the nodes sharing it all take, so a page written there is a kid of the first node's,
+and reads the bytes' object headers once (`object_lines`) for the kids that aren't page nodes
+(`fields_sharing_their_kids_are_walked_once`, `widgets_shared_by_fields_go_to_the_first`,
+`page_tree_nodes_sharing_their_kids_are_mended_once`, `kids_that_are_no_page_are_looked_for_in_one_pass`).
 
 Deleting pages, extracting and splitting are held to redaction's promise (PB-137, D-22 (a)). `drawn_before` walks
 the document's drawings first (`Pdf::reach`) and keeps what was drawn and painted, and the subset drawn for certain

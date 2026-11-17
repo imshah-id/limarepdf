@@ -5,7 +5,7 @@
 //! A page tree that lopdf reads with no pages, for reasons other readers look past, is
 //! mended too (see [`mend_page_tree`]).
 
-use lopdf::{Dictionary, Document, LoadOptions, Object};
+use lopdf::{Dictionary, Document, LoadOptions, Object, ObjectId};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::Write as _;
 use std::io::Cursor;
@@ -163,7 +163,13 @@ pub(crate) fn mend_page_tree(doc: &mut Document, bytes: &[u8]) -> bool {
     };
     let start = bytes.windows(5).position(|w| w == b"%PDF-").unwrap_or(0);
     let body = &bytes[start..];
-    let mut scan = None;
+    let mut lines = None;
+    // The kids no copy in `bytes` mends.
+    let mut missing = HashSet::new();
+    // Each `/Kids` array object, by the shallowest depth its kids were queued from and the
+    // mended copy made of it: nodes sharing one, as no well-made tree has, take that copy,
+    // and a page written in it is a kid of the first node's.
+    let mut lists: HashMap<ObjectId, (usize, Option<ObjectId>)> = HashMap::new();
     let mut changed = false;
     let mut seen = HashSet::new();
     let mut todo = vec![(root, 0)];
@@ -172,12 +178,26 @@ pub(crate) fn mend_page_tree(doc: &mut Document, bytes: &[u8]) -> bool {
             continue;
         }
         let kids = match doc.get_dictionary(node).and_then(|d| d.get(b"Kids")) {
-            Ok(Object::Array(a)) => a.clone(),
-            Ok(Object::Reference(r)) => match doc.get_object(*r) {
-                Ok(Object::Array(a)) => a.clone(),
-                _ => continue,
-            },
+            Ok(Object::Array(a)) => Ok(a.clone()),
+            Ok(Object::Reference(r)) => Err(*r),
             _ => continue,
+        };
+        let (list, kids) = match kids {
+            Ok(kids) => (None, kids),
+            Err(list) => {
+                let (from, copy) = lists.get(&list).copied().unwrap_or((usize::MAX, None));
+                if let (Some(copy), Ok(d)) = (copy, doc.get_dictionary_mut(node)) {
+                    d.set("Kids", copy);
+                }
+                if from <= depth {
+                    continue;
+                }
+                lists.insert(list, (depth, copy));
+                match doc.get_object(copy.unwrap_or(list)) {
+                    Ok(Object::Array(a)) => (Some(list), a.clone()),
+                    _ => continue,
+                }
+            }
         };
         let mut mended = kids.clone();
         for kid in &mut mended {
@@ -190,13 +210,19 @@ pub(crate) fn mend_page_tree(doc: &mut Document, bytes: &[u8]) -> bool {
                 Object::Reference(id) => {
                     let id = *id;
                     if !doc.get_dictionary(id).is_ok_and(is_page_node) {
-                        let scan = scan.get_or_insert_with(|| scan_objects(body));
-                        match page_node_copy(body, scan, id) {
+                        if missing.contains(&id) {
+                            continue;
+                        }
+                        let lines = lines.get_or_insert_with(|| object_lines(body));
+                        match page_node_copy(body, lines, id) {
                             Some(d) => {
                                 doc.objects.insert(id, Object::Dictionary(d));
                                 changed = true;
                             }
-                            None => continue,
+                            None => {
+                                missing.insert(id);
+                                continue;
+                            }
                         }
                     }
                     id
@@ -204,9 +230,19 @@ pub(crate) fn mend_page_tree(doc: &mut Document, bytes: &[u8]) -> bool {
                 _ => continue,
             };
             *kid = Object::Reference(id);
+            #[cfg(test)]
+            tests::QUEUED.set(tests::QUEUED.get() + 1);
             todo.push((id, depth + 1));
         }
         if mended != kids {
+            let mended = match list {
+                Some(list) => {
+                    let copy = doc.add_object(mended);
+                    lists.insert(list, (depth, Some(copy)));
+                    Object::Reference(copy)
+                }
+                None => Object::Array(mended),
+            };
             if let Ok(d) = doc.get_dictionary_mut(node) {
                 d.set("Kids", mended);
                 changed = true;
@@ -221,28 +257,44 @@ fn is_page_node(d: &Dictionary) -> bool {
     d.has_type(b"Page") || d.has_type(b"Pages")
 }
 
-/// The first copy of object `id` in `b`, outside stream data, that is a page or a page tree
-/// node.
-fn page_node_copy(b: &[u8], scan: &Scan, id: lopdf::ObjectId) -> Option<Dictionary> {
+/// Where each object's headers in `b` are, outside stream data, in the order they come: a
+/// header starts a line, after any spaces and tabs.
+fn object_lines(b: &[u8]) -> HashMap<ObjectId, Vec<usize>> {
+    let scan = scan_objects(b);
+    let mut lines: HashMap<ObjectId, Vec<usize>> = HashMap::new();
     let mut i = 0;
     while i < b.len() {
+        #[cfg(test)]
+        tests::LINES_READ.set(tests::LINES_READ.get() + 1);
         let line = i + b[i..]
             .iter()
             .take_while(|c| matches!(c, b' ' | b'\t'))
             .count();
-        if object_header(&b[line..]) == Some(id) && !scan.in_stream(line) {
-            let after = line + find(&b[line..], b"obj")? + 3;
-            let at = after + b[after..].iter().take_while(|c| is_white(**c)).count();
-            if let Some(d) = read_dictionary(&b[at..]).filter(is_page_node) {
-                return Some(d);
-            }
+        if let Some(id) = object_header(&b[line..]).filter(|_| !scan.in_stream(line)) {
+            lines.entry(id).or_default().push(line);
         }
         i = match b[i..].iter().position(|c| matches!(c, b'\r' | b'\n')) {
             Some(n) => i + n + 1,
             None => b.len(),
         };
     }
-    None
+    lines
+}
+
+/// The first copy of object `id` in `b`, of those `lines` finds, that is a page or a page
+/// tree node.
+fn page_node_copy(
+    b: &[u8],
+    lines: &HashMap<ObjectId, Vec<usize>>,
+    id: ObjectId,
+) -> Option<Dictionary> {
+    lines.get(&id)?.iter().find_map(|&line| {
+        #[cfg(test)]
+        tests::COPIES_READ.set(tests::COPIES_READ.get() + 1);
+        let after = line + find(&b[line..], b"obj")? + 3;
+        let at = after + b[after..].iter().take_while(|c| is_white(**c)).count();
+        read_dictionary(&b[at..]).filter(is_page_node)
+    })
 }
 
 /// What a scan of a file's bytes finds.
@@ -624,6 +676,87 @@ fn is_white(c: u8) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lopdf::dictionary;
+    use std::cell::Cell;
+
+    thread_local! {
+        /// Page tree kids queued to be mended on this thread.
+        pub(super) static QUEUED: Cell<usize> = const { Cell::new(0) };
+        /// Lines of a file looked at for an object's copies on this thread.
+        pub(super) static LINES_READ: Cell<usize> = const { Cell::new(0) };
+        /// Copies of an object read on this thread, for one that is a page or a node.
+        pub(super) static COPIES_READ: Cell<usize> = const { Cell::new(0) };
+    }
+
+    /// A document whose catalog's page tree is `root`.
+    fn with_root(doc: &mut Document, root: lopdf::ObjectId) {
+        let catalog = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => root });
+        doc.trailer.set("Root", catalog);
+    }
+
+    #[test]
+    fn page_tree_nodes_sharing_their_kids_are_mended_once() {
+        // Each node lists every node, and a page written directly, as its kids: the kids
+        // were queued again for each node, and the page copied again.
+        let n = 2_000;
+        let mut doc = Document::with_version("1.7");
+        let shared = doc.new_object_id();
+        let nodes: Vec<Object> = (0..n)
+            .map(|_| {
+                let node = dictionary! { "Type" => "Pages", "Kids" => shared };
+                doc.add_object(node).into()
+            })
+            .collect();
+        let mut kids = nodes.clone();
+        kids.push(dictionary! { "Type" => "Page" }.into());
+        doc.objects.insert(shared, Object::Array(kids));
+        let root = nodes[0].as_reference().unwrap();
+        with_root(&mut doc, root);
+        let before = doc.objects.len();
+        QUEUED.set(0);
+        assert!(mend_page_tree(&mut doc, b"%PDF-1.7\n"));
+        assert!(QUEUED.get() < 4 * n, "queued {} kids", QUEUED.get());
+        // One copy of the page, and one of the mended list, which every node now lists.
+        assert_eq!(doc.objects.len(), before + 2);
+        let last = nodes[n - 1].as_reference().unwrap();
+        let list = doc.get_dictionary(last).unwrap().get(b"Kids").unwrap();
+        let list = doc.dereference(list).unwrap().1.as_array().unwrap();
+        let page = list[n].as_reference().unwrap();
+        let page = doc.get_dictionary(page).unwrap();
+        assert!(page.has_type(b"Page"));
+        assert_eq!(page.get(b"Parent").unwrap(), &Object::Reference(root));
+    }
+
+    #[test]
+    fn kids_that_are_no_page_are_looked_for_in_one_pass() {
+        // The root lists `n` objects that aren't pages, nor is their copy in the file one,
+        // and `n` nodes that each list one more such object: the file was read again for
+        // each, and the last object's copy for each node.
+        let n = 2_000;
+        let mut doc = Document::with_version("1.7");
+        let mut b = b"%PDF-1.7\n".to_vec();
+        let last = (n as u32 + 1, 0);
+        let mut kids: Vec<Object> = Vec::new();
+        for i in 1..=n as u32 + 1 {
+            b.extend_from_slice(format!("{i} 0 obj\n<< /A 1 >>\nendobj\n").as_bytes());
+            kids.push(Object::Reference((i, 0)));
+        }
+        doc.max_id = last.0;
+        kids.pop();
+        for _ in 0..n {
+            let node = dictionary! { "Type" => "Pages", "Kids" => vec![last.into()] };
+            kids.push(doc.add_object(node).into());
+        }
+        let root = doc.add_object(dictionary! { "Type" => "Pages", "Kids" => kids });
+        with_root(&mut doc, root);
+        let lines = b.iter().filter(|&&c| c == b'\n').count();
+        LINES_READ.set(0);
+        COPIES_READ.set(0);
+        assert!(!mend_page_tree(&mut doc, &b));
+        assert!(LINES_READ.get() <= lines, "read {} lines", LINES_READ.get());
+        let copies = COPIES_READ.get();
+        assert!(copies <= n + 1, "read {copies} copies");
+    }
 
     #[test]
     fn dictionaries_end_at_their_own_brackets() {

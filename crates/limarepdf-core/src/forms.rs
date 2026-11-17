@@ -6,6 +6,7 @@ use crate::matrix::{self as mx, M};
 use crate::{Align, FontChoice, Pdf};
 use lopdf::{Dictionary, Object, ObjectId};
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 
 /// Limits that keep a malformed or hostile file from running away.
 const MAX_FIELDS: usize = 10_000;
@@ -171,6 +172,21 @@ struct Walk {
     limit: usize,
     /// Whether a field was left out for being nested more than [`MAX_DEPTH`] deep.
     too_deep: bool,
+    /// Each `/Kids` array object reached, by its object.
+    kids: HashMap<ObjectId, Kids>,
+    /// The widgets fields have taken.
+    claimed: HashSet<ObjectId>,
+}
+
+/// A node's kids, told apart.
+#[derive(Clone)]
+struct Kids {
+    /// Those that are fields of their own.
+    fields: Rc<[ObjectId]>,
+    /// Those that are the node's widgets.
+    widgets: Rc<[ObjectId]>,
+    /// For a `/Kids` array object, the shallowest depth a node took its kids from.
+    taken: Option<usize>,
 }
 
 impl Pdf {
@@ -263,6 +279,8 @@ impl Pdf {
                 Reach::Every => usize::MAX,
             },
             too_deep: false,
+            kids: HashMap::new(),
+            claimed: HashSet::new(),
         };
         for f in fields {
             if let Ok(id) = f.as_reference() {
@@ -283,8 +301,11 @@ impl Pdf {
             sig: bool,
             depth: usize,
             seen: &mut HashSet<ObjectId>,
+            lists: &mut HashSet<ObjectId>,
             out: &mut Vec<(ObjectId, bool)>,
         ) -> anyhow::Result<()> {
+            #[cfg(test)]
+            tests::LOOKED.set(tests::LOOKED.get() + 1);
             if !seen.insert(id) {
                 return Ok(());
             }
@@ -307,11 +328,18 @@ impl Pdf {
             if kids.is_some() && depth > MAX_DEPTH {
                 anyhow::bail!("the form's fields are nested more than {MAX_DEPTH} deep");
             }
+            // A `/Kids` array object that more than one node lists, as no well-made form
+            // has, is passed over once its kids are walked, as each was then.
+            let list = d.get(b"Kids").and_then(|o| o.as_reference()).ok();
+            if list.is_some_and(|l| lists.contains(&l)) {
+                return Ok(());
+            }
             for k in kids.into_iter().flatten() {
                 if let Ok(k) = k.as_reference() {
-                    walk(p, k, sig, depth + 1, seen, out)?;
+                    walk(p, k, sig, depth + 1, seen, lists, out)?;
                 }
             }
+            lists.extend(list);
             Ok(())
         }
         let fields = self
@@ -319,10 +347,10 @@ impl Pdf {
             .and_then(|f| f.get(b"Fields").ok())
             .and_then(|o| self.doc.dereference(o).ok())
             .and_then(|(_, o)| o.as_array().ok());
-        let (mut seen, mut out) = (HashSet::new(), Vec::new());
+        let (mut seen, mut lists, mut out) = (HashSet::new(), HashSet::new(), Vec::new());
         for f in fields.into_iter().flatten() {
             if let Ok(id) = f.as_reference() {
-                walk(self, id, false, 0, &mut seen, &mut out)?;
+                walk(self, id, false, 0, &mut seen, &mut lists, &mut out)?;
             }
         }
         Ok(out)
@@ -365,6 +393,8 @@ impl Pdf {
     }
 
     fn walk_field(&self, id: ObjectId, parent: &str, inh: &Inherited, depth: usize, w: &mut Walk) {
+        #[cfg(test)]
+        tests::LOOKED.set(tests::LOOKED.get() + 1);
         if depth > MAX_DEPTH {
             w.too_deep |= self.doc.get_dictionary(id).is_ok();
             return;
@@ -406,30 +436,53 @@ impl Pdf {
             inh.opt = Some(opt.clone());
         }
 
-        // Kids with a name are fields of their own; kids without one are this field's
-        // widgets.
-        let kids: Vec<ObjectId> = d
-            .get(b"Kids")
-            .ok()
-            .and_then(|o| self.doc.dereference(o).ok())
-            .and_then(|(_, o)| o.as_array().ok())
-            .map(|a| a.iter().filter_map(|k| k.as_reference().ok()).collect())
-            .unwrap_or_default();
-        let (fields, widgets): (Vec<ObjectId>, Vec<ObjectId>) = kids.into_iter().partition(|k| {
-            self.doc
-                .get_dictionary(*k)
-                .is_ok_and(|k| k.has(b"T") || !k.has(b"Rect"))
-        });
-        if !fields.is_empty() {
-            for k in fields {
-                self.walk_field(k, &name, &inh, depth + 1, w);
+        // A `/Kids` array object that more than one node lists, as no well-made form has, is
+        // taken once its kids are walked: a node listing it after that takes them only from
+        // nearer the top, where kids too deep before are not. A node listing it while they are
+        // walked, through a loop, walks them as a node with its own list would, and names
+        // them as `sig_changes`' roles do.
+        let list = d.get(b"Kids").and_then(|o| o.as_reference()).ok();
+        let kids = match list.and_then(|l| w.kids.get(&l)) {
+            Some(k) => k.clone(),
+            None => self.kids_of(d),
+        };
+        let taken = kids.taken.is_some_and(|t| t <= depth);
+        let take = |w: &mut Walk| {
+            if let Some(l) = list.filter(|_| !taken) {
+                let k = Kids {
+                    taken: Some(depth),
+                    ..kids.clone()
+                };
+                w.kids.insert(l, k);
+            }
+        };
+        if !kids.fields.is_empty() {
+            if taken {
+                // Each was walked, or left out as too deep, from there.
+                w.too_deep |= depth + 1 > MAX_DEPTH;
+            } else {
+                for &k in kids.fields.iter() {
+                    self.walk_field(k, &name, &inh, depth + 1, w);
+                }
+                take(w);
             }
             return;
         }
-        let widgets = if widgets.is_empty() && d.has(b"Rect") {
+        take(w);
+        // A widget that more than one field lists, as no well-made form has, goes to the
+        // first.
+        let widgets = if kids.widgets.is_empty() && d.has(b"Rect") {
             vec![id]
+        } else if taken {
+            Vec::new()
         } else {
-            widgets
+            let mut ws = kids.widgets.to_vec();
+            ws.retain(|&k| {
+                #[cfg(test)]
+                tests::LOOKED.set(tests::LOOKED.get() + 1);
+                w.claimed.insert(k)
+            });
+            ws
         };
         if let Some(field) = self.make_field(name, d, &inh, &widgets, w) {
             let node = Node {
@@ -441,6 +494,30 @@ impl Pdf {
                 opt: inh.opt.map(|o| self.options(&o)).unwrap_or_default(),
             };
             w.out.push((field, node));
+        }
+    }
+
+    /// The kids a field tree node `d` lists: those with a name, or with no `/Rect`, are
+    /// fields of their own; the others are its widgets.
+    fn kids_of(&self, d: &Dictionary) -> Kids {
+        let kids: Vec<ObjectId> = d
+            .get(b"Kids")
+            .ok()
+            .and_then(|o| self.doc.dereference(o).ok())
+            .and_then(|(_, o)| o.as_array().ok())
+            .map(|a| a.iter().filter_map(|k| k.as_reference().ok()).collect())
+            .unwrap_or_default();
+        let (fields, widgets): (Vec<ObjectId>, Vec<ObjectId>) = kids.into_iter().partition(|k| {
+            #[cfg(test)]
+            tests::LOOKED.set(tests::LOOKED.get() + 1);
+            self.doc
+                .get_dictionary(*k)
+                .is_ok_and(|k| k.has(b"T") || !k.has(b"Rect"))
+        });
+        Kids {
+            fields: fields.into(),
+            widgets: widgets.into(),
+            taken: None,
         }
     }
 
@@ -528,6 +605,8 @@ impl Pdf {
 
     /// A widget annotation, if it is on a page.
     fn widget(&self, id: ObjectId, w: &mut Walk) -> Option<Widget> {
+        #[cfg(test)]
+        tests::LOOKED.set(tests::LOOKED.get() + 1);
         let d = self.doc.get_dictionary(id).ok()?;
         let (page, pid) = *w.pages.get(&id)?;
         let rect = self.rect(d.get(b"Rect").ok()?)?;
@@ -685,4 +764,130 @@ pub(crate) fn button_export(state: &str, opt: &[(String, String)]) -> String {
         .ok()
         .and_then(|i| opt.get(i))
         .map_or_else(|| state.to_string(), |o| o.0.clone())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lopdf::dictionary;
+    use std::cell::Cell;
+
+    thread_local! {
+        /// Field tree entries looked at on this thread: nodes walked, kids told apart and
+        /// widgets read.
+        pub(super) static LOOKED: Cell<usize> = const { Cell::new(0) };
+    }
+
+    /// A form of `n` fields, `field(i)` each, listed in `/Fields` and each with the same
+    /// `/Kids` array object, which `kids` makes from the fields' ids.
+    fn sharing(
+        n: usize,
+        field: impl Fn(usize) -> Dictionary,
+        kids: impl FnOnce(&mut Pdf, &[ObjectId]) -> Vec<Object>,
+    ) -> Pdf {
+        let mut p = Pdf::new();
+        p.insert_blank(0, 300.0, 200.0).unwrap();
+        let shared = p.doc.new_object_id();
+        let ids: Vec<ObjectId> = (0..n)
+            .map(|i| {
+                let mut d = field(i);
+                d.set("Kids", shared);
+                p.doc.add_object(d)
+            })
+            .collect();
+        let list = kids(&mut p, &ids);
+        p.doc.objects.insert(shared, Object::Array(list));
+        let fields: Vec<Object> = ids.iter().map(|&id| id.into()).collect();
+        let form = dictionary! { "Fields" => fields };
+        p.doc.catalog_mut().unwrap().set("AcroForm", form);
+        p
+    }
+
+    fn name(i: usize) -> Object {
+        Object::string_literal(format!("f{i}"))
+    }
+
+    fn text_field(i: usize) -> Dictionary {
+        dictionary! { "FT" => "Tx", "T" => name(i) }
+    }
+
+    fn widget() -> Dictionary {
+        let rect: Vec<Object> = vec![0.into(), 0.into(), 10.into(), 10.into()];
+        dictionary! { "Subtype" => "Widget", "Rect" => rect }
+    }
+
+    /// How many widgets each field takes.
+    fn taken(p: &Pdf) -> Vec<usize> {
+        let out = p.field_nodes(Reach::Every).0;
+        out.iter().map(|(_, node)| node.widgets.len()).collect()
+    }
+
+    #[test]
+    fn fields_sharing_their_kids_are_walked_once() {
+        // Each field lists the same `n` fields as its kids: they were told apart and walked
+        // again for each field.
+        let n = 2_000;
+        let p = sharing(
+            n,
+            |i| dictionary! { "T" => name(i) },
+            |p, _| {
+                let kid = |i| p.doc.add_object(text_field(n + i)).into();
+                (0..n).map(kid).collect()
+            },
+        );
+        LOOKED.set(0);
+        let out = p.field_nodes(Reach::Every).0;
+        assert!(LOOKED.get() < 4 * n, "looked at {} entries", LOOKED.get());
+        assert_eq!(out.len(), n);
+        assert_eq!(out[0].0.name, format!("f0.f{n}"));
+        LOOKED.set(0);
+        assert_eq!(p.value_nodes().unwrap().len(), 2 * n);
+        assert!(LOOKED.get() < 4 * n, "looked at {} entries", LOOKED.get());
+
+        // Each field lists every field, a loop: the kids are walked again only as the walk
+        // goes deeper, to as deep as fields may be.
+        let p = sharing(
+            n,
+            |i| dictionary! { "T" => name(i) },
+            |_, ids| ids.iter().map(|&id| id.into()).collect(),
+        );
+        LOOKED.set(0);
+        assert!(p.field_nodes(Reach::Every).1);
+        let most = 4 * (MAX_DEPTH + 2) * n;
+        assert!(LOOKED.get() < most, "looked at {} entries", LOOKED.get());
+    }
+
+    #[test]
+    fn widgets_shared_by_fields_go_to_the_first() {
+        // Each field lists the same widgets as its kids: they were read again for each
+        // field, and each field took them all.
+        let (n, m) = (2_000, 2_000);
+        let p = sharing(n, text_field, |p, _| {
+            (0..m).map(|_| p.doc.add_object(widget()).into()).collect()
+        });
+        let most = 4 * (n + m);
+        LOOKED.set(0);
+        let each = taken(&p);
+        assert!(LOOKED.get() < most, "looked at {} entries", LOOKED.get());
+        assert_eq!(each.len(), n);
+        assert_eq!(each[0], m);
+        assert!(each[1..].iter().all(|&t| t == 0));
+        LOOKED.set(0);
+        assert_eq!(p.value_nodes().unwrap().len(), n + m);
+        assert!(LOOKED.get() < most, "looked at {} entries", LOOKED.get());
+
+        // As when each field lists the widget in an array of its own.
+        let mut p = Pdf::new();
+        let w = p.doc.add_object(widget());
+        let fields: Vec<Object> = (0..2)
+            .map(|i| {
+                let mut f = text_field(i);
+                f.set("Kids", vec![w.into()]);
+                p.doc.add_object(f).into()
+            })
+            .collect();
+        let form = dictionary! { "Fields" => fields };
+        p.doc.catalog_mut().unwrap().set("AcroForm", form);
+        assert_eq!(taken(&p), [1, 0]);
+    }
 }
