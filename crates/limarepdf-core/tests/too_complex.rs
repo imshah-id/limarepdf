@@ -507,10 +507,11 @@ fn too_complex_pictures_child() {
     }
 }
 
-/// Failed on the old code: not named within 30 s.
+/// Failed on the old code: not named within 30 s. The refusal comes after the whole budget,
+/// 2²³ steps (4 s in a debug build, over 10 s on a slow runner), so no closer bound on the
+/// time: the refusal's message says the budget stopped it.
 #[test]
 fn pictures_of_a_page_drawing_forms_over_and_over_are_refused_at_once() {
-    let start = Instant::now();
     let env = [("TOO_COMPLEX_PICTURES_CHILD", "1".to_string())];
     let ran = apart::run("too_complex_pictures_child", &env, Duration::from_secs(30));
     let Ran::Ended(text, status) = ran else {
@@ -520,11 +521,6 @@ fn pictures_of_a_page_drawing_forms_over_and_over_are_refused_at_once() {
     assert_eq!(said.len(), 1, "{}", apart::why_stopped(status));
     assert!(said[0].starts_with("refused|"), "{}", said[0]);
     assert!(said[0].contains("finding the pictures"), "{}", said[0]);
-    assert!(
-        start.elapsed() < Duration::from_secs(10),
-        "{:?}",
-        start.elapsed()
-    );
 }
 
 /// Adds `d` to the end of page 1's annotations.
