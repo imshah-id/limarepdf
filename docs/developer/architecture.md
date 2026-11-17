@@ -1637,8 +1637,9 @@ listed again under another field, an untitled one or a signature field, kept or 
 as only the listing a field is named by was compared, and a new signature field's widget listed under another field
 too, or in `/Fields` too, allowed, now refused as a change to that field or as a field added; a field listed twice by
 the same field or by `/Fields` is the same either way, and allowed (`a_field_listed_again_is_refused`). Each kind of
-change to a field is found once a page, however many of its keys or parts change, and its name copied only then: a
-field named with 64 KB and 1,000 keys changed, and one with 1,000 parts changed, were found 1,000 times each before
+change to a field is found once a page, however many of its keys or parts change, and its name copied only then:
+text and signature fields named with 64 KB, signed or not, with 1,000 keys or parts changed (a seed value's or a
+signature's too), were found 1,000 times each before, and the test counts the names copied, one a field
 (`a_fields_change_is_found_once_however_many_keys_or_parts_change`). A signature field added with a field of another
 kind inside it is refused for that field, as adding one is never allowed, on its own or not: a text field inside one
 was allowed with it before, after an approval or a certification allowing form filling

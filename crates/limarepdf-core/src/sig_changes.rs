@@ -2667,6 +2667,8 @@ impl<'a> Judge<'a> {
 
     /// Field `owner`'s name before this step (what a lock names), or its new name if it's new.
     fn field_name(&self, owner: ObjectId) -> String {
+        #[cfg(test)]
+        tests::NAMES_COPIED.set(tests::NAMES_COPIED.get() + 1);
         self.or
             .fields
             .get(&owner)
@@ -2986,6 +2988,8 @@ mod tests {
         pub(super) static RECT_READ: Cell<usize> = const { Cell::new(0) };
         /// Fields of the newer version `Judge::fields` looked at, on this thread.
         pub(super) static FIELDS_LOOKED: Cell<usize> = const { Cell::new(0) };
+        /// Field names `Judge::field_name` copied, on this thread.
+        pub(super) static NAMES_COPIED: Cell<usize> = const { Cell::new(0) };
     }
 
     fn square(n: usize) -> Dictionary {
@@ -3486,36 +3490,64 @@ mod tests {
         assert_eq!(changes_since(&signed, &p), plain);
     }
 
-    /// A field named with 64 KB whose 1,000 other entries change after signing, and one whose
-    /// 1,000 parts do: each field's change is found once, its name copied once, not once a key
-    /// or a part (1,000 times each before, 64 MB a field and twice that with what it needs).
+    /// Fields named with 64 KB each, whose 1,000 other entries or 1,000 parts change after
+    /// signing: a text field's entries and parts; an unsigned signature field's entries, parts
+    /// and seed value parts; a signed one's entries and its signature's parts. Each field's
+    /// change is found once, its name copied once, not once a key or a part (1,000 times each
+    /// before, 64 MB a field and twice that with what it needs).
     #[test]
     fn a_fields_change_is_found_once_however_many_keys_or_parts_change() {
-        let (a, b) = ("a".repeat(65_536), "b".repeat(65_536));
+        fn keyed(mut d: Dictionary) -> Dictionary {
+            for i in 0..1_000 {
+                d.set(format!("K{i}"), 0);
+            }
+            d
+        }
+        fn parts(doc: &mut lopdf::Document, all: &mut Vec<ObjectId>) -> Object {
+            let list: Vec<Object> = (0..1_000)
+                .map(|_| {
+                    let r = doc.add_object(dictionary! { "N" => 0 });
+                    all.push(r);
+                    r.into()
+                })
+                .collect();
+            list.into()
+        }
+        let name = |c: char| c.to_string().repeat(65_536);
+        let t = |c: char| Object::string_literal(name(c));
         let mut p = Pdf::new();
         p.insert_blank(0, 300.0, 200.0).unwrap();
-        let mut keyed = dictionary! { "FT" => "Tx", "T" => Object::string_literal(a.as_str()) };
-        for i in 0..1_000 {
-            keyed.set(format!("K{i}"), 0);
-        }
-        let keyed = p.doc.add_object(keyed);
-        let parts: Vec<ObjectId> = (0..1_000)
-            .map(|_| p.doc.add_object(dictionary! { "N" => 0 }))
-            .collect();
-        let list: Vec<Object> = parts.iter().map(|&r| r.into()).collect();
-        let named = Object::string_literal(b.as_str());
-        let held = dictionary! { "FT" => "Tx", "T" => named, "X" => list };
-        let held = p.doc.add_object(held);
-        let fields = vec![Object::from(keyed), held.into()];
-        let form = p.doc.add_object(dictionary! { "Fields" => fields });
-        p.doc.catalog_mut().unwrap().set("AcroForm", form);
+        let (doc, mut all) = (&mut p.doc, Vec::new());
+        let text_parts = parts(doc, &mut all);
+        let sig_parts = parts(doc, &mut all);
+        let seed_parts = parts(doc, &mut all);
+        let value = doc.add_object(dictionary! { "Type" => "Sig" });
+        let value_parts = parts(doc, &mut all);
+        let value_parts = doc.add_object(dictionary! { "Type" => "Sig", "X" => value_parts });
+        let ids: Vec<ObjectId> = [
+            keyed(dictionary! { "FT" => "Tx", "T" => t('a') }),
+            dictionary! { "FT" => "Tx", "T" => t('b'), "X" => text_parts },
+            keyed(dictionary! { "FT" => "Sig", "T" => t('c') }),
+            dictionary! { "FT" => "Sig", "T" => t('d'), "X" => sig_parts },
+            dictionary! { "FT" => "Sig", "T" => t('e'), "SV" => seed_parts },
+            keyed(dictionary! { "FT" => "Sig", "T" => t('f'), "V" => value }),
+            dictionary! { "FT" => "Sig", "T" => t('g'), "V" => value_parts },
+        ]
+        .into_iter()
+        .map(|f| doc.add_object(f))
+        .collect();
+        let fields: Vec<Object> = ids.iter().map(|&f| f.into()).collect();
+        let form = doc.add_object(dictionary! { "Fields" => fields });
+        doc.catalog_mut().unwrap().set("AcroForm", form);
         let signed = p.snapshot().unwrap();
         let mut p = Pdf::from_bytes(&signed, None).unwrap();
-        let d = p.doc.get_dictionary_mut(keyed).unwrap();
-        for i in 0..1_000 {
-            d.set(format!("K{i}"), 1);
+        for f in [ids[0], ids[2], ids[5]] {
+            let d = p.doc.get_dictionary_mut(f).unwrap();
+            for i in 0..1_000 {
+                d.set(format!("K{i}"), 1);
+            }
         }
-        for &r in &parts {
+        for &r in &all {
             p.doc.get_dictionary_mut(r).unwrap().set("N", 1);
         }
         let bytes = append_revision(&signed, &p.doc).unwrap().bytes;
@@ -3523,11 +3555,21 @@ mod tests {
         let mut versions = Versions::new(&bytes, None, &whole);
         let end = signed.len();
         let (listed, mut cache) = (listed(&whole), HashMap::new());
+        NAMES_COPIED.set(0);
         let raw = changes_after(&mut versions, &bytes, end, &[end], &listed, &mut cache);
+        let copied = NAMES_COPIED.get();
         let count = |kind: ChangeKind| raw.iter().filter(|s| s.kind == kind).count();
-        let changed = count(ChangeKind::FieldChanged(a));
-        let filled = count(ChangeKind::FieldFilled(b));
-        assert_eq!((changed, filled), (1, 1));
+        let found = [
+            count(ChangeKind::FieldChanged(name('a'))),
+            count(ChangeKind::FieldFilled(name('b'))),
+            count(ChangeKind::FieldChanged(name('c'))),
+            count(ChangeKind::FieldChanged(name('d'))),
+            count(ChangeKind::FieldChanged(name('e'))),
+            count(ChangeKind::SignatureChanged(name('f'))),
+            count(ChangeKind::SignatureChanged(name('g'))),
+        ];
+        assert_eq!(found, [1; 7]);
+        assert_eq!(copied, 7, "names copied");
     }
 
     /// A thousand fields each listing the same 1,000 kids, themselves, with no area on the
