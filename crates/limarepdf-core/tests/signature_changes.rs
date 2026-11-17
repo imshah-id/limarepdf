@@ -763,6 +763,125 @@ fn a_field_renamed_by_changes_to_other_fields_is_refused() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// A field listed again by another field than the one it's named by, or no longer: `B.G` of
+/// [`parent_form`] under `A` listed after `B`, or under `B`'s untitled kid; text field `Name`
+/// under signature field `Approver` listed after it, its kids in an array of their own; or
+/// `Name` under a signature field added after signing. Each is refused as a change to that
+/// field, after a lock naming it, an approval or a certification allowing no changes. So is a
+/// new signature field's widget listed under `Name` too, as a change to `Name`, or in
+/// `/Fields` too, as a field added. Listed twice by the same field or by `/Fields`, a field is
+/// the same either way, so `A` and a new signature field listed twice are allowed. Only the
+/// listing a field is named by was compared, so those refused were allowed before.
+#[test]
+fn a_field_listed_again_is_refused() {
+    let id = |b: &[u8], name| titled(&Document::load_mem(b).unwrap(), name);
+    // Field `name`'s kids in `b`.
+    let kids = |b: &[u8], name| {
+        let d = Document::load_mem(b).unwrap();
+        dict(&d, titled(&d, name)).get(b"Kids").unwrap().clone()
+    };
+    // Field `owner`'s kids, or the kids array `owner`, made `kid`, or none.
+    let list = |b: &[u8], owner: ObjectId, kid: Option<ObjectId>| {
+        let kids: Vec<Object> = kid.into_iter().map(Object::from).collect();
+        edit(b, |prev, new| match prev.get_object(owner).unwrap() {
+            Object::Array(_) => new.set_object(owner, kids),
+            _ => change(prev, new, owner, |d| d.set("Kids", kids)),
+        })
+    };
+    let moved = |field: &str| ChangeKind::FieldChanged(field.into());
+    let mut wrong = Vec::new();
+    // `e` refused for `kind`, or allowed if none.
+    let mut check = |what: &str, e: &[u8], kind: Option<ChangeKind>| {
+        let (got, ok) = (changes(e), report(e).all_ok());
+        let found = kind.map_or(ok, |k| !ok && got.contains(&(k, Some(Refusal::Never))));
+        if !found {
+            wrong.push(format!("{what}: {got:?}"));
+        }
+    };
+    let fields = edit(&parent_form(false), |p, n| relist(p, n, |f| f.reverse()));
+    let (a, g) = (id(&fields, "A"), id(&fields, "G"));
+    let under_b = kids(&fields, "B");
+    let u = under_b.as_array().unwrap()[1].as_reference().unwrap();
+    let twice = list(&fields, a, Some(g));
+    let approver = edit(&form(&["Name"]), |prev, new| {
+        let kids = new.add_object(Vec::<Object>::new());
+        let f = new.add_object(dictionary! {
+            "FT" => "Sig", "T" => Object::string_literal("Approver"), "Kids" => kids,
+        });
+        list_field(prev, new, f);
+    });
+    let array = kids(&approver, "Approver").as_reference().unwrap();
+    let name = id(&approver, "Name");
+    let naming = lock("Include", &["B.G", "Name"], None);
+    let sign = |b: &[u8], signer| match signer {
+        "P1" => certify(b, 1),
+        "an approval" => approve(b),
+        _ => locked_by(b, naming.clone()),
+    };
+    // Each named after its field first.
+    let cases = [
+        ("B.G under A too", &fields, a, Some(g)),
+        ("B.G under the untitled kid too", &fields, u, Some(g)),
+        ("B.G no longer under A too", &twice, a, None),
+        ("Name under Approver too", &approver, array, Some(name)),
+    ];
+    for signer in ["a lock naming it", "an approval", "P1"] {
+        for (case, unsigned, owner, kid) in cases {
+            let e = list(&sign(unsigned, signer), owner, kid);
+            let field = case.split(' ').next();
+            check(&format!("{case} after {signer}"), &e, field.map(moved));
+        }
+        let signed = sign(&fields, signer);
+        let e = edit(&signed, |p, n| relist(p, n, |l| l.push(a.into())));
+        check(&format!("A listed twice after {signer}"), &e, None);
+    }
+    // Signature field `Extra` added with a widget: the field and the widget.
+    let add_extra = |prev: &Document, new: &mut Document| {
+        let (f, w) = (new.new_object_id(), new.new_object_id());
+        let widget = dictionary! {
+            "Type" => "Annot", "Subtype" => "Widget", "P" => page(prev), "Parent" => f,
+            "Rect" => vec![0.into(), 0.into(), 0.into(), 0.into()],
+        };
+        new.set_object(w, widget);
+        add_annot(prev, new, w);
+        let kids = vec![Object::from(w)];
+        let field = dictionary! {
+            "FT" => "Sig", "T" => Object::string_literal("Extra"), "Kids" => kids,
+        };
+        new.set_object(f, field);
+        (f, w)
+    };
+    // After an approval, which allows adding it.
+    let approved = approve(&form(&["Name"]));
+    let e = edit(&approved, |prev, new| {
+        let kids = vec![Object::from(titled(prev, "Name"))];
+        let f = new.add_object(dictionary! {
+            "FT" => "Sig", "T" => Object::string_literal("Extra"), "Kids" => kids,
+        });
+        list_field(prev, new, f);
+    });
+    check("Name under new Extra too", &e, Some(moved("Name")));
+    let e = edit(&approved, |prev, new| {
+        let (f, w) = add_extra(prev, new);
+        let (to, kids) = (titled(prev, "Name"), vec![Object::from(w)]);
+        change(prev, new, to, |d| d.set("Kids", kids));
+        list_first(prev, new, f);
+    });
+    check("Extra's widget under Name too", &e, Some(moved("Name")));
+    let e = edit(&approved, |prev, new| {
+        let (f, w) = add_extra(prev, new);
+        relist(prev, new, |l| l.extend([Object::from(f), Object::from(w)]));
+    });
+    let added = ChangeKind::FieldAdded("Extra".into());
+    check("Extra's widget in /Fields too", &e, Some(added));
+    let e = edit(&approved, |prev, new| {
+        let (f, _) = add_extra(prev, new);
+        relist(prev, new, |l| l.extend([Object::from(f), Object::from(f)]));
+    });
+    check("Extra listed twice", &e, None);
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 #[test]
 fn actions_and_scripts_are_refused() {
     let b = approve(&base_pdf());

@@ -1555,6 +1555,9 @@ struct Roles {
     /// Indirect annotations and the page listing them.
     annots: HashMap<ObjectId, usize>,
     fields: BTreeMap<ObjectId, FieldInfo>,
+    /// Each listing of a field by another than the one it's named by: the field and the field
+    /// listing it, or none for `/Fields`.
+    again: BTreeSet<(ObjectId, Option<ObjectId>)>,
 }
 
 impl Roles {
@@ -1582,6 +1585,7 @@ impl Roles {
             page_annots: HashMap::new(),
             annots: HashMap::new(),
             fields: BTreeMap::new(),
+            again: BTreeSet::new(),
         };
 
         // Each kid the page tree or the form lists is a step, so a list many nodes share costs
@@ -1662,7 +1666,10 @@ impl Roles {
         // Whether a list of kids, which fields may share, holds a widget that shows.
         let mut shown = HashMap::new();
         while let Some((id, parent)) = stack.pop() {
-            if r.fields.contains_key(&id) {
+            if let Some(f) = r.fields.get(&id) {
+                if f.parent != parent {
+                    r.again.insert((id, parent));
+                }
                 continue;
             }
             if r.fields.len() > MAX_NODES {
@@ -2516,6 +2523,30 @@ impl<'a> Judge<'a> {
                     ChangeKind::FieldRemoved(f.name.clone())
                 };
                 self.push(never(kind, None));
+            }
+        }
+        // Listed by another field than the one it's named by, or no longer: only that one is
+        // compared below, but a reader going by another would see the field there.
+        let (or, nr) = (self.or, self.nr);
+        let kept = |p: &ObjectId| or.fields.contains_key(p) && nr.fields.contains_key(p);
+        for (id, by) in or.again.symmetric_difference(&nr.again) {
+            match (or.fields.get(id), nr.fields.get(id), by.filter(kept)) {
+                (Some(o), Some(_), _) => {
+                    let change = if o.signed {
+                        FieldChange::SignatureChanged
+                    } else {
+                        FieldChange::Changed
+                    };
+                    self.push_field(*id, change, None);
+                }
+                // Added in this step, and listed by a field kept too: that one changed.
+                (None, Some(_), Some(p)) => self.push_field(p, FieldChange::Changed, None),
+                // Or by `/Fields` or another field added: a field added outside its tree.
+                (None, Some(f), None) => {
+                    self.push(never(ChangeKind::FieldAdded(f.name.clone()), None));
+                }
+                // Removed: refused as that above.
+                _ => {}
             }
         }
         // The nodes of each field tree added in this step, in number order.

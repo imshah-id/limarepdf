@@ -1631,9 +1631,14 @@ moved under an untitled field reported as nothing, and one renamed through a tit
 (`a_field_renamed_by_changes_to_other_fields_is_refused`); a text field moved into a signature field or out of one
 was reported as nothing too (`a_typed_field_moved_into_or_out_of_a_signature_field_is_refused`), and a signed
 field's widget moved to another signature field, its signature then shown as that field's, allowed
-(`a_signed_fields_widget_moved_to_another_signature_field_is_refused`). Each kind of change to a field is found
-once a page, however many of its keys or parts change, and its name copied only then: a field named with 64 KB and
-1,000 keys changed, and one with 1,000 parts changed, were found 1,000 times each before
+(`a_signed_fields_widget_moved_to_another_signature_field_is_refused`). A field listed again by another field than
+the one it's named by, or no longer, is refused too, as a reader going by that listing would see the field there: one
+listed again under another field, an untitled one or a signature field, kept or added, was reported as nothing before,
+as only the listing a field is named by was compared, and a new signature field's widget listed under another field
+too, or in `/Fields` too, allowed, now refused as a change to that field or as a field added; a field listed twice by
+the same field or by `/Fields` is the same either way, and allowed (`a_field_listed_again_is_refused`). Each kind of
+change to a field is found once a page, however many of its keys or parts change, and its name copied only then: a
+field named with 64 KB and 1,000 keys changed, and one with 1,000 parts changed, were found 1,000 times each before
 (`a_fields_change_is_found_once_however_many_keys_or_parts_change`). A signature field added with a field of another
 kind inside it is refused for that field, as adding one is never allowed, on its own or not: a text field inside one
 was allowed with it before, after an approval or a certification allowing form filling
