@@ -461,6 +461,13 @@ fn read_chain(bytes: &[u8], signed_end: usize) -> Result<Vec<Section>, String> {
             return Err("the chain of revisions loops or is too long".into());
         }
         let read = read_section(bytes, at)?;
+        if read.stray_xref_stm {
+            return Err(
+                "a later revision's cross-reference stream names another one (/XRefStm), \
+                 which PDF apps read differently"
+                    .into(),
+            );
+        }
         let end = revision_end(bytes, read.after, at)
             .ok_or_else(|| format!("the revision at byte {at} isn't closed properly"))?;
         if let Some(newer) = sections.last() {
@@ -505,6 +512,10 @@ struct ReadSection {
     entries: Vec<(u32, Entry)>,
     prev: Option<usize>,
     xref_stm: Option<usize>,
+    /// Whether a cross-reference stream names another with `/XRefStm`, which the
+    /// specification gives a table's trailer only: lopdf adds that stream's entries, other
+    /// apps don't.
+    stray_xref_stm: bool,
     /// Where the section (with its trailer, or its object) ends.
     after: usize,
 }
@@ -569,6 +580,7 @@ fn read_table(bytes: &[u8], mut lx: Lexer) -> Option<ReadSection> {
         entries,
         prev: direct_offset(&trailer, b"Prev")?,
         xref_stm: direct_offset(&trailer, b"XRefStm")?,
+        stray_xref_stm: false,
         after: lx.pos(),
     })
 }
@@ -677,6 +689,7 @@ fn read_xref_stream(bytes: &[u8], mut lx: Lexer) -> Option<ReadSection> {
         entries,
         prev: direct_offset(&dict, b"Prev")?,
         xref_stm: None,
+        stray_xref_stm: dict.has(b"XRefStm"),
         after: tail.pos(),
     })
 }

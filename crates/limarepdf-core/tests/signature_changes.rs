@@ -8,7 +8,7 @@
 mod sigkit;
 
 use limarepdf_core::{
-    verify_signatures, Change, ChangeKind, DigitalSignature, Permissions, Refusal, SigStatus,
+    verify_signatures, Change, ChangeKind, DigitalSignature, Pdf, Permissions, Refusal, SigStatus,
     SignatureReport, TrustList,
 };
 use lopdf::{dictionary, Dictionary, Document, Object, ObjectId, Stream};
@@ -357,7 +357,9 @@ fn a_table_after_a_cross_reference_stream_changes_nothing_by_itself() {
 
 /// A revision written by hand: object 1 as `body` in a new object stream, and a
 /// cross-reference stream giving object 0 the entry `zero` (type and fields, `/W [1 4 2]`).
-fn object_one_in_a_stream(b: &[u8], body: &str, zero: (u8, u32, u16)) -> Vec<u8> {
+/// When `named`, that entry is in a second cross-reference stream the first names with
+/// `/XRefStm` instead, and the first lists nothing for object 0.
+fn object_one_in_a_stream(b: &[u8], body: &str, zero: (u8, u32, u16), named: bool) -> Vec<u8> {
     let d = Document::load_mem(b).unwrap();
     let r = root(&d);
     let tail = String::from_utf8_lossy(&b[b.len() - 40..]).into_owned();
@@ -368,7 +370,7 @@ fn object_one_in_a_stream(b: &[u8], body: &str, zero: (u8, u32, u16)) -> Vec<u8>
         .split_whitespace()
         .next()
         .unwrap();
-    let (stm, x) = (d.max_id + 1, d.max_id + 2);
+    let (stm, x, s) = (d.max_id + 1, d.max_id + 2, d.max_id + 3);
     let mut out = [b, b"\n"].concat();
     let at_stm = out.len();
     let data = format!("1 0 {body}");
@@ -380,23 +382,44 @@ fn object_one_in_a_stream(b: &[u8], body: &str, zero: (u8, u32, u16)) -> Vec<u8>
         )
         .as_bytes(),
     );
-    let at_x = out.len();
-    let mut rows = Vec::new();
-    for (kind, f1, f2) in [
-        zero,
-        (2, stm, 0),
-        (1, at_stm as u32, 0),
-        (1, at_x as u32, 0),
-    ] {
-        rows.push(kind);
-        rows.extend_from_slice(&f1.to_be_bytes());
-        rows.extend_from_slice(&f2.to_be_bytes());
+    let rows = |entries: &[(u8, u32, u16)]| {
+        let mut rows = Vec::new();
+        for &(kind, f1, f2) in entries {
+            rows.push(kind);
+            rows.extend_from_slice(&f1.to_be_bytes());
+            rows.extend_from_slice(&f2.to_be_bytes());
+        }
+        rows
+    };
+    let at_s = out.len();
+    if named {
+        let zero = rows(&[zero]);
+        out.extend_from_slice(
+            format!(
+                "{s} 0 obj\n<< /Type /XRef /W [1 4 2] /Index [0 1] /Size {} /Length {} >>\n\
+                 stream\n",
+                s + 1,
+                zero.len()
+            )
+            .as_bytes(),
+        );
+        out.extend_from_slice(&zero);
+        out.extend_from_slice(b"\nendstream\nendobj\n");
     }
+    let at_x = out.len();
+    let mut entries = vec![(2, stm, 0), (1, at_stm as u32, 0), (1, at_x as u32, 0)];
+    let (index, size, more) = if named {
+        entries.push((1, at_s as u32, 0));
+        (format!("1 1 {stm} 3"), s + 1, format!(" /XRefStm {at_s}"))
+    } else {
+        entries.insert(0, zero);
+        (format!("0 2 {stm} 2"), x + 1, String::new())
+    };
+    let rows = rows(&entries);
     out.extend_from_slice(
         format!(
-            "{x} 0 obj\n<< /Type /XRef /W [1 4 2] /Index [0 2 {stm} 2] /Size {} /Root {} {} R \
-             /Prev {prev} /Length {} >>\nstream\n",
-            x + 1,
+            "{x} 0 obj\n<< /Type /XRef /W [1 4 2] /Index [{index}] /Size {size} /Root {} {} R \
+             /Prev {prev}{more} /Length {} >>\nstream\n",
             r.0,
             r.1,
             rows.len()
@@ -408,15 +431,9 @@ fn object_one_in_a_stream(b: &[u8], body: &str, zero: (u8, u32, u16)) -> Vec<u8>
     out
 }
 
-/// An entry in use for object 0, added between two signatures and freed after the second,
-/// is refused. One pointing at the signed bytes of object 1 has lopdf read that old copy
-/// over a new one in an object stream (it keeps the object an entry's bytes name, and
-/// never puts an object-stream member over one it has). The second signature can't be
-/// checked then, so the first was compared with the end alone, where object 0 is only
-/// free, and the page tree turned for the second signer, then turned back, passed as
-/// allowed.
-#[test]
-fn an_entry_in_use_for_object_0_is_refused() {
+/// A signed file whose cross-reference is a stream, with object 1 (the catalog) written
+/// plainly: the file, where object 1 starts, and its dictionary as written.
+fn object_one_signed() -> (Vec<u8>, u32, String) {
     let mut d = Document::load_mem(&base_pdf()).unwrap();
     d.reference_table.cross_reference_type = lopdf::xref::XrefType::CrossReferenceStream;
     let mut base = Vec::new();
@@ -433,11 +450,26 @@ fn an_entry_in_use_for_object_0_is_refused() {
         .split("endobj")
         .next()
         .unwrap()
-        .trim();
+        .trim()
+        .to_string();
+    (b, offset, old)
+}
+
+/// An entry in use for object 0, added between two signatures and freed after the second,
+/// is refused. One pointing at the signed bytes of object 1 has lopdf read that old copy
+/// over a new one in an object stream (it keeps the object an entry's bytes name, and
+/// never puts an object-stream member over one it has). The second signature can't be
+/// checked then, so the first was compared with the end alone, where object 0 is only
+/// free, and the page tree turned for the second signer, then turned back, passed as
+/// allowed.
+#[test]
+fn an_entry_in_use_for_object_0_is_refused() {
+    let (b, offset, old) = object_one_signed();
+    let max_id = Document::load_mem(&b).unwrap().max_id;
     let turned = format!("{}/Rotate 180>>", old.strip_suffix(">>").unwrap());
     // Object 0 at object 1's signed bytes, or in the new object stream.
-    for zero in [(1, offset, 0), (2, d.max_id + 1, 0)] {
-        let r2 = object_one_in_a_stream(&b, &turned, zero);
+    for zero in [(1, offset, 0), (2, max_id + 1, 0)] {
+        let r2 = object_one_in_a_stream(&b, &turned, zero, false);
         let s2 = countersign(&r2, "Signature2", true);
         let b = append_raw(&s2, &[(1, old.as_bytes())], &[0], &[], "");
         let want = ChangeKind::Malformed("LimarePDF can't read object 0 reliably".into());
@@ -447,6 +479,42 @@ fn an_entry_in_use_for_object_0_is_refused() {
             "{zero:?}: {got:#?}"
         );
     }
+}
+
+/// A cross-reference stream naming another with `/XRefStm`, after signing, is refused. The
+/// specification gives that key to a table's trailer only, and other apps don't follow it
+/// from a stream, but lopdf does: there an entry in use for object 0, at object 1's signed
+/// bytes, brought back that old copy past the check of
+/// [`an_entry_in_use_for_object_0_is_refused`], and the page tree turned for the second
+/// signer, then turned back, passed as allowed.
+#[test]
+fn a_cross_reference_stream_naming_another_is_refused() {
+    let (b, offset, old) = object_one_signed();
+    let turned = format!("{}/Rotate 180>>", old.strip_suffix(">>").unwrap());
+    let want = ChangeKind::Malformed(
+        "a later revision's cross-reference stream names another one (/XRefStm), which PDF \
+         apps read differently"
+            .into(),
+    );
+    let r2 = object_one_in_a_stream(&b, &turned, (1, offset, 0), true);
+    // lopdf takes object 0 from the stream named, and LimarePDF says other apps read the
+    // file differently.
+    let lopdf = Document::load_mem(&r2).unwrap();
+    assert!(matches!(
+        lopdf.reference_table.get(0),
+        Some(&lopdf::xref::XrefEntry::Normal { offset: o, .. }) if o == offset
+    ));
+    assert!(Pdf::from_bytes(&r2, None).unwrap().differs().is_some());
+    let s2 = countersign(&r2, "Signature2", true);
+    let end = append_raw(&s2, &[(1, old.as_bytes())], &[0], &[], "");
+    let got = changes(&end);
+    assert!(
+        got.contains(&(want.clone(), Some(Refusal::Never))),
+        "{got:#?}"
+    );
+    // The key alone is refused, whatever the stream it names lists.
+    let plain = object_one_in_a_stream(&b, &old, (0, 0, 65535), true);
+    assert_eq!(changes(&plain), [(want, Some(Refusal::Never))]);
 }
 
 #[test]
