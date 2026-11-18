@@ -219,6 +219,8 @@ pub(crate) fn mend_page_tree(doc: &mut Document, bytes: &[u8]) -> Result<bool, P
         let mut mended = kids;
         let mut written = false;
         for kid in &mut mended {
+            #[cfg(test)]
+            tests::KIDS_READ.set(tests::KIDS_READ.get() + 1);
             let id = match kid {
                 Object::Dictionary(d) if is_page_node(d) => {
                     let mut d = d.clone();
@@ -718,6 +720,8 @@ mod tests {
     thread_local! {
         /// Page tree kids queued to be mended on this thread.
         pub(super) static QUEUED: Cell<usize> = const { Cell::new(0) };
+        /// Page tree kids looked at on this thread, queued or not.
+        pub(super) static KIDS_READ: Cell<usize> = const { Cell::new(0) };
         /// Lines of a file looked at for an object's copies on this thread.
         pub(super) static LINES_READ: Cell<usize> = const { Cell::new(0) };
         /// Copies of an object read on this thread, for one that is a page or a node.
@@ -760,6 +764,27 @@ mod tests {
         let page = doc.get_dictionary(page).unwrap();
         assert!(page.has_type(b"Page"));
         assert_eq!(page.get(b"Parent").unwrap(), &Object::Reference(last));
+    }
+
+    #[test]
+    fn page_tree_nodes_sharing_a_list_with_no_page_written_in_it_read_it_once() {
+        // Each node lists one list naming every node, with no page written in it: the first
+        // node reads it, the others pass over it, and nothing is copied.
+        let n = 2_000;
+        let mut doc = Document::with_version("1.7");
+        let shared = doc.new_object_id();
+        let nodes: Vec<Object> = (0..n)
+            .map(|_| {
+                let node = dictionary! { "Type" => "Pages", "Kids" => shared };
+                doc.add_object(node).into()
+            })
+            .collect();
+        doc.objects.insert(shared, Object::Array(nodes.clone()));
+        let root = nodes[0].as_reference().unwrap();
+        with_root(&mut doc, root);
+        KIDS_READ.set(0);
+        assert!(!mend_page_tree(&mut doc, b"%PDF-1.7\n").unwrap());
+        assert!(KIDS_READ.get() < 2 * n, "read {} kids", KIDS_READ.get());
     }
 
     #[test]

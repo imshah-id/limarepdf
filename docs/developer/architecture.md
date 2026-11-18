@@ -1238,7 +1238,9 @@ has pages of its own, inheriting from it (sharing one copy left lopdf, which rea
 file has objects, short of pages), and a file whose copies would take more than `MAX_SHARED_KIDS_COPIES` (64 MiB) is refused. It
 reads the bytes' object headers once (`object_lines`) for the kids that aren't page nodes
 (`fields_sharing_their_kids_are_walked_once`, `widgets_shared_by_fields_go_to_the_first`,
-`page_tree_nodes_sharing_their_kids_queue_them_once`, `a_node_first_reached_far_down_is_mended_from_nearer_the_top`,
+`page_tree_nodes_sharing_their_kids_queue_them_once`,
+`page_tree_nodes_sharing_a_list_with_no_page_written_in_it_read_it_once`,
+`a_node_first_reached_far_down_is_mended_from_nearer_the_top`,
 `a_shared_list_first_reached_far_down_is_mended_from_nearer_the_top`,
 `nodes_sharing_a_list_with_pages_written_in_it_each_give_their_pages_their_size`,
 `nodes_sharing_a_list_too_large_to_copy_for_each_are_refused`, `kids_that_are_no_page_are_looked_for_in_one_pass`).
