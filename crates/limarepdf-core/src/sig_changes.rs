@@ -1252,6 +1252,16 @@ fn compare_versions(
             .map(|(n, _)| *n)
             .collect()
     };
+    // Object 0 heads the list of free objects, so no revision may list it in use, even when
+    // a later one frees it again: lopdf keeps the object an entry's bytes name, so one
+    // pointing at the signed bytes of another object brings back that old copy.
+    let zero_in_use = between
+        .iter()
+        .flat_map(|s| &s.entries)
+        .any(|&(num, e)| num == 0 && e != Entry::Free);
+    if zero_in_use {
+        return malformed("LimarePDF can't read object 0 reliably".into());
+    }
     let newest = effective(between);
     // Frees before `a`, unless `between` reuses the number.
     let old_freed = freed(&effective(before));
