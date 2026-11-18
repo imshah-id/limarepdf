@@ -14,6 +14,9 @@ ignore = [
     { id = "RUSTSEC-2026-0370", reason = "zvariant unmaintained as a standalone crate; only through eframe" },
     { id = "RUSTSEC-2026-0371", reason = "zbus_names unmaintained as a standalone crate; only through eframe" },
     { id = "RUSTSEC-2026-0372", reason = "zvariant_derive unmaintained as a standalone crate; only through eframe" },
+    # Unmaintained, with no known vulnerability: limarepdf-core's dates and lopdf's default
+    # `chrono-clock` feature. It goes when core moves to jiff (lopdf has a `jiff` feature).
+    { id = "RUSTSEC-2026-0543", reason = "chrono unmaintained, no vulnerability; to go when core moves to jiff" },
 ]
 
 # The licences of what LimarePDF builds and ships. A crate under any other licence fails the check
