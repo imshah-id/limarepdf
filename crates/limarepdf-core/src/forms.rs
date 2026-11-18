@@ -328,32 +328,50 @@ impl Pdf {
     }
 
     /// Every node of the field tree, fields and widgets, each once, with whether it belongs to
-    /// a signature field (by its own or an inherited `/FT`). Unlike [`Pdf::every_form_field`]
-    /// it fails rather than skip what is nested too deep: for removing values, where a node
-    /// left out could keep one.
+    /// a signature field (by its own or an inherited `/FT`), as [`Pdf::form_nodes`] reads it:
+    /// a node a node of no kind reaches first is the first node's with a kind to list it after.
+    /// Unlike [`Pdf::every_form_field`] it fails rather than skip what is nested too deep: for
+    /// removing values, where a node left out could keep one.
     pub(crate) fn value_nodes(&self) -> anyhow::Result<Vec<(ObjectId, bool)>> {
-        fn walk(
-            p: &Pdf,
+        #[derive(Default)]
+        struct Walk {
+            /// Each node read, with its place in `out` and whether it has a kind.
+            at: HashMap<ObjectId, (usize, bool)>,
+            /// `/Kids` array objects walked through a node with a kind, and through one of
+            /// no kind.
+            taken: HashSet<ObjectId>,
+            looked: HashSet<ObjectId>,
+            out: Vec<(ObjectId, bool)>,
+        }
+        fn walk<'p>(
+            p: &'p Pdf,
             id: ObjectId,
-            sig: bool,
+            ft: Option<&'p [u8]>,
             depth: usize,
-            seen: &mut HashSet<ObjectId>,
-            lists: &mut HashSet<ObjectId>,
-            out: &mut Vec<(ObjectId, bool)>,
+            w: &mut Walk,
         ) -> anyhow::Result<()> {
             #[cfg(test)]
             tests::LOOKED.set(tests::LOOKED.get() + 1);
-            if !seen.insert(id) {
-                return Ok(());
-            }
             let Ok(d) = p.doc.get_dictionary(id) else {
                 return Ok(());
             };
-            let sig = match d.get(b"FT").ok().and_then(|o| p.name_value(o)) {
-                Some(ft) => ft == b"Sig",
-                None => sig,
+            let ft = d.get(b"FT").ok().and_then(|o| p.name_value(o)).or(ft);
+            let typed = of_a_kind(ft);
+            let sig = ft == Some(b"Sig");
+            // A node read first with no kind is read again when a node with a kind lists it,
+            // its kids too.
+            let at = match w.at.get(&id) {
+                Some(&(_, was)) if was || !typed => return Ok(()),
+                Some(&(i, _)) => {
+                    w.out[i].1 = sig;
+                    i
+                }
+                None => {
+                    w.out.push((id, sig));
+                    w.out.len() - 1
+                }
             };
-            out.push((id, sig));
+            w.at.insert(id, (at, typed));
             let kids = d
                 .get(b"Kids")
                 .ok()
@@ -366,17 +384,20 @@ impl Pdf {
                 anyhow::bail!("the form's fields are nested more than {MAX_DEPTH} deep");
             }
             // A `/Kids` array object that more than one node lists, as no well-made form
-            // has, is passed over once its kids are walked, as each was then.
+            // has, is passed over once its kids are walked, as each was then: by a node of no
+            // kind, only once a node with a kind or one of no kind walked them.
             let list = d.get(b"Kids").and_then(|o| o.as_reference()).ok();
-            if list.is_some_and(|l| lists.contains(&l)) {
+            if list.is_some_and(|l| w.taken.contains(&l) || !typed && w.looked.contains(&l)) {
                 return Ok(());
             }
             for k in kids.into_iter().flatten() {
                 if let Ok(k) = k.as_reference() {
-                    walk(p, k, sig, depth + 1, seen, lists, out)?;
+                    walk(p, k, ft, depth + 1, w)?;
                 }
             }
-            lists.extend(list);
+            if let Some(l) = list {
+                if typed { &mut w.taken } else { &mut w.looked }.insert(l);
+            }
             Ok(())
         }
         let fields = self
@@ -384,13 +405,13 @@ impl Pdf {
             .and_then(|f| f.get(b"Fields").ok())
             .and_then(|o| self.doc.dereference(o).ok())
             .and_then(|(_, o)| o.as_array().ok());
-        let (mut seen, mut lists, mut out) = (HashSet::new(), HashSet::new(), Vec::new());
+        let mut w = Walk::default();
         for f in fields.into_iter().flatten() {
             if let Ok(id) = f.as_reference() {
-                walk(self, id, false, 0, &mut seen, &mut lists, &mut out)?;
+                walk(self, id, None, 0, &mut w)?;
             }
         }
-        Ok(out)
+        Ok(w.out)
     }
 
     /// Whether this is an XFA-only ("dynamic XFA") form: one made for Adobe Reader, whose
@@ -1012,6 +1033,9 @@ mod tests {
         assert!(LOOKED.get() < 6 * n, "looked at {} entries", LOOKED.get());
         assert_eq!(out.len(), n);
         assert_eq!(out[0].0.name, format!("f{}.f{n}", n - 1));
+        LOOKED.set(0);
+        assert_eq!(p.value_nodes().unwrap().len(), 2 * n);
+        assert!(LOOKED.get() < 6 * n, "looked at {} entries", LOOKED.get());
     }
 
     #[test]
@@ -1039,5 +1063,9 @@ mod tests {
         let looked = LOOKED.get();
         assert!(looked < 10 * layers, "looked at {looked} entries");
         assert_eq!(out.len(), 2);
+        LOOKED.set(0);
+        assert_eq!(p.value_nodes().unwrap().len(), 2 * layers + 2);
+        let looked = LOOKED.get();
+        assert!(looked < 10 * layers, "looked at {looked} entries");
     }
 }

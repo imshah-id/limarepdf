@@ -466,6 +466,46 @@ fn form_values_cleared(mut p: Pdf) {
     }
 }
 
+/// A signed signature widget `K` that a node `X` of no kind lists before signature field `T`
+/// does, through its own `/Kids` array, below an untitled node both list, or through the one
+/// array both list: the form shows it as `T.K`, and removing form values keeps its signature.
+/// Before, the signature went, as the value of `X.K`, of no kind.
+#[test]
+fn a_signature_a_node_of_no_kind_lists_first_is_kept() {
+    for shape in ["own arrays", "below a node", "one array"] {
+        let mut p = make(
+            "BT /F1 12 Tf 10 180 Td (Page text) Tj ET",
+            Dictionary::new(),
+        );
+        let signed = dictionary! { "Type" => "Sig", "Name" => s("WALRUS-SHARED-SIGNER") };
+        let k = widget(&mut p, dictionary! { "T" => s("K"), "V" => signed });
+        let mut kids = Object::from(vec![Object::Reference(k)]);
+        if shape == "below a node" {
+            let m = p.doc.add_object(dictionary! { "Kids" => kids });
+            kids = vec![Object::Reference(m)].into();
+        } else if shape == "one array" {
+            kids = p.doc.add_object(kids).into();
+        }
+        let x = p
+            .doc
+            .add_object(dictionary! { "T" => s("X"), "Kids" => kids.clone() });
+        let t = p
+            .doc
+            .add_object(dictionary! { "FT" => "Sig", "T" => s("T"), "Kids" => kids });
+        let fields = vec![Object::Reference(x), Object::Reference(t)];
+        catalog_set(
+            &mut p,
+            "AcroForm",
+            dictionary! { "Fields" => fields }.into(),
+        );
+        let names: Vec<String> = p.form_fields().into_iter().map(|f| f.name).collect();
+        assert!(names.iter().any(|n| n == "T.K"), "{shape}: {names:?}");
+        p.remove_hidden(&[Hidden::FormValues]).unwrap();
+        let kept = Saved::of(&mut p).places("WALRUS-SHARED-SIGNER");
+        assert!(!kept.is_empty(), "{shape}: the signature went");
+    }
+}
+
 /// A text widget on the page that the form's field list leaves out, `parents` fields below
 /// one holding a value. With `looped`, the top field's parent is the widget's own, so the
 /// parents go round in a loop.
