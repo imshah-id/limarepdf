@@ -523,6 +523,9 @@
 
 ### Changed
 
+- The Linux builds, the `.deb` and the `.rpm` need glibc 2.43 or later (Ubuntu 26.04, Fedora 44 and later), as
+  they are now built on Ubuntu 26.04; before, 2.39. On an older system, Debian 13 and Ubuntu 24.04 among them,
+  the package repository keeps the version installed now, and newer ones have to be built from source.
 - Building LimarePDF needs the latest stable Rust (`rustup update stable`); older versions aren't supported. The
   package no longer names a minimum Rust version.
 - Redaction, Reduce file size and Save all images follow drawings inside drawings as deep as reading a page's text
