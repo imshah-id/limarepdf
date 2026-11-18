@@ -1200,7 +1200,7 @@ mod tests {
                 assert!(t.state() == state, "restored: {restored}: the tab changed");
                 assert!(t.pdf.doc.objects == objects, "the content changed");
                 assert!(t.redo_removes() && !t.scrubbed);
-                assert_eq!(t.pdf.redaction_marks().len(), 1);
+                assert_eq!(t.pdf.redaction_marks().unwrap().len(), 1);
                 match &app.dialog {
                     Dialog::RecoveryFile { text, .. } => {
                         assert!(text.contains("hasn't redone the change"), "{text}")
@@ -1212,7 +1212,7 @@ mod tests {
             f.clear();
             app.act(&ctx, Act::Redo);
             let t = &app.tabs[0];
-            assert!(t.scrubbed && t.pdf.redaction_marks().is_empty());
+            assert!(t.scrubbed && t.pdf.redaction_marks().unwrap().is_empty());
             assert!(!could_offer(&m, "Walrus text"));
         }
     }
@@ -1324,7 +1324,7 @@ mod tests {
                 app.tabs[0].pdf.doc.objects == objects,
                 "{done}: the content changed"
             );
-            assert_eq!(app.tabs[0].pdf.redaction_marks().len(), 1);
+            assert_eq!(app.tabs[0].pdf.redaction_marks().unwrap().len(), 1);
             match &app.dialog {
                 Dialog::RecoveryFile { text, file, .. } => {
                     assert!(text.contains(&file.display().to_string()), "{text}");

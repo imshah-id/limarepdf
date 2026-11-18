@@ -14,7 +14,7 @@ use crate::{Pdf, Result};
 use chrono::{DateTime, FixedOffset, NaiveDate, Utc};
 use lopdf::xref::XrefEntry;
 use lopdf::{Dictionary, Object, ObjectId};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 /// The digital signatures in a document, as checked by [`verify_signatures`].
@@ -285,7 +285,7 @@ pub enum SigKind {
 
 /// What a certified document allows after certification (the DocMDP `/P` value), from
 /// least to most.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Permissions {
     /// No changes.
     NoChanges,
@@ -517,12 +517,11 @@ pub fn verify_signatures(
             None => groups.push((place, vec![(field, node.id)])),
         }
     }
-    let mut versions = Versions {
-        bytes,
-        password,
-        whole: &pdf,
-        cache: HashMap::new(),
-    };
+    // A field signed after a signature counts as signing only if it's listed here.
+    let listed: HashSet<ObjectId> = (groups.iter())
+        .flat_map(|(_, fields)| fields.iter().map(|&(_, id)| id))
+        .collect();
+    let mut versions = Versions::new(bytes, password, &pdf);
     let mut signatures: Vec<DigitalSignature> = groups
         .into_iter()
         .map(|(place, fields)| check_one(&pdf, &mut versions, place, fields))
@@ -552,7 +551,7 @@ pub fn verify_signatures(
             locks: signatures[i].locks.as_ref(),
         })
         .collect();
-    let found = sig_changes::analyse(&mut versions, &inputs, certified);
+    let found = sig_changes::analyse(&mut versions, &inputs, &listed, certified);
     for (i, changes) in which.into_iter().zip(found) {
         signatures[i].changes = changes;
     }
@@ -621,7 +620,17 @@ pub(crate) struct Versions<'a> {
 const MAX_VERSIONS: usize = 100;
 const MAX_VERSION_BYTES: usize = 1 << 30;
 
-impl Versions<'_> {
+impl<'a> Versions<'a> {
+    /// The versions of `bytes`, `whole` being the whole file opened with `password`.
+    pub(crate) fn new(bytes: &'a [u8], password: Option<&'a str>, whole: &'a Pdf) -> Self {
+        Versions {
+            bytes,
+            password,
+            whole,
+            cache: HashMap::new(),
+        }
+    }
+
     /// Whether the version ending at `end` is open or may be opened within the limits.
     fn allowed(&self, end: usize) -> bool {
         end == self.bytes.len()

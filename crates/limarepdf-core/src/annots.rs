@@ -2,20 +2,25 @@
 //! flattening them into the page content. Links, form widgets and popups have their own
 //! code and are not listed here.
 
-use crate::annot_ap::{drawable, DRAWN};
+use crate::annot_ap::{self, drawable, Place, DRAWN, MAX_POINTS};
+use crate::budget::{TooComplex, Work};
 use crate::doc::decode_text;
 use crate::form_flatten::{self, Flat};
-use crate::form_write::parse_da;
 use crate::matrix as mx;
 use crate::sanitise::Layers;
 use crate::{Align, Pdf, Result};
 use anyhow::{anyhow, bail};
 use lopdf::{Dictionary, Object, ObjectId};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 
 /// How many of a page's annotations are shown, a limit that keeps a malformed or hostile
 /// file from running away. Removing information reads them all.
 pub const MAX_ANNOTS: usize = 10_000;
+
+/// Most bytes of a date (`/M`, `/CreationDate`) read: one written in full as UTF-16 takes
+/// 48.
+const MAX_DATE: usize = 64;
 
 /// What [`Pdf::flatten_annotations`] did.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -201,6 +206,10 @@ pub struct Annot {
     /// For lines, polylines and drawings, their points in displayed-page points, one list
     /// per stroke; empty for other kinds.
     pub paths: Vec<Vec<(f32, f32)>>,
+    /// Listed past the budget for reading the annotations ([`crate::TooComplex`]): its
+    /// text, points and text style weren't read, and are empty (`None` for the style). It
+    /// is shown, and can be selected, moved and deleted, but its text can't be changed.
+    pub unread: bool,
 }
 
 /// How a rectangle, ellipse, line or drawing is painted. Its line's colour is the
@@ -278,55 +287,160 @@ impl Annot {
 }
 
 impl Pdf {
-    /// The annotations on every page, page by page in the file's order.
+    /// The annotations on every page, page by page in the file's order, each once, on the
+    /// first page that lists it (each page still shows it, [`Pdf::page_annotations`]): the
+    /// first [`MAX_ANNOTS`] of each page's list. Those placed where they are drawn (PB-114)
+    /// are drawn within one budget ([`crate::TooComplex`]); past it, each is placed at its
+    /// own `/Rect`. The lists' entries are looked at, and their points and text read, within
+    /// another; past it, each is listed [`Annot::unread`].
     pub fn annotations(&self) -> Vec<Annot> {
+        self.listed(&mut Place::drawn())
+    }
+
+    /// [`Pdf::annotations`], placed and read by `place`.
+    pub(crate) fn listed(&self, place: &mut Place) -> Vec<Annot> {
+        self.every_annotation_in(place, MAX_ANNOTS)
+    }
+
+    /// The annotations pages `pages` (zero-based) list, each list read once: for choosing by
+    /// page what [`Pdf::annotations`] lists, each on the first page that lists it.
+    pub fn annotation_ids_on(&self, pages: &[usize]) -> Result<HashSet<(u32, u16)>> {
         let ids = self.page_ids();
+        let on: Vec<ObjectId> = (self.page_list(Some(pages))?.into_iter())
+            .map(|i| ids[i])
+            .collect();
+        Ok(self.listed_annots(&on).into_iter().map(|a| a.1).collect())
+    }
+
+    /// Annotation `id` as [`Pdf::annotations`] lists it (on the first page that does), but
+    /// read alone: placed and read within budgets of its own, reading no other annotation.
+    pub fn annotation(&self, id: (u32, u16)) -> Result<Annot> {
+        self.listed_one(id, &mut Place::drawn())
+    }
+
+    /// [`Pdf::annotation`], placed and read by `place`.
+    pub(crate) fn listed_one(&self, id: ObjectId, place: &mut Place) -> Result<Annot> {
+        let pages = self.page_ids();
+        let lists = |(_, _, list): &(usize, _, &[Object])| {
+            (list.iter().take(MAX_ANNOTS)).any(|o| o.as_reference().ok() == Some(id))
+        };
+        let (i, _, _) = (self.each_annots(&pages))
+            .find(lists)
+            .ok_or_else(|| anyhow!("no such annotation"))?;
         let mut layers = self.layers_off();
-        (0..ids.len())
-            .flat_map(|i| {
-                self.annotations_in(i, ids[i], self.annot_refs(ids[i]), &mut layers)
-                    .unwrap_or_default()
-            })
-            .collect()
+        let one = self.annotations_in(i, pages[i], vec![id], &mut layers, place)?;
+        one.into_iter()
+            .next()
+            .ok_or_else(|| anyhow!("no such annotation"))
     }
 
     /// The annotations on one page (zero-based), in the file's order (the order they are
-    /// drawn in).
+    /// drawn in), placed and read as [`Pdf::annotations`] places and reads them.
     pub fn page_annotations(&self, page_index: usize) -> Result<Vec<Annot>> {
         let page = self.page_id_at(page_index)?;
+        let list = self.annots_array(page).unwrap_or_default();
+        let list = &list[..list.len().min(MAX_ANNOTS)];
+        let mut place = Place::drawn();
+        place.look(list.len());
+        let refs = list.iter().filter_map(|o| o.as_reference().ok()).collect();
         let mut layers = self.layers_off();
-        self.annotations_in(page_index, page, self.annot_refs(page), &mut layers)
+        self.annotations_in(page_index, page, refs, &mut layers, &mut place)
     }
 
-    /// Every annotation on every page, without [`Pdf::annot_refs`]'s limit: for removing
-    /// information, where one left out could keep what should go.
-    pub(crate) fn every_annotation(&self) -> Vec<Annot> {
-        let ids = self.page_ids();
-        let mut layers = self.layers_off();
-        (0..ids.len())
-            .flat_map(|i| {
-                self.annotations_in(i, ids[i], self.all_annot_refs(ids[i]), &mut layers)
-                    .unwrap_or_default()
-            })
-            .collect()
+    /// Every annotation, each once, on the first page that lists it, without
+    /// [`MAX_ANNOTS`], placed by `place`: for removing information, where one left out could
+    /// keep what should go.
+    pub(crate) fn every_annotation(&self, place: &mut Place) -> Vec<Annot> {
+        self.every_annotation_in(place, usize::MAX)
     }
 
-    /// The annotations `refs` of page `page`, number `page_index` (zero-based), and whether
-    /// each is in a layer `layers` hide. The page is given, not looked up by number: listing
-    /// every page's annotations would otherwise go through the page tree once a page
-    /// (ENH-35: 63 ms on 300 pages).
+    /// The annotations the pages list, the first `most` of each list, each once, on the
+    /// first page that lists it, placed by `place`. Each list is read once however many
+    /// pages share it, its entries looked at within the reading budget ([`Place::look`]);
+    /// none is built once `place` is done.
+    fn every_annotation_in(&self, place: &mut Place, most: usize) -> Vec<Annot> {
+        let placed = self.placed_pages();
+        let pages: Vec<ObjectId> = placed.iter().map(|p| p.1).collect();
+        let mut layers = self.layers_off();
+        let mut seen = HashSet::new();
+        let mut out = Vec::new();
+        for (k, _, list) in self.each_annots(&pages) {
+            let (i, _, to_vis) = placed[k];
+            let list = &list[..list.len().min(most)];
+            place.look(list.len());
+            for id in list.iter().filter_map(|o| o.as_reference().ok()) {
+                if place.done() {
+                    return out;
+                }
+                if seen.insert(id) {
+                    out.extend(self.annot(id, i, to_vis, &mut layers, place));
+                }
+            }
+        }
+        out
+    }
+
+    /// Every redaction mark, on each page that lists it, without [`MAX_ANNOTS`], placed by
+    /// `place`: a mark several pages list is applied on each. Each list's entries are looked
+    /// at once however many pages share it, or times the page tree lists a page writing it
+    /// in, within the reading budget ([`Place::look`]), and only marks are built; a page
+    /// whose list was looked at before is charged a step for each of its marks, each placed
+    /// there again. None is built once `place` is done.
+    pub(crate) fn every_mark(&self, place: &mut Place) -> Vec<Annot> {
+        let mut layers = self.layers_off();
+        let mut found: HashMap<ObjectId, Rc<[ObjectId]>> = HashMap::new();
+        let mut out = Vec::new();
+        for (i, page, to_vis) in self.placed_pages() {
+            let Some((at, list)) = self.annots_at(page) else {
+                continue;
+            };
+            let marks = match found.get(&at.unwrap_or(page)) {
+                Some(marks) => {
+                    place.look(marks.len());
+                    marks.clone()
+                }
+                None => {
+                    place.look(list.len());
+                    #[cfg(test)]
+                    entries_read(list.len());
+                    let marks: Rc<[ObjectId]> = (list.iter())
+                        .filter_map(|o| o.as_reference().ok())
+                        .filter(|&id| {
+                            self.doc.get_dictionary(id).is_ok_and(|d| {
+                                d.get(b"Subtype").and_then(Object::as_name).ok() == Some(b"Redact")
+                            })
+                        })
+                        .collect();
+                    found.insert(at.unwrap_or(page), marks.clone());
+                    marks
+                }
+            };
+            for &id in marks.iter() {
+                if place.done() {
+                    return out;
+                }
+                out.extend(self.annot(id, i, to_vis, &mut layers, place));
+            }
+        }
+        out
+    }
+
+    /// The annotations `refs` of page `page`, number `page_index` (zero-based), placed by
+    /// `place`, and whether each is in a layer `layers` hide. The page is given, not looked
+    /// up by number again: its callers have it.
     fn annotations_in(
         &self,
         page_index: usize,
         page: ObjectId,
         refs: Vec<ObjectId>,
         layers: &mut Option<Layers>,
+        place: &mut Place,
     ) -> Result<Vec<Annot>> {
         let (vd, _, _) = self.vis_down(page);
         let to_vis = mx::inv(vd).ok_or_else(|| anyhow!("degenerate page transform"))?;
         Ok(refs
             .into_iter()
-            .filter_map(|id| self.annot(id, page_index, to_vis, layers))
+            .filter_map(|id| self.annot(id, page_index, to_vis, layers, place))
             .collect())
     }
 
@@ -341,19 +455,24 @@ impl Pdf {
             .collect()
     }
 
-    /// The pages (zero-based) annotations `ids` are on, by the pages that list them: `None`
-    /// for one no page lists. One walk of the page tree, however many are asked.
+    /// The pages (zero-based) annotations `ids` are on, by the first page that lists each:
+    /// `None` for one no page lists. One walk of the page tree, however many are asked, with
+    /// each list read once ([`Pdf::each_annots`]).
     pub fn annotation_pages(&self, ids: &[(u32, u16)]) -> Vec<Option<usize>> {
         let mut out = vec![None; ids.len()];
-        for (i, page) in self.page_ids().into_iter().enumerate() {
-            if out.iter().all(Option::is_some) {
-                break;
-            }
-            let refs = self.all_annot_refs(page);
-            for (k, id) in ids.iter().enumerate() {
-                if out[k].is_none() && refs.contains(id) {
+        let mut wanted: HashMap<ObjectId, Vec<usize>> = HashMap::new();
+        for (k, &id) in ids.iter().enumerate() {
+            wanted.entry(id).or_default().push(k);
+        }
+        let pages = self.page_ids();
+        for (i, _, list) in self.each_annots(&pages) {
+            for id in list.iter().filter_map(|o| o.as_reference().ok()) {
+                for k in wanted.remove(&id).unwrap_or_default() {
                     out[k] = Some(i);
                 }
+            }
+            if wanted.is_empty() {
+                break;
             }
         }
         out
@@ -361,15 +480,15 @@ impl Pdf {
 
     /// Give annotations written into a page's `/Annots` directly, which the format doesn't
     /// allow, objects of their own, so that removing information finds them like any other.
-    /// How they look and what they hold is unchanged.
+    /// How they look and what they hold is unchanged, and pages sharing a list keep sharing
+    /// it.
     pub(crate) fn own_direct_annots(&mut self) -> Result<()> {
-        for page in self.page_ids() {
-            let Some(list) = self.annots_array(page) else {
-                continue;
-            };
-            if !list.iter().any(|o| o.as_dict().is_ok()) {
-                continue;
-            }
+        let pages = self.page_ids();
+        let direct: Vec<(ObjectId, Option<ObjectId>, Vec<Object>)> = (self.each_annots(&pages))
+            .filter(|(_, _, list)| list.iter().any(|o| o.as_dict().is_ok()))
+            .map(|(i, at, list)| (pages[i], at, list.to_vec()))
+            .collect();
+        for (page, at, list) in direct {
             let list: Vec<Object> = list
                 .into_iter()
                 .map(|o| match o {
@@ -377,24 +496,46 @@ impl Pdf {
                     o => o,
                 })
                 .collect();
-            self.doc.get_dictionary_mut(page)?.set("Annots", list);
+            match at {
+                Some(at) => *self.doc.get_object_mut(at)? = Object::Array(list),
+                None => self.doc.get_dictionary_mut(page)?.set("Annots", list),
+            }
         }
         Ok(())
     }
 
-    /// Remove the annotations `pick` chooses, with the replies to them and their popups.
-    /// Locked ones are removed too; the app checks [`Annot::locked`] first. Every
-    /// annotation is offered to `pick`, not only those shown. Returns how many were
-    /// removed, replies included.
-    pub fn remove_annotations(&mut self, pick: impl Fn(&Annot) -> bool) -> Result<usize> {
-        self.own_direct_annots()?;
-        let gone = self
-            .every_annotation()
-            .iter()
-            .filter(|a| pick(a))
-            .map(|a| a.id)
-            .collect();
-        self.drop_annotations(gone)
+    /// Remove the annotations `pick` chooses, with the replies to them and their popups;
+    /// `pages` (zero-based) limits this to those any of these pages list. Locked ones are
+    /// removed too; the app checks [`Annot::locked`] first. Every annotation is offered to
+    /// `pick` once, as [`Pdf::every_annotation`] lists it, not only those shown, each at
+    /// its own `/Rect`: none is drawn to place it. Each is read, for `pick` to choose by
+    /// what it says: refused, with nothing changed, past the budget for reading them
+    /// ([`crate::TooComplex`]), none read past it. Returns how many were removed, replies
+    /// included.
+    pub fn remove_annotations(
+        &mut self,
+        pages: Option<&[usize]>,
+        pick: impl Fn(&Annot) -> bool,
+    ) -> Result<usize> {
+        self.atomically(|p| {
+            p.own_direct_annots()?;
+            let on = pages.map(|pages| p.annotation_ids_on(pages)).transpose()?;
+            let mut place = Place::own().stopping();
+            let all = p.every_annotation(&mut place);
+            place.whole()?;
+            let gone = (all.iter())
+                .filter(|a| on.as_ref().is_none_or(|on| on.contains(&a.id)) && pick(a))
+                .map(|a| a.id)
+                .collect();
+            p.drop_annotations(gone)
+        })
+    }
+
+    /// Remove annotation `id`, with the replies to it and their popups, reading no other
+    /// annotation; with nothing changed when it fails. Returns how many were removed,
+    /// replies included.
+    pub fn remove_annotation(&mut self, id: (u32, u16)) -> Result<usize> {
+        self.atomically(|p| p.drop_annotations(HashSet::from([id])))
     }
 
     /// Remove the annotations `gone` (of any kind, links and form widgets too), with the
@@ -407,44 +548,78 @@ impl Pdf {
     /// popups too.
     pub(crate) fn drop_annotations_ids(
         &mut self,
-        mut gone: HashSet<ObjectId>,
+        gone: HashSet<ObjectId>,
     ) -> Result<(usize, HashSet<ObjectId>)> {
-        let all = self.every_annotation();
-        loop {
-            let before = gone.len();
-            for a in &all {
-                if a.reply_to.is_some_and(|r| gone.contains(&r)) {
-                    gone.insert(a.id);
-                }
-            }
-            if gone.len() == before {
-                break;
-            }
-        }
-        let mut off = HashSet::new();
         if gone.is_empty() {
-            return Ok((0, off));
+            return Ok((0, HashSet::new()));
         }
-        for page in self.page_ids() {
-            let Some(refs) = self.annots_array(page) else {
-                continue;
-            };
+        let pages = self.page_ids();
+        let mut all = HashSet::new();
+        with_replies(&mut all, gone, &self.replies(&pages));
+        Ok((all.len(), self.take_out(&pages, &all)?))
+    }
+
+    /// The replies `pages` list, by what each replies to (`/IRT`), from the kinds listed
+    /// ([`AnnotKind::of`]), without placing or reading any more of them.
+    pub(crate) fn replies(&self, pages: &[ObjectId]) -> HashMap<ObjectId, Vec<ObjectId>> {
+        let mut out: HashMap<ObjectId, Vec<ObjectId>> = HashMap::new();
+        for (_, id) in self.listed_annots(pages) {
+            let to = self.doc.get_dictionary(id).ok().and_then(|d| {
+                AnnotKind::of(d.get(b"Subtype").ok()?.as_name().ok()?)?;
+                d.get(b"IRT").and_then(Object::as_reference).ok()
+            });
+            if let Some(to) = to {
+                out.entry(to).or_default().push(id);
+            }
+        }
+        out
+    }
+
+    /// Take the annotations `gone` and their popups out of the lists of `pages`. Returns
+    /// the annotations taken out, with `gone`.
+    pub(crate) fn take_out(
+        &mut self,
+        pages: &[ObjectId],
+        gone: &HashSet<ObjectId>,
+    ) -> Result<HashSet<ObjectId>> {
+        // Each list is changed once: pages sharing one keep sharing it, or all lose it.
+        let mut off = HashSet::new();
+        let mut changed = Vec::new();
+        for (i, at, refs) in self.each_annots(pages) {
             let (kept, taken): (Vec<Object>, Vec<Object>) = refs.iter().cloned().partition(|o| {
                 o.as_reference()
-                    .map_or(true, |id| !gone.contains(&id) && !self.popup_of(id, &gone))
+                    .map_or(true, |id| !gone.contains(&id) && !self.popup_of(id, gone))
             });
             off.extend(taken.iter().filter_map(|o| o.as_reference().ok()));
-            if kept.len() < refs.len() {
-                let pd = self.doc.get_dictionary_mut(page)?;
-                if kept.is_empty() {
-                    pd.remove(b"Annots");
-                } else {
-                    pd.set("Annots", kept);
+            if !taken.is_empty() {
+                changed.push((pages[i], at, kept));
+            }
+        }
+        let mut emptied = HashSet::new();
+        for (page, at, kept) in changed {
+            match at {
+                Some(at) => {
+                    if kept.is_empty() {
+                        emptied.insert(at);
+                    }
+                    *self.doc.get_object_mut(at)? = Object::Array(kept);
+                }
+                None if kept.is_empty() => {
+                    self.doc.get_dictionary_mut(page)?.remove(b"Annots");
+                }
+                None => self.doc.get_dictionary_mut(page)?.set("Annots", kept),
+            }
+        }
+        if !emptied.is_empty() {
+            for &page in pages {
+                let at = self.annots_at(page).and_then(|(at, _)| at);
+                if at.is_some_and(|at| emptied.contains(&at)) {
+                    self.doc.get_dictionary_mut(page)?.remove(b"Annots");
                 }
             }
         }
-        off.extend(&gone);
-        Ok((gone.len(), off))
+        off.extend(gone);
+        Ok(off)
     }
 
     /// Draw the annotations into the pages' content as they look now and remove them, so
@@ -459,21 +634,13 @@ impl Pdf {
     /// text box whose text its font can't write ([`Pdf::box_unwritable`]), rather than draw
     /// `?` into the page for good (BUG-39), and when finding those popups and replies is too
     /// complex ([`crate::TooComplex`]): each is looked at once, however often a page lists
-    /// it, within one budget for all the pages (A-06).
+    /// it, within one budget for all the pages (A-06). Refused too when drawing those without
+    /// a drawing is too complex: within one budget, each is charged what it draws, however
+    /// many share its points or text.
     pub fn flatten_annotations(&mut self, pages: Option<&[usize]>) -> Result<Flattened> {
         let ids = self.page_ids();
         let pages = self.page_list(pages)?;
         let on: Vec<ObjectId> = pages.iter().map(|&i| ids[i]).collect();
-        for (&i, &page) in pages.iter().zip(&on) {
-            let missing = self.missing_appearances(&[page]).into_iter();
-            if let Some(chars) = missing.filter_map(|id| self.box_unwritable(id)).next() {
-                bail!(
-                    "LimarePDF can't draw the text box on page {}: {}; nothing was flattened",
-                    i + 1,
-                    crate::embed::box_refusal(&chars)
-                );
-            }
-        }
         // What goes with the annotations kept, found on every page before anything is
         // changed, with one budget: each page's walk below finds no more.
         {
@@ -484,17 +651,31 @@ impl Pdf {
                 }
             }
         }
-        // File attachments stay annotations, so they keep having no drawing.
-        let missing: Vec<ObjectId> = self
-            .missing_appearances(&on)
-            .into_iter()
-            .filter(|&id| {
-                self.doc.get_dictionary(id).is_ok_and(|d| {
-                    d.get(b"Subtype").and_then(|o| o.as_name()).ok() != Some(b"FileAttachment")
+        // Those without a drawing are drawn, with one budget, before any is put in the file.
+        {
+            let mut work = annot_ap::work();
+            let missing = self.missing_on(&on);
+            for &(k, id) in &missing {
+                if let Some(chars) = self.box_unwritable(id, &mut work)? {
+                    bail!(
+                        "LimarePDF can't draw the text box on page {}: {}; nothing was \
+                         flattened",
+                        pages[k] + 1,
+                        crate::embed::box_refusal(&chars)
+                    );
+                }
+            }
+            // File attachments stay annotations, so they keep having no drawing.
+            let missing: Vec<ObjectId> = (missing.into_iter())
+                .map(|(_, id)| id)
+                .filter(|&id| {
+                    self.doc.get_dictionary(id).is_ok_and(|d| {
+                        d.get(b"Subtype").and_then(|o| o.as_name()).ok() != Some(b"FileAttachment")
+                    })
                 })
-            })
-            .collect();
-        self.draw_annotations(&missing);
+                .collect();
+            self.draw_within(&missing, &mut work)?;
+        }
         let mut done = Flattened::default();
         for (&i, page) in pages.iter().zip(on) {
             let mut unplaced = Vec::new();
@@ -513,14 +694,19 @@ impl Pdf {
     }
 
     /// The annotations on `pages` that LimarePDF can draw and that have no drawing of their own
-    /// (no `/AP /N`), past the 10,000 a page shows too (H-06). Hidden ones and replies are
-    /// left out.
+    /// (no `/AP /N`), past the 10,000 a page shows too (H-06), each once however many pages
+    /// list it. Hidden ones and replies are left out.
     pub(crate) fn missing_appearances(&self, pages: &[ObjectId]) -> Vec<ObjectId> {
-        let mut out = Vec::new();
-        for &page in pages {
-            for id in self.all_annot_refs(page) {
+        self.missing_on(pages).into_iter().map(|m| m.1).collect()
+    }
+
+    /// [`Pdf::missing_appearances`], each with the index in `pages` of the first page that
+    /// lists it.
+    fn missing_on(&self, pages: &[ObjectId]) -> Vec<(usize, ObjectId)> {
+        (self.listed_annots(pages).into_iter())
+            .filter(|&(_, id)| {
                 let Ok(d) = self.doc.get_dictionary(id) else {
-                    continue;
+                    return false;
                 };
                 let drawn = d
                     .get(b"Subtype")
@@ -533,46 +719,123 @@ impl Pdf {
                     .is_some_and(|ap| ap.has(b"N"));
                 // Replies are listed, not drawn.
                 let shown = self.flags(d) & (HIDDEN | NO_VIEW) == 0 && !d.has(b"IRT");
-                if drawn && !has_ap && shown {
-                    out.push(id);
+                drawn && !has_ap && shown
+            })
+            .collect()
+    }
+
+    /// The annotations of the kinds `pick` chooses on every page, each once however many
+    /// pages list it: those [`Pdf::every_annotation`] lists, found without placing or reading
+    /// any, for what needs only what each annotation is.
+    pub(crate) fn annotations_of_kind(
+        &self,
+        pick: impl Fn(&AnnotKind) -> bool,
+    ) -> HashSet<ObjectId> {
+        let placed: Vec<ObjectId> = self.placed_pages().into_iter().map(|p| p.1).collect();
+        (self.listed_annots(&placed).into_iter())
+            .filter(|&(_, id)| (self.doc.get_dictionary(id)).is_ok_and(|d| self.of_kind(d, &pick)))
+            .map(|(_, id)| id)
+            .collect()
+    }
+
+    /// How many annotations of the kinds `pick` chooses the pages list: those
+    /// [`Pdf::annotations_of_kind`] finds, and those written into a list directly, which
+    /// the listings skip but removing information gives objects first
+    /// ([`Pdf::own_direct_annots`]). Each list is read once, and none is built.
+    pub(crate) fn count_of_kind(&self, pick: impl Fn(&AnnotKind) -> bool) -> usize {
+        let placed: Vec<ObjectId> = self.placed_pages().into_iter().map(|p| p.1).collect();
+        let mut seen = HashSet::new();
+        let mut n = 0;
+        for (_, _, list) in self.each_annots(&placed) {
+            n += (list.iter())
+                .filter(|o| match o {
+                    Object::Reference(id) => {
+                        seen.insert(*id)
+                            && (self.doc.get_dictionary(*id)).is_ok_and(|d| self.of_kind(d, &pick))
+                    }
+                    Object::Dictionary(d) => self.of_kind(d, &pick),
+                    _ => false,
+                })
+                .count();
+        }
+        n
+    }
+
+    /// Whether annotation `d` is of a kind `pick` chooses and has a `/Rect` to place it by:
+    /// the listings leave out one without.
+    fn of_kind(&self, d: &Dictionary, pick: impl Fn(&AnnotKind) -> bool) -> bool {
+        let kind = d.get(b"Subtype").and_then(Object::as_name).ok();
+        kind.and_then(AnnotKind::of).is_some_and(|k| pick(&k))
+            && d.get(b"Rect").ok().and_then(|o| self.rect(o)).is_some()
+    }
+
+    /// The pages the listings list annotations on, those that can be placed, each with its
+    /// index and the transform to displayed-page points: a page whose transform is
+    /// degenerate lists none, so another sharing its list still does.
+    fn placed_pages(&self) -> Vec<(usize, ObjectId, mx::M)> {
+        (self.page_ids().into_iter().enumerate())
+            .filter_map(|(i, page)| Some((i, page, mx::inv(self.vis_down(page).0)?)))
+            .collect()
+    }
+
+    /// The page's `/Annots` array, resolved, and its object when the page refers to one
+    /// rather than writing it in.
+    pub(crate) fn annots_at(&self, page: ObjectId) -> Option<(Option<ObjectId>, &[Object])> {
+        let o = self.doc.get_dictionary(page).ok()?.get(b"Annots").ok()?;
+        let (at, o) = self.doc.dereference(o).ok()?;
+        Some((at, o.as_array().ok()?))
+    }
+
+    /// The page's `/Annots` array, resolved.
+    pub(crate) fn annots_array(&self, page: ObjectId) -> Option<&[Object]> {
+        Some(self.annots_at(page)?.1)
+    }
+
+    /// The `/Annots` arrays of `pages`, each once however many of them share it, with the
+    /// index in `pages` of the first that lists it and its object: for passes over every
+    /// page's annotations, which would otherwise read a list once a page sharing it. One a
+    /// page writes in is its alone, read once however many times the page tree lists the
+    /// page.
+    pub(crate) fn each_annots<'a>(
+        &'a self,
+        pages: &'a [ObjectId],
+    ) -> impl Iterator<Item = (usize, Option<ObjectId>, &'a [Object])> + 'a {
+        let mut seen = HashSet::new();
+        (pages.iter().enumerate()).filter_map(move |(i, &page)| {
+            let (at, list) = self.annots_at(page)?;
+            if !seen.insert(at.unwrap_or(page)) {
+                return None;
+            }
+            #[cfg(test)]
+            entries_read(list.len());
+            Some((i, at, list))
+        })
+    }
+
+    /// The annotations `pages` list, each once, with the index in `pages` of the first page
+    /// that lists it ([`Pdf::each_annots`]). Direct dictionaries are skipped;
+    /// [`Pdf::own_direct_annots`] gives them objects first.
+    pub(crate) fn listed_annots(&self, pages: &[ObjectId]) -> Vec<(usize, ObjectId)> {
+        let mut seen = HashSet::new();
+        let mut out = Vec::new();
+        for (i, _, list) in self.each_annots(pages) {
+            for id in list.iter().filter_map(|o| o.as_reference().ok()) {
+                if seen.insert(id) {
+                    out.push((i, id));
                 }
             }
         }
         out
     }
 
-    /// The page's `/Annots` array, resolved.
-    pub(crate) fn annots_array(&self, page: ObjectId) -> Option<Vec<Object>> {
-        self.doc
-            .get_dictionary(page)
-            .ok()?
-            .get(b"Annots")
-            .ok()
-            .and_then(|o| self.doc.dereference(o).ok())
-            .and_then(|(_, o)| o.as_array().ok())
-            .cloned()
-    }
-
-    /// Every annotation a page lists, without [`Pdf::annot_refs`]'s limit: for removing
-    /// information, where one left out could keep what should go. Direct dictionaries are
+    /// Every annotation a page lists, without [`MAX_ANNOTS`]: for removing information,
+    /// where one left out could keep what should go. Direct dictionaries are
     /// skipped; [`Pdf::own_direct_annots`] gives them objects first.
     pub(crate) fn all_annot_refs(&self, page: ObjectId) -> Vec<ObjectId> {
-        self.annots_array(page)
-            .unwrap_or_default()
-            .iter()
-            .filter_map(|o| o.as_reference().ok())
-            .collect()
-    }
-
-    /// The annotations a page refers to, the first [`MAX_ANNOTS`] only: for showing them
-    /// (direct dictionaries, which the format doesn't allow, are skipped).
-    pub(crate) fn annot_refs(&self, page: ObjectId) -> Vec<ObjectId> {
-        self.annots_array(page)
-            .unwrap_or_default()
-            .iter()
-            .take(MAX_ANNOTS)
-            .filter_map(|o| o.as_reference().ok())
-            .collect()
+        let list = self.annots_array(page).unwrap_or_default();
+        #[cfg(test)]
+        entries_read(list.len());
+        list.iter().filter_map(|o| o.as_reference().ok()).collect()
     }
 
     fn flags(&self, d: &Dictionary) -> i64 {
@@ -583,7 +846,7 @@ impl Pdf {
     }
 
     /// Whether `id` is a popup belonging to one of `gone`.
-    fn popup_of(&self, id: ObjectId, gone: &HashSet<ObjectId>) -> bool {
+    pub(crate) fn popup_of(&self, id: ObjectId, gone: &HashSet<ObjectId>) -> bool {
         let Ok(d) = self.doc.get_dictionary(id) else {
             return false;
         };
@@ -599,69 +862,26 @@ impl Pdf {
         page: usize,
         to_vis: mx::M,
         layers: &mut Option<Layers>,
+        place: &mut Place,
     ) -> Option<Annot> {
+        #[cfg(test)]
+        tests::BUILT.set(tests::BUILT.get() + 1);
         let d = self.doc.get_dictionary(id).ok()?;
         let kind = AnnotKind::of(d.get(b"Subtype").ok()?.as_name().ok()?)?;
-        let rect = self.annot_rect(d)?;
-        let text = |key: &[u8]| {
-            d.get(key)
-                .ok()
-                .and_then(|o| self.shown_text_value(o))
-                .unwrap_or_default()
-        };
+        let rect = place.rect(self, d)?;
+        let read = place.read(|work| self.annot_read(d, &kind, rect, to_vis, work));
+        let unread = read.is_none();
+        let read = read.unwrap_or_default();
         let date = |key: &[u8]| {
-            d.get(key)
-                .ok()
-                .and_then(|o| self.string_bytes(o))
-                .and_then(|b| pdf_date(&decode_text(&b)))
+            let (_, o) = self.doc.dereference(d.get(key).ok()?).ok()?;
+            let s = o.as_str().ok()?;
+            pdf_date(&decode_text(&s[..s.len().min(MAX_DATE)]))
         };
-        let markup = matches!(
-            kind,
-            AnnotKind::Highlight
-                | AnnotKind::Underline
-                | AnnotKind::StrikeOut
-                | AnnotKind::Squiggly
-                | AnnotKind::Redact
-        );
-        let quads = if markup {
-            self.numbers(d.get(b"QuadPoints").ok())
-                .unwrap_or_default()
-                .as_chunks::<8>()
-                .0
-                .iter()
-                .map(|q| {
-                    let mut b = [f32::MAX, f32::MAX, f32::MIN, f32::MIN];
-                    for &[x, y] in q.as_chunks::<2>().0 {
-                        let (x, y) = mx::apply(to_vis, x, y);
-                        (b[0], b[1]) = (b[0].min(x), b[1].min(y));
-                        (b[2], b[3]) = (b[2].max(x), b[3].max(y));
-                    }
-                    b
-                })
-                .collect()
-        } else {
-            Vec::new()
-        };
-        let text_style = (kind == AnnotKind::TextBox).then(|| {
-            let da = d
-                .get(b"DA")
-                .ok()
-                .and_then(|o| self.string_bytes(o))
-                .unwrap_or_default();
-            let (_, _, color) = parse_da(&da);
-            let color: Vec<f32> = color
-                .map(|o| {
-                    o.operands
-                        .iter()
-                        .filter_map(|x| x.as_float().ok())
-                        .collect()
-                })
-                .unwrap_or_default();
+        let text_style = read.text.map(|(size, color)| {
             let q = d.get(b"Q").ok().and_then(|o| self.int_value(o));
             TextStyle {
-                // As it is drawn: from `/DA`, else `/DS`.
-                size: self.box_geometry(d, rect).size,
-                color: rgb(&color),
+                size,
+                color,
                 fill: self.colour(d, b"C").map(|c| rgb(&c)),
                 border: self.border(d).0,
                 align: Align::of_q(q.unwrap_or(0)),
@@ -678,53 +898,22 @@ impl Pdf {
             width: self.border(d).0,
             arrow: self.line_ends(d).iter().any(|e| e.as_slice() != b"None"),
         });
-        let to_shown = |v: Vec<f32>| -> Vec<(f32, f32)> {
-            v.as_chunks::<2>()
-                .0
-                .iter()
-                .map(|&[x, y]| mx::apply(to_vis, x, y))
-                .collect()
-        };
-        let paths = match kind {
-            AnnotKind::Line => self.numbers(d.get(b"L").ok()).into_iter().collect(),
-            AnnotKind::PolyLine => self.numbers(d.get(b"Vertices").ok()).into_iter().collect(),
-            AnnotKind::Ink => d
-                .get(b"InkList")
-                .ok()
-                .and_then(|o| self.doc.dereference(o).ok())
-                .and_then(|(_, o)| o.as_array().ok())
-                .map(|list| {
-                    list.iter()
-                        .take(MAX_ANNOTS)
-                        .filter_map(|s| self.numbers(Some(s)))
-                        .collect()
-                })
-                .unwrap_or_default(),
-            _ => Vec::new(),
-        }
-        .into_iter()
-        .map(to_shown)
-        .collect();
         Some(Annot {
             id,
             page,
             kind,
             bbox: mx::transform_rect(to_vis, rect),
-            quads,
+            quads: read.quads,
             color: self.colour(d, b"C").map(|c| rgb(&c)),
             opacity: d
                 .get(b"CA")
                 .ok()
                 .and_then(|o| self.num(o))
                 .map_or(1.0, |a| a.clamp(0.0, 1.0)),
-            contents: text(b"Contents"),
-            author: text(b"T"),
-            subject: text(b"Subj"),
-            name: d
-                .get(b"Name")
-                .and_then(|o| o.as_name())
-                .map(|n| String::from_utf8_lossy(n).into_owned())
-                .unwrap_or_default(),
+            contents: read.contents,
+            author: read.author,
+            subject: read.subject,
+            name: read.name,
             modified: date(b"M")
                 .or_else(|| date(b"CreationDate"))
                 .unwrap_or_default(),
@@ -738,9 +927,111 @@ impl Pdf {
                 .is_some_and(|ap| ap.has(b"N")),
             text_style,
             shape,
-            paths,
+            paths: read.paths,
+            unread,
         })
     }
+
+    /// The points and text of annotation `d`, of kind `kind`, whose box is `rect`: each
+    /// charged to `work` before it is read, its points turned to displayed-page points
+    /// (`to_vis`).
+    fn annot_read(
+        &self,
+        d: &Dictionary,
+        kind: &AnnotKind,
+        rect: [f32; 4],
+        to_vis: mx::M,
+        work: &mut Work,
+    ) -> std::result::Result<Read, TooComplex> {
+        let text = |key: &[u8], work: &mut Work| {
+            let t = self.text_charged(d.get(key).ok(), true, work)?;
+            Ok::<_, TooComplex>(t.unwrap_or_default())
+        };
+        let markup = matches!(
+            kind,
+            AnnotKind::Highlight
+                | AnnotKind::Underline
+                | AnnotKind::StrikeOut
+                | AnnotKind::Squiggly
+                | AnnotKind::Redact
+        );
+        let quads = match markup {
+            true => self.points_charged(d.get(b"QuadPoints").ok(), MAX_POINTS, work)?,
+            false => None,
+        };
+        let quads = (quads.unwrap_or_default().as_chunks::<4>().0.iter())
+            .map(|q| {
+                let mut b = [f32::MAX, f32::MAX, f32::MIN, f32::MIN];
+                for &(x, y) in q {
+                    let (x, y) = mx::apply(to_vis, x, y);
+                    (b[0], b[1]) = (b[0].min(x), b[1].min(y));
+                    (b[2], b[3]) = (b[2].max(x), b[3].max(y));
+                }
+                b
+            })
+            .collect();
+        let style = match *kind == AnnotKind::TextBox {
+            // As it is drawn: from `/DA`, else `/DS`.
+            true => {
+                let g = self.box_geometry(d, rect, work)?;
+                Some((g.size, rgb(&g.text_rgb)))
+            }
+            false => None,
+        };
+        let points = |key: &[u8], n: usize, work: &mut Work| {
+            let p = self.points_charged(d.get(key).ok(), n, work)?;
+            Ok::<_, TooComplex>(p.into_iter().collect())
+        };
+        let ink = || {
+            let (_, o) = self.doc.dereference(d.get(b"InkList").ok()?).ok()?;
+            o.as_array().ok()
+        };
+        let paths: Vec<Vec<(f32, f32)>> = match kind {
+            AnnotKind::Line => points(b"L", 2, work)?,
+            AnnotKind::PolyLine => points(b"Vertices", MAX_POINTS, work)?,
+            AnnotKind::Ink => match ink() {
+                Some(list) => self.ink_strokes(list, work)?,
+                None => Vec::new(),
+            },
+            _ => Vec::new(),
+        };
+        let name = match d.get(b"Name").and_then(|o| o.as_name()) {
+            Ok(n) => {
+                work.take(n.len() as u64)?;
+                String::from_utf8_lossy(n).into_owned()
+            }
+            Err(_) => String::new(),
+        };
+        Ok(Read {
+            quads,
+            paths: (paths.into_iter())
+                .map(|p| {
+                    p.into_iter()
+                        .map(|(x, y)| mx::apply(to_vis, x, y))
+                        .collect()
+                })
+                .collect(),
+            contents: text(b"Contents", work)?,
+            author: text(b"T", work)?,
+            subject: text(b"Subj", work)?,
+            name,
+            text: style,
+        })
+    }
+}
+
+/// What listing an annotation reads within the budget for reading them
+/// ([`Place::read`]): its points and text.
+#[derive(Default)]
+struct Read {
+    quads: Vec<[f32; 4]>,
+    paths: Vec<Vec<(f32, f32)>>,
+    contents: String,
+    author: String,
+    subject: String,
+    name: String,
+    /// A text box's text size and colour, as it is drawn: from `/DA`, else `/DS`.
+    text: Option<(f32, [f32; 3])>,
 }
 
 /// What flattening does with each annotation: draw the marks, drop replies and the
@@ -812,9 +1103,420 @@ fn pdf_date(s: &str) -> Option<String> {
     Some(out)
 }
 
+/// Into `gone`, the annotations `ids` with the replies to each at any depth, by what they
+/// reply to ([`Pdf::replies`]): each looked at once.
+pub(crate) fn with_replies(
+    gone: &mut HashSet<ObjectId>,
+    ids: impl IntoIterator<Item = ObjectId>,
+    replies: &HashMap<ObjectId, Vec<ObjectId>>,
+) {
+    let mut todo: Vec<ObjectId> = ids.into_iter().collect();
+    while let Some(id) = todo.pop() {
+        if gone.insert(id) {
+            todo.extend(replies.get(&id).into_iter().flatten());
+        }
+    }
+}
+
+/// Counts `n` `/Annots` entries read on this thread ([`tests::ENTRIES_READ`]).
+#[cfg(test)]
+pub(crate) fn entries_read(n: usize) {
+    tests::ENTRIES_READ.set(tests::ENTRIES_READ.get() + n);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::budget::budget_seam;
+    use crate::print::{Orientation, PageSetup, Paper, PerSheet, Scale};
+    use crate::{Hidden, TooComplex};
+    use lopdf::dictionary;
+    use std::cell::Cell;
+
+    thread_local! {
+        /// `/Annots` entries read listing annotations on this thread.
+        pub(super) static ENTRIES_READ: Cell<usize> = const { Cell::new(0) };
+        /// Entries listings built an annotation for on this thread.
+        pub(super) static BUILT: Cell<usize> = const { Cell::new(0) };
+    }
+
+    /// `n` pages sharing one `/Annots` array of `k` squares without a drawing, and the first
+    /// square.
+    fn sharing_annots(n: usize, k: usize) -> (Pdf, ObjectId) {
+        let mut p = Pdf::new();
+        p.insert_blank(0, 300.0, 200.0).unwrap();
+        let page = p.page_ids()[0];
+        let squares: Vec<Object> = (0..k)
+            .map(|_| {
+                let d = dictionary! {
+                    "Type" => "Annot",
+                    "Subtype" => "Square",
+                    "Rect" => vec![10.into(), 10.into(), 20.into(), 20.into()],
+                    "F" => 4,
+                };
+                p.doc.add_object(d).into()
+            })
+            .collect();
+        let first = squares[0].as_reference().unwrap();
+        let list = p.doc.add_object(squares);
+        let d = p.doc.get_dictionary_mut(page).unwrap();
+        d.set("Annots", list);
+        let d = d.clone();
+        let tree = d.get(b"Parent").and_then(Object::as_reference).unwrap();
+        let kids: Vec<Object> = std::iter::once(page.into())
+            .chain((1..n).map(|_| p.doc.add_object(d.clone()).into()))
+            .collect();
+        let t = p.doc.get_dictionary_mut(tree).unwrap();
+        t.set("Kids", kids);
+        t.set("Count", n as i64);
+        (p, first)
+    }
+
+    /// The `/Annots` entries `f` reads on 2,000 pages sharing one array of 1,000 squares past
+    /// what it reads on two, and whether it worked on 2,000.
+    fn read_past_two(f: impl Fn(&mut Pdf, ObjectId) -> bool) -> (usize, bool) {
+        let read = |n| {
+            let (mut p, first) = sharing_annots(n, 1_000);
+            ENTRIES_READ.set(0);
+            let worked = f(&mut p, first);
+            (ENTRIES_READ.get(), worked)
+        };
+        let (two, _) = read(2);
+        let (many, worked) = read(2_000);
+        (many.saturating_sub(two), worked)
+    }
+
+    /// Pages sharing one `/Annots` array have it read once a pass, however many share it:
+    /// saving, removing one, looking one up, deleting a page and removing hidden information
+    /// read no more of it on 2,000 pages than on two. (The walks of what pages draw read each
+    /// page's list, each entry charged to their budget: what a page draws is its own.)
+    #[test]
+    fn annotations_pages_share_are_read_once_a_pass() {
+        let got = [
+            read_past_two(|p, _| p.app_snapshot().is_ok()),
+            read_past_two(|p, _| p.render_snapshot().is_ok()),
+            read_past_two(|p, id| p.remove_annotation(id).is_ok()),
+            read_past_two(|p, _| p.annotation((u32::MAX, 0)).is_err()),
+            read_past_two(|p, _| p.delete_pages(&[1]).is_ok()),
+            read_past_two(|p, _| {
+                (p.remove_hidden(&[Hidden::Comments, Hidden::Attachments])).is_ok()
+            }),
+        ];
+        assert_eq!(got, [(0, true); 6]);
+    }
+
+    /// One page the page tree lists `n` times, writing in its own `/Annots` array of `k`
+    /// squares without a drawing, the first made a redaction mark.
+    fn listed_many_times(n: usize, k: usize) -> Pdf {
+        let (mut p, first) = sharing_annots(1, k);
+        let d = p.doc.get_dictionary_mut(first).unwrap();
+        d.set("Subtype", "Redact");
+        let page = p.page_ids()[0];
+        let list = p.annots_array(page).unwrap().to_vec();
+        let d = p.doc.get_dictionary_mut(page).unwrap();
+        d.set("Annots", list);
+        let tree = d.get(b"Parent").and_then(Object::as_reference).unwrap();
+        let t = p.doc.get_dictionary_mut(tree).unwrap();
+        t.set("Kids", vec![Object::from(page); n]);
+        t.set("Count", n as i64);
+        assert_eq!(p.page_count(), n);
+        p
+    }
+
+    /// A page the page tree lists many times has the `/Annots` array it writes in read once
+    /// a pass, as pages sharing one array do: listing the annotations, counting the marks and
+    /// finding them read no more of it with the page listed 1,000 times than twice. Each
+    /// time the page is listed still shows the mark.
+    #[test]
+    fn a_page_listed_many_times_has_its_annotations_read_once_a_pass() {
+        let read = |n, f: &dyn Fn(&Pdf) -> bool| {
+            let p = listed_many_times(n, 1_000);
+            ENTRIES_READ.set(0);
+            let worked = f(&p);
+            (ENTRIES_READ.get(), worked)
+        };
+        let past_two = |f: &dyn Fn(&Pdf) -> bool| {
+            let ((two, _), (many, worked)) = (read(2, f), read(1_000, f));
+            (many.saturating_sub(two), worked)
+        };
+        let got = [
+            past_two(&|p| p.annotations().len() == 1_000),
+            past_two(&|p| p.redaction_mark_count() == 1),
+            past_two(&|p| p.redaction_marks().is_ok_and(|m| m.len() == p.page_count())),
+        ];
+        assert_eq!(got, [(0, true); 3]);
+    }
+
+    /// Printing or flattening pages that share their annotations draws each once: 100 pages
+    /// sharing 1,000 squares without a drawing, which drawing once a page would take past
+    /// the budget for drawing them ([`annot_ap::work`]).
+    #[test]
+    fn annotations_pages_share_are_drawn_once() {
+        let (mut p, _) = sharing_annots(100, 1_000);
+        let paper = Paper {
+            id: "page".into(),
+            label: "page".into(),
+            size: (300.0, 200.0),
+            margins: Some([0.0; 4]),
+        };
+        let setup = PageSetup {
+            paper,
+            orientation: Orientation::Automatic,
+            scale: Scale::ShrinkOversized,
+            per_sheet: PerSheet::default(),
+            booklet: None,
+        };
+        let pages: Vec<usize> = (0..100).collect();
+        let printed = p.print_sheets(&pages, &setup).map(|_| ());
+        let flattened = p.flatten_annotations(None).map(|f| f.drawn);
+        let text = |e: anyhow::Error| e.to_string();
+        assert_eq!(
+            (printed.map_err(text), flattened.map_err(text)),
+            (Ok(()), Ok(100_000))
+        );
+    }
+
+    /// Removing an annotation from an array pages share takes it out of the array, which they
+    /// still share; removing the rest takes the array off them.
+    #[test]
+    fn removing_one_keeps_pages_sharing_their_annotations() {
+        let (mut p, first) = sharing_annots(3, 3);
+        let at = |p: &Pdf| -> Vec<Option<Object>> {
+            let page = |id| p.doc.get_dictionary(id).unwrap();
+            (p.page_ids().into_iter())
+                .map(|id| page(id).get(b"Annots").ok().cloned())
+                .collect()
+        };
+        let shared = at(&p);
+        assert_eq!(p.remove_annotation(first).unwrap(), 1);
+        assert_eq!(at(&p), shared);
+        let left = p.all_annot_refs(p.page_ids()[0]);
+        assert_eq!(left.len(), 2);
+        assert!(!left.contains(&first));
+        for id in left {
+            p.remove_annotation(id).unwrap();
+        }
+        assert_eq!(at(&p), [None, None, None]);
+    }
+
+    /// The listing gives an annotation several pages list once, on the first that lists it
+    /// (Q1); each page still shows it, and choosing by page finds it on any of them.
+    #[test]
+    fn the_listing_gives_each_annotation_once_on_its_first_page() {
+        let (mut p, first) = sharing_annots(3, 3);
+        let pages = |list: Vec<Annot>| list.into_iter().map(|a| a.page).collect::<Vec<_>>();
+        assert_eq!(pages(p.annotations()), [0, 0, 0]);
+        assert_eq!(pages(p.page_annotations(2).unwrap()), [2, 2, 2]);
+        assert!(p.annotation_ids_on(&[2]).unwrap().contains(&first));
+        let removed = p.remove_annotations(Some(&[2]), |a| a.id == first);
+        assert_eq!(removed.unwrap(), 1);
+        assert_eq!(pages(p.annotations()), [0, 0]);
+    }
+
+    /// Removing annotations stops at the first refusal of the budget for reading them: none
+    /// is built past it. 1,000 squares, with a budget for about 150.
+    #[test]
+    fn removing_builds_none_past_the_reading_budget() {
+        let (mut p, _) = sharing_annots(1, 1_000);
+        BUILT.set(0);
+        let (e, _) = budget_seam::with_limit(10_000, || p.remove_annotations(None, |_| false));
+        assert!(e.is_err_and(|e| e.is::<TooComplex>()));
+        let built = BUILT.get();
+        assert!(built <= 10_000 / 64 + 1, "{built} built");
+    }
+
+    /// Each entry of a list a listing looks at is charged a step of the budget for reading:
+    /// removing annotations from a page listing 100,000 entries that aren't annotations is
+    /// refused with a budget for fewer, and listing them takes a step for each of the 10,000
+    /// shown.
+    #[test]
+    fn listings_charge_each_entry_they_look_at() {
+        let mut p = Pdf::new();
+        p.insert_blank(0, 300.0, 200.0).unwrap();
+        let page = p.page_ids()[0];
+        let d = p.doc.get_dictionary_mut(page).unwrap();
+        d.set("Annots", vec![Object::Null; 100_000]);
+        let remove = |p: &mut Pdf| p.remove_annotations(None, |_| true);
+        let (removed, _) = budget_seam::with_limit(50_000, || remove(&mut p));
+        let (_, taken) = budget_seam::with_limit(u64::MAX, || p.annotations());
+        let refused = removed.is_err_and(|e| e.is::<TooComplex>());
+        assert_eq!((refused, taken.iter().max()), (true, Some(&10_000)));
+    }
+
+    /// Redaction marks are listed on each page showing them, and only marks are built: 200
+    /// pages sharing a mark and 999 squares look at the 1,000 entries once and build 200
+    /// entries, not 200,000.
+    #[test]
+    fn redaction_marks_build_marks_only() {
+        let (mut p, first) = sharing_annots(200, 1_000);
+        let d = p.doc.get_dictionary_mut(first).unwrap();
+        d.set("Subtype", "Redact");
+        BUILT.set(0);
+        ENTRIES_READ.set(0);
+        let marks = p.redaction_marks().unwrap();
+        let counts = (marks.len(), ENTRIES_READ.get(), BUILT.get());
+        assert_eq!(counts, (200, 1_000, 200));
+    }
+
+    /// The squares of [`sharing_annots`] made redaction marks, without a `/Rect` unless
+    /// `rect`.
+    fn as_marks(p: &mut Pdf, rect: bool) {
+        let page = p.page_ids()[0];
+        let ids: Vec<ObjectId> = (p.annots_array(page).unwrap().iter())
+            .filter_map(|o| o.as_reference().ok())
+            .collect();
+        for id in ids {
+            let d = p.doc.get_dictionary_mut(id).unwrap();
+            d.set("Subtype", "Redact");
+            if !rect {
+                d.remove(b"Rect");
+            }
+        }
+    }
+
+    /// The marks many pages share are counted once, as the listing gives them (Q1), and none
+    /// is built: 2,000 pages sharing 100 marks count 100.
+    #[test]
+    fn marks_many_pages_share_are_counted_once_building_none() {
+        let (mut p, _) = sharing_annots(2_000, 100);
+        as_marks(&mut p, true);
+        BUILT.set(0);
+        let n = p.redaction_mark_count();
+        assert_eq!((n, BUILT.get()), (100, 0));
+    }
+
+    /// The count is of marks, not the areas they cover (PB-40), within the budget for
+    /// reading them and past it, where listing them is refused: 3 pages sharing a mark of
+    /// two quads, one of none and one without a `/Rect`, listed and applied nowhere, count
+    /// 2 marks of 9 areas.
+    #[test]
+    fn the_count_is_of_marks_not_areas() {
+        let (mut p, first) = sharing_annots(3, 3);
+        as_marks(&mut p, true);
+        let quad = [10, 20, 20, 20, 10, 10, 20, 10].map(Object::from);
+        let d = p.doc.get_dictionary_mut(first).unwrap();
+        d.set("QuadPoints", [quad.clone(), quad].concat());
+        let last = p.annots_array(p.page_ids()[0]).unwrap()[2].as_reference();
+        p.doc
+            .get_dictionary_mut(last.unwrap())
+            .unwrap()
+            .remove(b"Rect");
+        let within = (p.redaction_mark_count(), p.redaction_marks().unwrap().len());
+        let ((count, listed), _) = budget_seam::with_limit(1, || {
+            let listed = p.redaction_marks();
+            (
+                p.redaction_mark_count(),
+                listed.is_err_and(|e| e.is::<TooComplex>()),
+            )
+        });
+        assert_eq!((within, count, listed), ((2, 9), 2, true));
+    }
+
+    /// Applying marks many pages share is refused past the budget for reading them, each
+    /// page's marks charged, even marks with nothing to place: 2,000 pages sharing 100 marks
+    /// without a `/Rect`, with a budget of 100,000 steps.
+    #[test]
+    fn applying_marks_many_pages_share_is_refused_past_the_budget() {
+        let (mut p, _) = sharing_annots(2_000, 100);
+        as_marks(&mut p, false);
+        BUILT.set(0);
+        let (e, _) = budget_seam::with_limit(100_000, || p.apply_redactions());
+        let built = BUILT.get();
+        let refused = e.as_ref().is_err_and(|e| e.is::<TooComplex>());
+        assert!(refused && built <= 100_000, "{:?}, {built} built", e.err());
+    }
+
+    /// [`sharing_annots`] on `n` pages with 1,000 squares, the first `n` moved apart, and a
+    /// redaction for each page over its own one of them.
+    fn marked_apart(n: usize) -> (Pdf, Vec<(usize, [f32; 4])>) {
+        let (mut p, _) = sharing_annots(n, 1_000);
+        let page = p.page_ids()[0];
+        let squares: Vec<ObjectId> = (p.annots_array(page).unwrap().iter())
+            .filter_map(|o| o.as_reference().ok())
+            .take(n)
+            .collect();
+        let mut marks = Vec::new();
+        for (i, id) in squares.into_iter().enumerate() {
+            let x = 5 * i as i64;
+            let rect = vec![(x + 1).into(), 99.into(), (x + 3).into(), 101.into()];
+            p.doc.get_dictionary_mut(id).unwrap().set("Rect", rect);
+            // Halfway down the page, so the same seen from the top.
+            let x = x as f32;
+            marks.push((i, [x, 98.0, x + 4.0, 102.0]));
+        }
+        (p, marks)
+    }
+
+    /// Redacting reads the list of annotations marked pages share once, however many of
+    /// them it marks: marks on 50 pages sharing 1,000 squares, each over its own, read no
+    /// more of the list than marks on two. Each page counts its square, and the pages still
+    /// share the 950 left.
+    #[test]
+    fn redacting_reads_a_list_marked_pages_share_once() {
+        let annots = |p: &Pdf| -> Vec<Option<Object>> {
+            let page = |id| p.doc.get_dictionary(id).unwrap();
+            (p.page_ids().into_iter())
+                .map(|id| page(id).get(b"Annots").ok().cloned())
+                .collect()
+        };
+        let redact = |pages: usize| {
+            let (mut p, marks) = marked_apart(50);
+            let shared = annots(&p);
+            ENTRIES_READ.set(0);
+            let report = p.redact(&marks[..pages]).unwrap();
+            let read = ENTRIES_READ.get();
+            let counts: Vec<usize> = report.pages.iter().map(|r| r.annots).collect();
+            let left = p.annots_array(p.page_ids()[0]).map_or(0, <[Object]>::len);
+            (read, counts, annots(&p) == shared, left)
+        };
+        let ((two, ..), (many, counts, shared, left)) = (redact(2), redact(50));
+        assert_eq!(
+            (many.saturating_sub(two), counts, shared, left),
+            (0, vec![1; 50], true, 950)
+        );
+    }
+
+    /// Redacting counts an annotation, with its replies, on the first marked page it goes
+    /// with: two pages sharing a square, its pop-up and a reply to it, both marked over the
+    /// square and the second over the pop-up too, count 2 and 0, and lose the list.
+    #[test]
+    fn redacting_counts_each_annotation_on_the_first_page_it_goes_with() {
+        let (mut p, first) = sharing_annots(2, 3);
+        let ids: Vec<ObjectId> = (p.annots_array(p.page_ids()[0]).unwrap().iter())
+            .filter_map(|o| o.as_reference().ok())
+            .collect();
+        let at = |x: i64| -> Vec<Object> { vec![x.into(), 95.into(), (x + 10).into(), 105.into()] };
+        p.doc.get_dictionary_mut(first).unwrap().set("Rect", at(10));
+        let d = p.doc.get_dictionary_mut(ids[1]).unwrap();
+        d.set("Subtype", "Popup");
+        d.set("Parent", first);
+        d.set("Rect", at(100));
+        let d = p.doc.get_dictionary_mut(ids[2]).unwrap();
+        d.set("IRT", first);
+        d.set("Rect", at(200));
+        // Halfway down the page, so the same seen from the top.
+        let over = |x: f32| [x + 2.0, 98.0, x + 8.0, 102.0];
+        let marks = [(0, over(10.0)), (1, over(10.0)), (1, over(100.0))];
+        let report = p.redact(&marks).unwrap();
+        let counts: Vec<usize> = report.pages.iter().map(|r| r.annots).collect();
+        let lists: Vec<Option<usize>> = (p.page_ids().into_iter())
+            .map(|id| p.annots_array(id).map(<[Object]>::len))
+            .collect();
+        assert_eq!((counts, lists), (vec![2, 0], vec![None, None]));
+    }
+
+    /// Redacting charges each entry each marked page looks at to its budget for drawing the
+    /// annotations, before the drawings are checked: marks on 50 pages sharing 1,000
+    /// squares are refused there with a budget of 40,000 steps.
+    #[test]
+    fn redacting_charges_each_entry_each_marked_page_looks_at() {
+        let (mut p, marks) = marked_apart(50);
+        let (e, _) = budget_seam::with_limit(40_000, || p.redact(&marks));
+        let what = e
+            .err()
+            .and_then(|e| e.downcast_ref::<TooComplex>().map(|t| t.what));
+        assert_eq!(what, Some("drawing the annotations"));
+    }
 
     #[test]
     fn dates() {

@@ -134,6 +134,15 @@ how many entries there are; clippy.toml refuses `page_iter` and `get_pages` anyw
 overflow, as the app is built), overflowed itself, or, as the pages were collected for drawing, asked for more
 memory than a computer has, which ended the app (PB-173, found by the `readers` fuzz target).
 
+Finding a page by its number (`Pdf::page_id_at`, and `parse_page`, which goes through it) walks the tree up to it,
+so an operation over many pages finds them once (`Pdf::page_ids`) and passes each page's object on
+(`parse_page_of`, `text_matches_of`, `scan_target`), and removing a page's links finds the page once for them all
+(PB-29). Before, finding redaction marks, redacting, applying the marks, removing hidden information, listing and
+flattening the form's fields, reading the document's words, recognising text, optimising scans, removing links and
+signing found pages by their number inside their loops, so their time grew with the square of the page count.
+`tests/page_walks.rs` counts the tree's entries read (`doc::pages_seam`, built only for tests) by 25 operations on
+2,000 pages, and holds each to 20 walks.
+
 hayro (0.9) sets aside memory for a picture from its stated width and height, not from its data: an inline image of
 78 bytes stating 255,555,555 × 2 pixels made it ask for about 4 GB (PB-81, found by REL-12's `draw` fuzz target). So
 every copy pages are drawn from leaves out a picture whose data can't come near filling it
@@ -1076,13 +1085,13 @@ removed). An original is kept when a certainly drawn readable node draws it, and
 page goes to `report.left`; drawn by nothing, it is unlisted. Then every `/Resources` and `/DR` in the file, at
 any depth in any object, whatever holds it and whether or not anything draws with it, is found, and in their
 `/XObject` and `/Properties` dictionaries the entries for unused originals, and properties holding removed
-alternative text that no node uses (by reference, or a direct one by equality), are worked out first, reading
-only, then removed in place, shared dictionaries too. Last, an independent walk follows every reference from the
-trailer, as saving keeps it: the tag tree (`StructTreeRoot`) and private application data (`PieceInfo`) are
-followed after everything else, so an object something else reaches counts as that, and each route still
-reaching anything removed is a `report.left` sentence naming it ("removed content may still be in the file,
-through the tag tree"), which makes both callers refuse: the app rolls back, the CLI writes nothing. Nothing is
-cut on those routes (that needs its own design).
+alternative text that no node uses (by reference, or a direct one by equality, found by its hash in
+`retained::Props`), are worked out first, reading only, then removed in place, shared dictionaries too. Last, an
+independent walk follows every reference from the trailer, as saving keeps it: the tag tree (`StructTreeRoot`) and
+private application data (`PieceInfo`) are followed after everything else, so an object something else reaches
+counts as that, and each route still reaching anything removed is a `report.left` sentence naming it ("removed
+content may still be in the file, through the tag tree"), which makes both callers refuse: the app rolls back, the
+CLI writes nothing. Nothing is cut on those routes (that needs its own design).
 Removing hidden layers takes the same steps (`drop_hidden_layers`, PB-153; PB-111 with it): a walk before the
 change (which refuses, as the check does, when the drawings are too complex) and one after every edit; the
 removed set is the pictures and forms drawn before and not after, with those carrying a hidden `/OC` of their
@@ -1101,15 +1110,25 @@ one; then it walks down from the list as before.
 Decoded content is cached by object (`reach::Decoded`) and shared by the walks before and after a redaction,
 which only adds objects; Remove hidden information edits streams in place, so its walk after starts afresh.
 Its scan for hidden content (`scan_layers`, WP-03) runs on `Pdf::reach_listed`: the same walk following every
-name the resources list, used or not, without reading the content, each set of resources (by fingerprint)
-followed once, so it costs a step per entry of each drawing's resources and per name listed, not per page. Each
+name the resources list, used or not, without reading the content, each set of resources followed once, so it
+costs a step per name listed and per KiB of resources read, not per page. Each
 node carries its stream (`Node::stream`, `None` for a page's content) and the resources it draws with
 (`Node::res`); a drawing without resources of its own is looked into with the first and compared with the others
 (`check_shared`). Drawings are followed to any depth within the walk's budget; the scan's own recursion, with
 its 32-deep limit, is gone. `drop_hidden_properties` stays a scan of every object, the boundary's safe superset.
 
 The walk is charged against a `budget::Work` (`budget.rs`, `TooComplex`), one step per drawing reached, name
-looked up, page, annotation, holder and entry of inherited resources. `reach::STEPS` is 2²² (4,194,304): 32
+looked up, page, annotation and holder, one per KiB of resources read, and one per KiB of what it keeps of marked
+content (properties written in the resources, `Node::properties`, and alternative text, `Node::alt`). Resources
+are read once where they are written (`Walk::res`: an object of their own, the dictionary whose `/Resources` they
+are, or a Type 3 font's name in a set), however many drawings share them, and the walk borrows what it reads,
+copying only what it keeps. A page's content is read once a walk in the same way (`Walk::page_uses`: the object
+its `/Contents` refers to, or the streams an array written in the page lists), however many pages share it; that
+is kept for the walk only, as Remove hidden information rewrites content in place. Resources are told apart as
+they are read (`Walk::told`), by what they hold: the same entries in any order, compared exactly after a hash with
+random keys, are one set, numbered, and a drawing without resources of its own is followed once for each set it
+is drawn with (WP-04; a form drawn from pages whose resources only printed alike was once followed with the first
+page's, and `scan_layers` skipped the second page's). `reach::STEPS` is 2²² (4,194,304): 32
 times the corpus maximum, 129,066 steps (`pdfjs/issue6692.pdf`, 109 pages; the 1,080 files that open, measured
 2026-11-04 with the budget lifted). The walk runs first as a check, refusing before anything changes; the walk
 after the change is allowed twice the limit plus the objects added, so it can't fail midway on a document that
@@ -1119,10 +1138,18 @@ a copy, not strict) leaves the pictures listed when that walk fails rather than 
 
 Reading a page (`objects.rs`, `parse_as_page`; S1-06, H-07) has a budget of its own: a step per operator and per
 form opened, plus one per KiB of the form's content, charged across every form the page draws, however often (a
-form is read again each time it is drawn), one per cell the underline grids go through (S1-07), and one for
+form is read again each time it is drawn), one per cell the underline grids go through (S1-07), one for
 each part of the rest of looking for underlines that can grow faster than the page (CP-05; both under
-"Underlines and strike-throughs"). `objects::STEPS` is 2²³ (8,388,608): 7.5 times the corpus maximum,
-1,124,715 steps (`pdfbox/5134.pdf`, page 1, 474,984 of them looking for underlines; every page of the 1,080
+"Underlines and strike-throughs"), and the colour spaces the page sets (`colour.rs`, `Space::named`; WP-04): a
+step for each space and each function read, one per part a list of parts names, one per 1,024 numbers of an
+array and one per KiB of sampled data, calculator code and colour tables. A function many parts share is read
+once for each depth it is met at, so three levels listing the same function 20 times read 4 functions, not
+8,421. Setting a colour (`cs`, `sc`, `scn` and the stroking `CS`, `SC`, `SCN`) is also charged what showing it
+takes (`Space::cost`), each time: one step per 1,024 values read and steps run (the colour's values, a sampled
+function's cell corners for each output, a stitching function's bounds and its dearest part, a calculator's
+steps with the longer block of each `ifelse`), worked out when the space is read; the device spaces and
+ordinary spot colours cost nothing beyond their operator. `objects::STEPS` is 2²³ (8,388,608): 7.5 times the corpus maximum, 1,124,715 steps (`pdfbox/5134.pdf`,
+page 1, 474,984 of them looking for underlines; every page of the 1,080
 files that open, measured 2026-11-06 with the budget lifted; 649,731 before CP-05, 12.9 times, and 588,688
 before the grids' cells were counted, 14 times). A step takes about 0.47 µs in an optimised build, whatever the
 forms' depth or width, so a page is refused after about 4 s of reading; the heaviest corpus page reads in
@@ -1190,7 +1217,35 @@ alike; PB-04); content none of these places counts as on a page that went, so it
 removal being refused. Object references (`OBJR`) aren't marked content and keep their old test. Form field walks
 share one depth rule (PB-05): fields at most `forms::MAX_DEPTH` (32) below the top field, their widgets one level
 further, as `form_nodes` reads them: `value_nodes` and `field_goes` refuse a node with kids deeper than that, and
-`orphan_widgets` a widget with more than 33 parents.
+`orphan_widgets` a widget with more than 33 parents. A `/Kids` array object that many nodes list, as no well-made
+file has, is walked once, not once a node: in `forms.rs` a node listing it again takes its kids from that walk
+(`Walk::kids`, kept by depth so a shallower node still reaches kids too deep before, and walked again through a
+loop so names come out as `sig_changes` gives them), and a widget more than one field lists goes to the first
+(`Walk::claimed`; it went to each before); a node of no kind (`field_kind`) is no field and takes neither the list
+nor a widget, so the field listing them after it still does
+(`flattening_draws_a_value_whose_widget_a_node_of_no_kind_lists`), but keeps the list told apart, untaken, for the
+next node listing it (`nodes_of_no_kind_sharing_widgets_read_them_once`; each read it again before). Its kid
+fields it walks as of no kind, without taking them, so a field listing them after it walks them again as its own
+(`flattening_draws_a_value_whose_kid_field_a_node_of_no_kind_lists`; they went to no field before), while a node
+of no kind listing them after it passes over them (`nodes_of_no_kind_sharing_kid_fields_walk_them_once`); a node
+walked with no kind is passed over when reached again with none
+(`nodes_of_no_kind_reached_again_are_walked_once`), so each node is walked at most twice. `value_nodes` passes
+over such a list. `repair.rs`'s
+`mend_page_tree` walks the tree a depth at a time, so a node or a list several nodes list is mended from the one
+nearest the top (a node first reached too deep to mend what is below it went unmended before), and queues the kids
+such a list gives by reference once; each node takes its own copy of a list with pages written in it, so that each
+has pages of its own, inheriting from it (sharing one copy left lopdf, which reads no more of a page list than the
+file has objects, short of pages), and a file whose copies would take more than `MAX_SHARED_KIDS_COPIES` (64 MiB) is
+refused: `copy_size` counts what a copy holds on the heap, a dictionary's room for its entries and index too, as
+indexmap and hashbrown keep it (`tests/shared_kids_memory.rs` checks it against a counting allocator). It
+reads the bytes' object headers once (`object_lines`) for the kids that aren't page nodes
+(`fields_sharing_their_kids_are_walked_once`, `widgets_shared_by_fields_go_to_the_first`,
+`page_tree_nodes_sharing_their_kids_queue_them_once`,
+`page_tree_nodes_sharing_a_list_with_no_page_written_in_it_read_it_once`,
+`a_node_first_reached_far_down_is_mended_from_nearer_the_top`,
+`a_shared_list_first_reached_far_down_is_mended_from_nearer_the_top`,
+`nodes_sharing_a_list_with_pages_written_in_it_each_give_their_pages_their_size`,
+`nodes_sharing_a_list_too_large_to_copy_for_each_are_refused`, `kids_that_are_no_page_are_looked_for_in_one_pass`).
 
 Deleting pages, extracting and splitting are held to redaction's promise (PB-137, D-22 (a)). `drawn_before` walks
 the document's drawings first (`Pdf::reach`) and keeps what was drawn and painted, and the subset drawn for certain
@@ -1256,8 +1311,8 @@ pen strokes smoothed into curves, typed names as the glyph outlines of a bundled
 flattens just those annotations, after looking at every page without changing it (`Pdf::plan_page`), so an item
 it can't place (no `/Rect`, or no drawing with a box) is refused with nothing changed, not removed undrawn
 (PB-112). Counting and locking them (`Pdf::sign_items`, `lock_sign_items`) walk every
-annotation a page lists (`all_annot_refs`, PB-02), not the 10,000 the app shows, as removal does; so does
-finding an annotation's page when it has no `/P` (`annot_page`). The app's saved signatures and the Create
+annotation the pages list (`listed_annots`, each list once however many pages share it; PB-02), not the 10,000 the
+app shows, as removal does; so does finding an annotation's page when it has no `/P` (`annot_page`). The app's saved signatures and the Create
 signature window are in `crates/limarepdf-gui/src/signing.rs`; every preview button is a white card that the
 preview's paper fills (`paper_button`, PB-09), with a 2-point outline always drawn (clear, the border colour
 under the pointer from the last frame's response, the accent when chosen), as a white fill hides the flat
@@ -1313,15 +1368,96 @@ drawing is what flattening writes into the page. An annotation in a layer (`/OC`
 marked content tagged with it (`/OC /LimareField1 BDC … EMC`, the layer or rule named in the page's
 `/Properties`), so it shows when the layer does, as before (PB-180). That is `flatten_page`, so flattening the
 form or comments, finishing signing and printing all do it; a rule written in place is stored as an object of its
-own, since renderers look a tag's layer up by reference.
+own, since renderers look a tag's layer up by reference. A drawing reads at most 100,000 points (`MAX_POINTS`)
+from each entry, and an Ink drawing's strokes, or a Squiggly one's wavy lines, share 100,000 between them, so a
+stroke listed many times is drawn only to the points left. A change made from the points (adding a stroke,
+setting a drawing's width, which sizes its box by them, turning a drawing, moving an annotation by its `/L`,
+`/Vertices`, `/QuadPoints`, `/CL` or `/InkList`) is refused past them instead (`TooComplex`, "changing the
+annotation", limit 100,000; `annot_write::past_its_points`), counted by each array's length before any is read,
+so nothing is written from points cut short and nothing changes.
 
 A drawing is placed by the annotation's `/Rect`, which flattening and every renderer map its box onto. Markup,
 links, lines, polygons, polylines and ink (`BY_POINTS`) are drawn from their own points instead, so one whose
 `/Rect` has no area (a point, or a line away from it, as `pdfjs/issue14203.pdf` has them) is given the box around
 what it draws (`extent`: the paths' points, a curve's control points, past them by the widest line plus a point)
-as its drawing's box and its `/Rect` (PB-114). `annot_rect` gives that box without drawing: `Pdf::annotations`
-and `page_links` list it, `move_annotation` moves from it as the app does, and redaction removes the annotation
-when a mark touches it or its `/Rect`.
+as its drawing's box and its `/Rect` (PB-114). `annot_rect` gives that box without putting the drawing in the
+file: `Pdf::annotations` and `page_links` list it, `move_annotation` moves from it as the app does, and redaction
+removes the annotation when a mark touches it or its `/Rect`.
+
+Drawing annotations has a budget (`annot_ap::STEPS`, `work`; WP-04): 256 steps for each annotation, one for each
+point read, each byte of text read (a stamp's name, `/DA`, `/DS`, a text box's text each time it is checked for
+characters its font can't write or set, `box_text`) and each byte the drawing writes, and two more for each byte
+of a text box's text set (`SETTING`), each time it is measured to fit its box too (`fit_text_box`, with a budget
+of its own). Text written as a stream, here and in reading them (below), is charged its own bytes and each byte
+its filters give, a failure too (`budget::Work::decode`): lopdf limits each filter to a try's size, tried at the
+stream's own size (4 KiB at least) and then four times larger as far as the steps left allow, a try that fails is
+charged all it could take, and past them it is refused. Before, a failure was free and only the last filter's
+bytes counted, a text box's text was read uncharged, only its length charged after, and measuring it was free.
+Annotations can share their points and text, which each reads again, so it counts everything drawn, however
+often. One budget covers what a change draws, and everything is drawn before anything is put in the file,
+so a refusal (`TooComplex`, "drawing the annotations") changes nothing: flattening, printing (`print_planned`),
+redacting, and adding, changing or moving a comment or link refuse. Showing the document (`render_snapshot`,
+`app_snapshot`, the page under text being edited; `draw_shown`) draws as far as the budget goes and leaves the
+rest without a drawing, as other readers show them, rather than not open it; the listings (`Pdf::annotations`,
+`page_annotations`, `page_links`) place those past it at their own `/Rect`, and removing comments and sanitising
+read each at its own `/Rect`, drawing none. `STEPS` is 2²⁴ (16,777,216): 200 times the corpus maximum, 83,771
+steps (`pdfjs/issue15292.pdf`, 9 annotations; the 1,086 files that open, every annotation's own drawing taken
+away, measured 2026-11-14 with the budget lifted). Timed in an optimised build on made-up pages of each kind just
+under the limit, short text boxes are the dearest: shown (`app_snapshot`) in 2.9 s and flattened in 2.4 s
+(0.14 µs a step, most of it setting their text), refused at twice the limit in 1.2 s. Every other case takes at
+most 2.1 s (long text boxes shown), the drawings save in at most 2 s, and the most memory used is 0.9 GiB, showing
+61,000 tiny text boxes, the document and its copy included. Counting each operator drawn first let cloudy borders write about 1 GB of drawing within
+the limit (13 s to draw, 109 s to compress when saved); 64 steps an annotation let 207,000 tiny text boxes take
+1.5 GiB; and one step a byte of text set let short ones take 4.5 s to show.
+
+Reading the listed annotations has a budget of its own (`annot_ap::READ_STEPS`, `Place::read`; WP-04): one step
+for each entry of a page's `/Annots` a listing looks at (`Place::look`, the list charged before any is looked at),
+64 for each annotation (`READ_EACH`), one for each point and ink stroke read and each byte of text (its comment,
+author, subject and name, and a text box's `/DA` and `/DS`, read once for its style by `box_geometry`, as it is
+drawn: a text box whose colour is only in `/DS` is listed in that colour, where only `/DA` was read before). Past
+it, the listings list the rest `Annot::unread`: their date, flags, colour, opacity, box and what they reply to are
+read, their text, points and style not (empty, `text_style` `None`). The app shows "Too large to show"
+(`editor::TOO_LARGE`) for their text on the card, the tip, the inspector and the replies, and lets them be
+selected, moved and deleted as if read (text markup still stays on its text; a redaction mark isn't resized, its
+areas unknown), never changed: a double-click doesn't open one for typing (`writable`), its inspector offers only
+Delete. Changing one reads it alone (`Pdf::annotation`, as the listings list it but within budgets of its own,
+as the app does to type in a comment), so `change_annotation` refuses only when that one alone is past the
+budget, rather than write what is shown over its text. Deleting one (`Pdf::remove_annotation`, from the Comments
+view or the page) reads no other annotation. The listings read each page's list once however many pages share it,
+or times the page tree lists a page that writes its list in (`each_annots`, keyed by the list's object or else the
+page's), and list each annotation once, on the first page that lists it: the Comments view and `annot list` give it
+one card or line, under that page, and each page still shows it (`page_annotations`).
+`annotation_ids_on` gives what some pages list, for the Comments view's This page and `annot list --pages` and
+`annot remove --pages`, so one that pages 2 and 3 both list is chosen by either. Before, P pages sharing a list of
+N entries built P × min(N, 10,000) entries, each about 330 B even unread. What removes information reads every
+annotation and refuses past the budget (`Place::whole`), building none past the first refusal (`Place::stopping`,
+`Place::done`): `remove_annotations` (`annot remove`, choosing by author), applying redaction (the marks' areas)
+and its search for the removed text in the comments (`find_elsewhere`). The marks (`every_mark`, for applying and
+`Pdf::redaction_marks`, which refuses past either budget) are found by kind in each page's list, looked through once
+however many pages share it, and only they are built; a page whose list was looked through before is charged a step
+for each of its marks, so P pages sharing M marks are refused past the budget, not built P × M times, uncharged where
+a mark has no `/Rect`. Applying finds the annotations under the marks the same way (`annots_under`), before anything
+changes and once for all the marked pages, within the drawing budget (above): each list is read once however many
+marked pages share it, and each entry each marked page looks at is charged a step, as is drawing one placed by its
+points, so P marked pages sharing N entries are refused past the budget ("drawing the annotations") before the
+drawings are checked, not read P × N times. They go once, after every page (`Pdf::take_out`, each list changed
+once, with the replies to them, `Pdf::replies` and `with_replies`, and their pop-ups), and the fields of the widgets
+among them are pruned once (`prune_fields`); each page counts those going with it, one gone with an earlier page not
+again. Before, each marked page read its list and every page's list for the replies, and changed its own: 50 marked
+pages sharing a list of 1,000 entries read 140,328 entries more than 2 did.
+What needs only what each annotation is picks ids by
+kind, building no entry (`annotations_of_kind`): sanitising's comments and attachments, and the marks applying
+redaction removes. The count of marks for the marks banner, the Redact pane and the questions before saving and
+applying (`redaction_mark_count`, by `count_of_kind`, never refused) reads each list once: each mark with a `/Rect`
+once, however many pages list it, as the listing gives it, and one written into a list directly, which the listings
+skip but applying gives an object first (`own_direct_annots`) and applies; a mark over several lines is one, not one
+per area as `redaction_marks` gives them (PB-40). `annot list` marks one "too large to show" (`"unread": true` in JSON).
+`READ_STEPS` is 2²⁴: 2,242 times the corpus
+maximum, 7,480 steps (`pdfjs/issue12579.pdf`, 85 annotations; the 1,086 files that open, measured 2026-11-15 with
+the budget lifted). Timed in an optimised build (the `ci-test` profile) on made-up pages just under the limit, ink
+strokes sharing their points are the dearest: listed in 0.7 s and removed in 0.9 s (0.04 µs a step). 258,111
+annotations with nothing to read are removed in 0.8 s and 246,723 short notes in 0.7 s (the listings list at most
+10,000 a page); every other case takes at most 0.6 s, and twice the limit is refused within 1.1 s.
 
 Links (ENH-17) are `links.rs`, kept apart from comments: `AnnotKind::of` leaves them out, so they are never in
 the Comments view or `Pdf::annotations`. `Pdf::page_links` reads every link of a page with an area: its id
@@ -1459,13 +1595,114 @@ so signed attributes are never re-encoded before checking. The cryptography is R
 appended revisions' cross-reference sections itself (lopdf corrects bad offsets and repairs broken tables, which
 would hide changes), checks that lopdf reads the same objects (in number order, so a revision with several faults
 always gives the same reason: saving compares the reasons before and after, and one naming another object would
-count as a new change), then compares each signed version with the next,
-judging every object that differs by each role it plays (page content, comment, form field, signature, document
-structure) against the signer's permissions. Trust is in `trust.rs`: the trust list file (`trust.txt` in the
-settings folder, whose location `limarepdf_core::settings_dir` gives both the app and the command line), and the chain
-search from a signer's certificate to a trusted authority over the certificates the signature and the document's
-`/DSS` carry, with RFC 5280's checks at the signing time, including certificate policy processing; each link's
-signature is checked over the certificate as written (`cms_check::check_cert_signature`). Signatures and
+count as a new change; object 0 aside, which lopdf lists as free after reading a table but not a stream, so a
+table after a stream was refused, `a_table_after_a_cross_reference_stream_changes_nothing_by_itself`), then compares
+each signed version with the next (a later signature's version is one when only
+white space lies between its end and a revision's, either way round: one ending at `%%EOF`, before the end of line
+the revision's end takes in, wasn't, so a change made before it and undone after was missed,
+`a_change_undone_before_the_next_signature_still_counts`; that end of line is at most `\r\n`, so a signature's end
+lying further before a revision's end is never its end, and a run of white space after it isn't looked through again
+for each revision ending later, `white_space_after_a_signature_end_is_looked_at_once`), judging every object that differs by each role it plays
+(page content, comment, form field, signature, document structure) against the signer's permissions. Each version
+keeps each `/Annots` list once, however many pages share
+it, and each pair of lists (before and after) is compared once: its entries are looked for by their references, and
+those written in place (which the format doesn't allow) among each other. Each entry of each pair, each comparison,
+and each change found for each page it shows on is a step, within `MAX_STEPS` (4,000,000) a version, past which the
+later version is too complex to check (never allowed, as when assigning roles passes its limits) and none of the
+lists' changes is reported; each change is reported once a page. Two pages sharing a list of 2,000 comments, one
+more added after signing: 16,022,008 objects compared before, at most 5,000 now
+(`signature_changes_compare_each_annots_list_once`). A hundred pages sharing a list of 100 fields' widgets, emptied
+after signing: 10,000 changes, so refused at a limit of 5,000
+(`annotation_changes_on_each_page_count_against_the_steps`). Assigning roles looks through each list held in an
+object once a version too, and walks the annotations written in place in a list again for each page that has it, a
+step for each object in them. A thousand pages sharing a list of 1,000 comments, one more added after signing:
+2,001,000 entries looked at before, at most 5,000 now (`roles_look_through_a_list_pages_share_once`); a hundred
+pages sharing 100 written in place: refused at a limit of 50,000
+(`annotations_in_a_shared_list_cost_steps_on_each_page`). Anything else it reaches it walks once for each kind of
+role it plays, a step, keeping what an object refers to for the other pages and annotations that reach it; handing
+it on to each of those is a step, or one for each reference in the object that one had reached already, if more. A
+thousand pages sharing resources that hold 1,000 numbers, changed after signing: 2,025,006 objects walked before, at
+most 50,000 now (`roles_walk_what_pages_share_once`); a page listing 1,000 arrays that each hold the same dictionary
+of 1,000 numbers: 2,007,026 before, at most 50,000 now (`parts_reached_through_many_arrays_are_walked_once`); a
+hundred pages sharing 100 objects that each refer to the same 100 others: refused at a limit of 100,000
+(`references_reached_again_cost_steps`); an array of 5,000 references to one object, reached from the form and then
+last of all from the catalog: refused at a limit of 2,000 (`references_reached_again_last_cost_steps`); a structure
+tree's parent tree listing an element once for each of its 5,000 marked pieces, reached by the catalog alone: a step,
+the same within 1,000 (`a_parent_tree_listing_an_element_again_costs_a_step`); an article thread through 300 pages
+still a step a bead a page (`a_thread_through_every_page_costs_a_step_a_bead`). Walking the page tree and the form
+fields, each kid a node lists and each 64 bytes of a field's name is a step, against the same limit (its own count),
+and nesting isn't limited: a page 70 levels down was skipped before, as was a field 40 down
+(`pages_deep_in_the_tree_are_checked`, `fields_deep_in_the_form_are_checked`). A page-tree node listing a page and
+1,000 nodes that each list the same: refused at a limit of 100,000 (`page_tree_kids_cost_a_step_each`); a root field
+named with 6,400 bytes over 1,000 kids: refused at 50,000 (`long_field_names_cost_steps`). Whether a field's widgets
+show is worked out once for each list of kids fields share, a `/Rect` read only when it has four numbers: 1,000
+fields that each list all of them, 8,008,000 numbers read before, at most 50,000 now
+(`form_kids_cost_a_step_each`); a `/Rect` of 10,000 numbers, 20,000 read before, none now
+(`a_rectangle_of_too_many_numbers_is_not_read`). Each field keeps the top of its tree as it's recorded, so a signature
+field added after signing is judged with all its nodes however deep (`a_new_signature_fields_deep_widget_is_judged`),
+and the trees of those added are gathered in one look at each field and judged in a second, both through one counted
+accessor: 2,000 new signature fields, about 4,000,000 looks before, 4,000 now
+(`new_signature_fields_are_looked_at_a_couple_of_times_each`; a scan of every field for each new tree counts
+4,004,000). A field signed after signing counts as signing only when the report lists its signature, as nothing else
+checks it, and every signed node of a new field is judged, not only the first: one nested past the 32 levels the
+report follows, or a value on a widget the report doesn't read, is refused
+(`a_signature_the_report_doesnt_list_is_refused`, `a_new_signature_the_report_doesnt_list_is_refused`; the widget's
+was allowed before, `a_signature_on_a_fields_widget_is_refused`). Nor does a field count as signed when its `/V`
+refers to a signature dictionary the version before the step has: an empty field given a document timestamp's or
+the first signature's, after a certification allowing no changes or an approval, was allowed as its timestamp or
+signing before, the report listing the earlier signature in both fields
+(`an_earlier_signature_put_in_a_field_is_refused`; a copy in an object of its own is a signature the report finds
+copied). A widget that is a kid of a signature field is
+judged by the field it's part of (`FieldInfo::field`), as signing sets the field's `/V` and draws and locks its
+widgets: signing such a field, empty, was refused before, the kid's new drawing taken for a change to an unsigned
+field, and a signing that redraws the kid's own drawing in place was too; that drawing redrawn after signing, in place
+or replaced, is refused (`signs_a_field_whose_widget_is_a_kid`, `signing_redraws_a_widget_kids_own_drawing`). A
+field signed before and moved into a new signature
+field isn't taken for that field's signing: an untitled one listed first around a document timestamp was reported as
+the timestamp's signing, its adding not at all, and after a certification allowing no changes was allowed until
+fields' parents were compared (`a_new_signature_field_holding_an_earlier_signature_is_no_signing`). A field made part
+of a signature field, or no longer, by a list of kids or fields changing is refused, as its signing would go
+unjudged, or its changes be judged as filling in another field: a widget moved under one and given a made-up
+signature was reported as nothing before
+(`a_widget_moved_under_a_signature_field_and_signed_is_refused`), and one moved out of one and filled in as the
+other field's is refused too (`a_widget_moved_out_of_a_signature_field_is_refused`). So is a field listed under
+another field, even keeping its name, or renamed by a change to one above it or to a title in an object of its own, as
+a lock naming it would no longer, or what it takes from those above it would change, and filling it in is judged by
+the name it had: a locked field listed under another was reported as nothing before, and filled in, allowed, one
+moved under an untitled field reported as nothing, and one renamed through a title in an object of its own allowed
+(`a_field_renamed_by_changes_to_other_fields_is_refused`); a text field moved into a signature field or out of one
+was reported as nothing too (`a_typed_field_moved_into_or_out_of_a_signature_field_is_refused`), and a signed
+field's widget moved to another signature field, its signature then shown as that field's, allowed
+(`a_signed_fields_widget_moved_to_another_signature_field_is_refused`). A field listed again by another field than
+the one it's named by, or no longer, is refused too, as a reader going by that listing would see the field there: one
+listed again under another field, an untitled one or a signature field, kept or added, was reported as nothing before,
+as only the listing a field is named by was compared, and a new signature field's widget listed under another field
+too, or in `/Fields` too, allowed, now refused as a change to that field or as a field added; a field listed twice by
+the same field or by `/Fields` is the same either way, and allowed (`a_field_listed_again_is_refused`). A field whose
+`/Parent` names another than the field listing it, which readers following `/Parent` name it by and take its type,
+value and actions from, is walked as all a change to it (`FieldMeta`), so that `/Parent`, when recorded nowhere, is
+part of it too, as is one an annotation not in `/Fields` names: such a parent renamed, refilled, made a list or given
+a script was reported as nothing before, and the widget filled in allowed after an approval, a certification allowing
+filling in or a lock naming it as that parent's kid; a widget whose `/Parent` is the field listing it is filled in as
+before (`a_field_s_parent_other_than_its_listing_is_refused`). Each kind of
+change to a field is found once a page, however many of its keys or parts change, and its name copied only then:
+text and signature fields named with 64 KB, signed or not, with 1,000 keys or parts changed (a seed value's or a
+signature's too), were found 1,000 times each before, and the test counts the names copied, one a field
+(`a_fields_change_is_found_once_however_many_keys_or_parts_change`). So is a widget a page's `/Annots` lists again
+and again: an entry referring again to what one before it did is judged once a side, where a page listing a text
+field's and a signed signature field's widgets 1,000 times each, named with 64 KB and taken off after signing, and
+another field's put on 1,000 times, copied each name once an entry before, 3,000 in all
+(`a_widget_listed_again_and_again_is_judged_once`). So is a field added listed by many: one named with 64 KB and
+listed by 1,000 fields added with it was found added once for each but the first, 999 copies
+(`a_field_added_listed_by_many_is_found_once`). A signature field added with a field of another
+kind inside it is refused for that field, as adding one is never allowed, on its own or not: a text field inside one
+was allowed with it before, after an approval or a certification allowing form filling
+(`a_field_inside_a_new_signature_field_is_refused`). Trust is in `trust.rs`: the trust
+list file (`trust.txt`
+in the settings folder, whose location `limarepdf_core::settings_dir` gives both the app and the command line), and
+the chain search from a signer's certificate to a trusted authority over the certificates the signature and the
+document's `/DSS` carry, with RFC 5280's checks at the signing time, including certificate policy processing; each
+link's signature is checked over the certificate as written (`cms_check::check_cert_signature`). Signatures and
 certificates read their algorithm through one function, `cms_check::scheme`: an RSA-PSS algorithm whose parameters
 are left out or NULL gives *can't check* (RFC 4055 requires them; only an empty list means the defaults), while an
 RSA-PSS-only key with no parameters has no limits (`pss_key_limits`, RFC 4055 section 1.2). Trust is applied after
@@ -1496,7 +1733,9 @@ CLI, run as a separate program). It is built for core's own tests and, through c
 for the app's and the CLI's: their dev-dependencies turn the feature on, so `cargo build --release` never has it,
 and CI's "No test seam" steps check the release programs for the variable's name. The feature has a second seam
 for the CLI, `render::panic_seam`: with `LIMAREPDF_TEST_DRAW_PANICS` set, drawing a page panics, so its tests reach
-the CLI's panic guard now that no file is known to make hayro panic. Writes of LimarePDF's own files say what happened too (BUG-14): `IdStore::create` and `import` return a
+the CLI's panic guard now that no file is known to make hayro panic. A third, `budget::budget_seam`, gives a
+thread's operations another limit; with `LIMAREPDF_TEST_BUDGET` set (`budget_seam::VAR`), every operation the CLI
+does has that limit, so its tests reach a budget's refusal. Writes of LimarePDF's own files say what happened too (BUG-14): `IdStore::create` and `import` return a
 `Stored` (the ID and warnings) once the ID's file is written, so a default that can't be noted, or a sync not
 confirmed, is a warning, never a failure that a second try would repeat; `IdStore::remove` returns its warnings;
 the app's ID window shows them (`Said::Warning`), the CLI prints `warning:` lines and succeeds, and the trust list,
@@ -2058,9 +2297,9 @@ every file a command reads besides the document (a picture, a password file, for
 certificate, the digital ID used) and refuses an output that is one of them (PB-139). The contract, its tests and
 limits: [contracts](contracts.md#file-identity-and-destinations).
 
-Listing annotations (`Pdf::annotations`, and `every_annotation` for the redaction marks counted after every change
-and before every save) passes each page's id to `annotations_in`; looked up by number (`page_id_at`, which builds
-the page list) it went through the page tree once a page, 63 ms on 300 pages (batch 37).
+Listing annotations (`Pdf::annotations`, and `count_of_kind` for the redaction marks counted after every change
+and before every save) takes the pages' ids from one list (`placed_pages`); looked up by number
+(`page_id_at`, which builds the page list) it went through the page tree once a page, 63 ms on 300 pages (batch 37).
 
 Crash recovery copies are kept by `crates/limarepdf-gui/src/recovery.rs`, in a private
 per-user state folder with one subfolder per running app, which holds a locked `lock` file while the app runs. A tab's

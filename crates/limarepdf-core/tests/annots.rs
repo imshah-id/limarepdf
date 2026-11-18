@@ -451,7 +451,7 @@ fn removing_takes_replies_and_popups_too() {
         dictionary! {},
     );
     add(&mut p, 0, "Link", [0.0, 0.0, 10.0, 10.0], dictionary! {});
-    let n = p.remove_annotations(|a| a.id == note).unwrap();
+    let n = p.remove_annotations(None, |a| a.id == note).unwrap();
     assert_eq!(n, 2);
     let left = p.annotations();
     assert_eq!(left.len(), 1);
@@ -460,11 +460,11 @@ fn removing_takes_replies_and_popups_too() {
     let annots = p.doc.get_dictionary(pg).unwrap().get(b"Annots").unwrap();
     assert_eq!(annots.as_array().unwrap().len(), 2, "square and link stay");
     assert_eq!(
-        p.remove_annotations(|a| a.kind == AnnotKind::Square)
+        p.remove_annotations(None, |a| a.kind == AnnotKind::Square)
             .unwrap(),
         1
     );
-    assert_eq!(p.remove_annotations(|_| true).unwrap(), 0);
+    assert_eq!(p.remove_annotations(None, |_| true).unwrap(), 0);
 }
 
 #[test]
@@ -789,6 +789,62 @@ fn an_annotation_placed_by_its_points_is_listed_and_moved_where_it_is_drawn() {
         "{ends:?}"
     );
     assert!(ink(&mut p, [55, 78, 145, 82]).0 > 20, "drawn where it went");
+}
+
+/// One annotation read alone (`Pdf::annotation`, WP-04) is as every annotation lists it: on
+/// either page, a line placed where it is drawn, a note, a text box, a drawing and the
+/// highlight replying to the note. A pop-up, a link and something not in the file are no
+/// such annotation.
+#[test]
+fn one_annotation_is_as_they_are_all_listed() {
+    let mut p = page();
+    p.insert_blank(1, 300.0, 200.0).unwrap();
+    line_away_from_its_rect(&mut p);
+    let link = add(&mut p, 0, "Link", [0.0, 0.0, 10.0, 10.0], dictionary! {});
+    let note = add(
+        &mut p,
+        1,
+        "Text",
+        [10.0, 170.0, 30.0, 190.0],
+        dictionary! { "Contents" => text("Check this"), "T" => text("Sam") },
+    );
+    let popup = add(
+        &mut p,
+        1,
+        "Popup",
+        [40.0, 120.0, 140.0, 190.0],
+        dictionary! { "Parent" => note },
+    );
+    add(
+        &mut p,
+        1,
+        "FreeText",
+        [100.0, 60.0, 200.0, 140.0],
+        dictionary! { "Contents" => text("Hello there"), "DA" => text("/Helv 12 Tf 1 0 0 rg") },
+    );
+    add(
+        &mut p,
+        1,
+        "Ink",
+        [100.0, 60.0, 200.0, 140.0],
+        dictionary! { "InkList" => vec![nums(&[110.0, 70.0, 150.0, 130.0, 190.0, 70.0])] },
+    );
+    let quad = [50.0, 100.0, 150.0, 100.0, 150.0, 112.0, 50.0, 112.0];
+    add(
+        &mut p,
+        1,
+        "Highlight",
+        [50.0, 100.0, 150.0, 112.0],
+        dictionary! { "QuadPoints" => nums(&quad), "IRT" => note },
+    );
+    let all = p.annotations();
+    assert_eq!(all.len(), 5);
+    for a in &all {
+        assert_eq!(&p.annotation(a.id).unwrap(), a);
+    }
+    for id in [link, popup, (999, 0)] {
+        assert!(p.annotation(id).is_err(), "{id:?}");
+    }
 }
 
 /// PB-114: redacting where an annotation placed by its points is drawn removes it, as
@@ -1622,7 +1678,7 @@ fn replies_are_listed_but_not_drawn() {
     assert_eq!(ink(&mut p, [0, 0, 300, 200]), before, "nothing more drawn");
     assert!(p.add_reply(note, "  ", "").is_err());
     // Deleting what it answers takes the reply too.
-    assert_eq!(p.remove_annotations(|a| a.id == note).unwrap(), 2);
+    assert_eq!(p.remove_annotations(None, |a| a.id == note).unwrap(), 2);
 }
 
 /// Batch 42 (ENH-40): the pages comments are on, found by the pages listing them: draft
@@ -1638,7 +1694,7 @@ fn annotations_are_found_by_the_pages_listing_them() {
     assert_eq!(pages(&p), [Some(1), Some(0), None]);
     p.reorder(&[1, 0]).unwrap();
     assert_eq!(pages(&p), [Some(0), Some(1), None]);
-    p.remove_annotations(|a| a.id == first).unwrap();
+    p.remove_annotations(None, |a| a.id == first).unwrap();
     assert_eq!(pages(&p), [Some(0), None, None]);
 }
 

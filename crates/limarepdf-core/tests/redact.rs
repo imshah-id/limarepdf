@@ -1930,7 +1930,10 @@ fn marks_are_kept_until_applied() {
         .collect();
     p.add_redaction_mark(0, &boxes, "Sam").unwrap();
     assert!(p.apply_redactions().is_ok_and(|r| r.pages[0].chars == 5));
-    assert!(p.redaction_marks().is_empty(), "applied marks are removed");
+    assert!(
+        p.redaction_marks().unwrap().is_empty(),
+        "applied marks are removed"
+    );
     assert!(!p.page_text(0).contains("Zebra"));
     assert!(p.apply_redactions().is_err(), "nothing left to apply");
 }
@@ -1946,7 +1949,7 @@ fn marks_survive_saving_and_are_not_flattened() {
     .unwrap();
     let bytes = p.to_bytes().unwrap();
     let mut q = Pdf::from_bytes(&bytes, None).unwrap();
-    let marks = q.redaction_marks();
+    let marks = q.redaction_marks().unwrap();
     assert_eq!(marks.len(), 2);
     assert!(near(marks[0].1, [30.0, 80.0, 90.0, 105.0]), "{marks:?}");
     assert_eq!(q.annotations()[0].kind.label(), "Redaction mark");
@@ -1955,7 +1958,7 @@ fn marks_survive_saving_and_are_not_flattened() {
         "a mark removes nothing by itself"
     );
     q.flatten_annotations(None).unwrap();
-    assert_eq!(q.redaction_marks().len(), 2);
+    assert_eq!(q.redaction_marks().unwrap().len(), 2);
 }
 
 /// Poppler and Ghostscript, reading the redacted output on their own:
@@ -2447,7 +2450,7 @@ fn an_earlier_revision_of_the_file_leaves_nothing_in_the_redacted_output() {
     let rep = p.apply_redactions().unwrap();
     assert!(rep.left.is_empty(), "{:?}", rep.left);
     assert_eq!(rep.pages[0].chars, 12, "{:?}", rep.pages[0]);
-    assert!(p.redaction_marks().is_empty());
+    assert!(p.redaction_marks().unwrap().is_empty());
 
     let saved = Saved::of(&mut p);
     saved.assert_gone(&["QUOKKASECRET", "QUOKKA", "SECRET", "Draft"]);

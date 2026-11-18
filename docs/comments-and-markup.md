@@ -120,6 +120,12 @@ Some things to know:
 
 - Notes keep their size, and highlights and other text markup stay on their text, so neither can be resized, and
   markup can't be moved. Annotations the file locks can't be moved or deleted.
+- When a document's comments are too many or too long to read (more than 16,777,216 steps of their text and
+  points), those past that say "Too large to show" in the Comments view, the inspector and when you hover over
+  them. They can be selected, moved and deleted, but not changed or typed in.
+- A drawing, line or shape with more than 100,000 points can't be changed, moved or turned, nor a drawing given
+  another stroke past that: LimarePDF says it is too complex and leaves it as it was, rather than keep only part of
+  it.
 - A drag that starts on a highlight still selects the text under it. Hovering over a mark shows its comment.
 - Lines and drawings are picked by clicking near their strokes, not anywhere in their box.
 - A selected line has a round handle on each end instead of a box: drag either end to turn the line, or to point
@@ -134,7 +140,8 @@ Some things to know:
 The **Comments** view shows the document's annotations as cards under the name of their page, with replies
 indented under the comment they answer: click its icon on the left or **Review > Comments**, or choose ☰ > Review >
 Comments. Each card shows who made it, what it is and when, and the first lines of its comment; a highlight or
-other text markup with no comment shows the words it marks. Hover over a card for the whole comment.
+other text markup with no comment shows the words it marks. Hover over a card for the whole comment. A PDF can put
+one annotation on several pages: each of them shows it, and it has one card, under the first of them.
 
 <img src="images/comments.png" width="1000" alt="The Comments view at the left, with cards under the name of their page: Alex Kim's highlight is selected, with its Reply button and Sam Lee's reply indented under it, and a card further down says Draft reply; the highlighted words are selected on the page, and the inspector at the right shows the highlight's colour, opacity and comment box, Sam Lee's reply, and the Reply box with Add reply">
 
@@ -144,9 +151,10 @@ other text markup with no comment shows the words it marks. Hover over a card fo
   select the comment before or after the one selected, in the order the Comments view shows them, and show it on
   the page. With nothing selected, Next starts from the page you are reading.
 - **Search** with the box at the top: the cards whose comment, replies or marked words hold what you type stay.
-- **Filter ▾** shows only some types (Note, Highlight and so on), some authors, or the page you are reading. **Clear
-  filters** shows them all again. The count above the cards says how many show, such as "4 of 12 comments". The
-  filter and the search belong to the document's tab, and nothing about them is saved in the file.
+- **Filter ▾** shows only some types (Note, Highlight and so on), some authors, or the page you are reading (with
+  any annotation on it that an earlier page has too). **Clear filters** shows them all again. The count above the
+  cards says how many show, such as "4 of 12 comments". The filter and the search belong to the document's tab, and
+  nothing about them is saved in the file.
 - **With the keyboard:** click a card, or Tab to the list, then Up and Down go to the card before or after, Home
   and End to the first and last, each selected and shown on the page. Enter puts you in the reply box, Delete deletes
   the comment, and Esc goes back to the page, leaving the comment selected.

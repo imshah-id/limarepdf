@@ -44,12 +44,15 @@ pub(crate) fn draw_as_shadings(doc: &Document, swaps: &mut BTreeMap<ObjectId, Ob
     // Each drawing: the object holding its resources, the resources, its streams.
     let mut drawings = Vec::new();
     let mut others = BTreeSet::new();
+    // Each annotation list once, however many pages share it.
+    let mut lists = BTreeSet::new();
     for page in crate::doc::page_tree(doc) {
         if let Some((holder, res)) = inherited_at(doc, page, b"Resources") {
             drawings.push((holder, res.clone(), doc.get_page_contents(page)));
         }
         let annots = (doc.get_dictionary(page).ok())
             .and_then(|p| doc.dereference(p.get(b"Annots").ok()?).ok())
+            .filter(|(at, _)| at.is_none_or(|at| lists.insert(at)))
             .and_then(|(_, a)| a.as_array().ok());
         for a in annots.into_iter().flatten() {
             others.extend(appearances(doc, a));

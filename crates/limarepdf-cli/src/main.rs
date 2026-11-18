@@ -1210,14 +1210,15 @@ enum AnnotCmd {
 
 fn annot_list(input: &Path, pages: &Option<String>, json: bool, pw: &Option<String>) -> Result<()> {
     let pdf = open(input, pw)?;
-    let pages = match pages {
-        Some(r) => Some(parse_page_range(r, pdf.page_count())?),
+    // Each is listed once, on the first page that lists it, and chosen by any that does.
+    let on = match pages {
+        Some(r) => Some(pdf.annotation_ids_on(&parse_page_range(r, pdf.page_count())?)?),
         None => None,
     };
     let list: Vec<Annot> = pdf
         .annotations()
         .into_iter()
-        .filter(|a| pages.as_ref().is_none_or(|p| p.contains(&a.page)))
+        .filter(|a| on.as_ref().is_none_or(|on| on.contains(&a.id)))
         .collect();
     let index = |id: (u32, u16)| list.iter().position(|a| a.id == id);
     // f32 noise such as 0.8999999761 left out.
@@ -1245,6 +1246,7 @@ fn annot_list(input: &Path, pages: &Option<String>, json: bool, pw: &Option<Stri
                     "reply_to": a.reply_to.and_then(index).map(|i| i + 1),
                     "hidden": a.hidden(),
                     "locked": a.locked(),
+                    "unread": a.unread,
                 })
             })
             .collect();
@@ -1264,6 +1266,10 @@ fn annot_list(input: &Path, pages: &Option<String>, json: bool, pw: &Option<Stri
         }
         if a.locked() {
             notes.push("locked".into());
+        }
+        // Past the budget for reading the annotations: its author and comment weren't read.
+        if a.unread {
+            notes.push("too large to show".into());
         }
         let dash = |s: &str| {
             if s.is_empty() {
@@ -4158,9 +4164,8 @@ fn run(cmd: Cmd) -> Result<()> {
                         .map(AnnotKind::parse)
                         .collect()
                 });
-                let n = p.remove_annotations(|a| {
-                    pages.as_ref().is_none_or(|p| p.contains(&a.page))
-                        && kinds.as_ref().is_none_or(|k| k.contains(&a.kind))
+                let n = p.remove_annotations(pages.as_deref(), |a| {
+                    kinds.as_ref().is_none_or(|k| k.contains(&a.kind))
                         && author.as_ref().is_none_or(|w| *w == a.author)
                 })?;
                 save_edited(&io, &mut p, &original, false)?;
@@ -4465,7 +4470,7 @@ fn run(cmd: Cmd) -> Result<()> {
                 .and_then(|s| s.to_str())
                 .unwrap_or("document")
                 .to_string();
-            let names = pdf.picture_names(&stem);
+            let names = pdf.picture_names(&stem)?;
             if names.is_empty() {
                 out!("no pictures to save");
                 return Ok(());

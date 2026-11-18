@@ -3,8 +3,9 @@
 //! comment, and its place on the page. Each gets a drawing of its own straight away, so
 //! other viewers show it as LimarePDF does.
 
-use crate::annot_ap::{arrow_size, DRAWN, NOTE_SIZE};
+use crate::annot_ap::{self, arrow_size, Place, DRAWN, MAX_POINTS, NOTE_SIZE};
 use crate::annots::NO_VIEW;
+use crate::budget::TooComplex;
 use crate::doc::encode_text;
 use crate::embed::check_writable;
 use crate::form_ap::{lines_height, nums, Metrics};
@@ -24,6 +25,17 @@ const PAD: f32 = 1.0;
 const INK_TOLERANCE: f32 = 0.35;
 /// Most points kept from one pen stroke.
 const MAX_STROKE: usize = 20_000;
+/// What changing an annotation is called when it is refused past its points.
+const CHANGING: &str = "changing the annotation";
+
+/// The refusal of a change to an annotation past the [`MAX_POINTS`] points it is drawn
+/// with, which would write them back cut.
+fn past_its_points() -> TooComplex {
+    TooComplex {
+        what: CHANGING,
+        limit: MAX_POINTS as u64,
+    }
+}
 
 impl Pdf {
     /// Mark lines of text on page `page_index` (zero-based) with a highlight, underline,
@@ -287,15 +299,24 @@ impl Pdf {
         if d.get(b"Subtype").and_then(|o| o.as_name()).ok() != Some(b"Ink") {
             bail!("not a drawing");
         }
-        let mut list = self.strokes(d);
+        let mut list = self.strokes(d)?.unwrap_or_default();
+        // Within the points it is drawn with, the new stroke too.
+        let points: usize = (list.iter().chain([&new]))
+            .map(|s| s.len().div_ceil(2))
+            .sum();
+        if points > MAX_POINTS || list.len() >= MAX_POINTS {
+            return Err(past_its_points().into());
+        }
         list.push(new);
         let pad = ink_pad(self.border(d).0);
-        let d = self.doc.get_dictionary_mut(id)?;
-        d.set("InkList", ink_list(&list));
-        d.set("Rect", nums(&points_rect(&list, pad)));
-        d.set("M", Object::string_literal(pdf_now()));
-        self.draw_annotations(&[id]);
-        Ok(())
+        self.atomically(|p| {
+            let d = p.doc.get_dictionary_mut(id)?;
+            d.set("InkList", ink_list(&list));
+            d.set("Rect", nums(&points_rect(&list, pad)));
+            d.set("M", Object::string_literal(pdf_now()));
+            p.draw_annotations(&[id])?;
+            Ok(())
+        })
     }
 
     /// Set a rectangle's, ellipse's, line's or drawing's line width, fill and arrowhead,
@@ -310,17 +331,22 @@ impl Pdf {
                 .numbers(d.get(b"L").ok())
                 .filter(|l| l.len() >= 4)
                 .map(|l| line_rect(&l, look.width, look.arrow)),
-            b"Ink" => Some(points_rect(&self.strokes(d), ink_pad(look.width))),
+            b"Ink" => Some(points_rect(
+                &self.strokes(d)?.unwrap_or_default(),
+                ink_pad(look.width),
+            )),
             _ => bail!("not a shape, line or drawing"),
         };
-        let d = self.doc.get_dictionary_mut(id)?;
-        shape_entries(d, look, look.arrow != had_arrow);
-        if let Some(r) = rect.filter(|r| r[2] > r[0] && r[3] > r[1]) {
-            d.set("Rect", nums(&r));
-        }
-        d.set("M", Object::string_literal(pdf_now()));
-        self.draw_annotations(&[id]);
-        Ok(())
+        self.atomically(|p| {
+            let d = p.doc.get_dictionary_mut(id)?;
+            shape_entries(d, look, look.arrow != had_arrow);
+            if let Some(r) = rect.filter(|r| r[2] > r[0] && r[3] > r[1]) {
+                d.set("Rect", nums(&r));
+            }
+            d.set("M", Object::string_literal(pdf_now()));
+            p.draw_annotations(&[id])?;
+            Ok(())
+        })
     }
 
     /// Answer the annotation `to` with a comment (`/IRT`). The reply is listed with what
@@ -367,12 +393,14 @@ impl Pdf {
         let width = self.border(d).0;
         let arrow = self.line_ends(d).iter().any(|e| e.as_slice() != b"None");
         let l = [a.0, a.1, b.0, b.1];
-        let d = self.doc.get_dictionary_mut(id)?;
-        d.set("L", nums(&l));
-        d.set("Rect", nums(&line_rect(&l, width, arrow)));
-        d.set("M", Object::string_literal(pdf_now()));
-        self.draw_annotations(&[id]);
-        Ok(())
+        self.atomically(|p| {
+            let d = p.doc.get_dictionary_mut(id)?;
+            d.set("L", nums(&l));
+            d.set("Rect", nums(&line_rect(&l, width, arrow)));
+            d.set("M", Object::string_literal(pdf_now()));
+            p.draw_annotations(&[id])?;
+            Ok(())
+        })
     }
 
     /// Turn the drawing `id` on page `page_index` (zero-based) by `degrees` about the
@@ -386,7 +414,7 @@ impl Pdf {
             bail!("not a drawing");
         }
         let pad = ink_pad(self.border(d).0);
-        let strokes = self.strokes(d);
+        let strokes = self.strokes(d)?.unwrap_or_default();
         // The middle of the strokes as shown; y runs down, so a positive angle turns
         // clockwise.
         let r = points_rect(&strokes, 0.0);
@@ -395,35 +423,64 @@ impl Pdf {
         let turn = [c, s, -s, c, cx - c * cx + s * cy, cy - s * cx - c * cy];
         let m = mx::mul(mx::mul(to_vis, turn), to_user);
         let list: Vec<Vec<f32>> = strokes.iter().map(|v| map_points(m, v)).collect();
-        let d = self.doc.get_dictionary_mut(id)?;
-        d.set("InkList", ink_list(&list));
-        d.set("Rect", nums(&points_rect(&list, pad)));
-        d.set("M", Object::string_literal(pdf_now()));
-        self.draw_annotations(&[id]);
-        Ok(())
+        self.atomically(|p| {
+            let d = p.doc.get_dictionary_mut(id)?;
+            d.set("InkList", ink_list(&list));
+            d.set("Rect", nums(&points_rect(&list, pad)));
+            d.set("M", Object::string_literal(pdf_now()));
+            p.draw_annotations(&[id])?;
+            Ok(())
+        })
     }
 
-    /// A drawing's strokes as numbers, as `/InkList` holds them.
-    fn strokes(&self, d: &Dictionary) -> Vec<Vec<f32>> {
-        d.get(b"InkList")
-            .ok()
+    /// A drawing's strokes as numbers, as `/InkList` holds them (`None` when it has none):
+    /// all of them, or refused ([`past_its_points`]), with nothing more read, past the
+    /// [`MAX_POINTS`] points it is drawn with or that many strokes.
+    fn strokes(&self, d: &Dictionary) -> std::result::Result<Option<Vec<Vec<f32>>>, TooComplex> {
+        let list = (d.get(b"InkList").ok())
             .and_then(|o| self.doc.dereference(o).ok())
-            .and_then(|(_, o)| o.as_array().ok())
-            .map(|list| list.iter().filter_map(|s| self.numbers(Some(s))).collect())
-            .unwrap_or_default()
+            .and_then(|(_, o)| o.as_array().ok());
+        let Some(list) = list else {
+            return Ok(None);
+        };
+        if list.len() > MAX_POINTS {
+            return Err(past_its_points());
+        }
+        let mut left = MAX_POINTS;
+        let mut out = Vec::new();
+        for s in list {
+            out.extend(self.numbers_within(Some(s), &mut left)?);
+        }
+        Ok(Some(out))
     }
 
-    /// The page an annotation is on: its `/P`, else the page that lists it.
+    /// The numbers of an array of them, all of them, the points they make (half as many,
+    /// rounded up) taken from `left`: refused ([`past_its_points`]), with none read, when
+    /// they are more than `left`. For a change, which would otherwise write them back cut.
+    fn numbers_within(
+        &self,
+        o: Option<&Object>,
+        left: &mut usize,
+    ) -> std::result::Result<Option<Vec<f32>>, TooComplex> {
+        let Some((_, o)) = o.and_then(|o| self.doc.dereference(o).ok()) else {
+            return Ok(None);
+        };
+        let points = o.as_array().map_or(0, Vec::len).div_ceil(2);
+        *left = left.checked_sub(points).ok_or_else(past_its_points)?;
+        Ok(self.numbers(Some(o)))
+    }
+
+    /// The page an annotation is on: its `/P`, else the first page that lists it.
     pub(crate) fn annot_page(&self, id: ObjectId) -> Result<ObjectId> {
         let d = self.doc.get_dictionary(id)?;
-        match d.get(b"P").and_then(|o| o.as_reference()) {
-            Ok(p) => Ok(p),
-            Err(_) => self
-                .page_ids()
-                .into_iter()
-                .find(|&p| self.all_annot_refs(p).contains(&id))
-                .ok_or_else(|| anyhow!("the annotation is on no page")),
+        if let Ok(p) = d.get(b"P").and_then(|o| o.as_reference()) {
+            return Ok(p);
         }
+        let pages = self.page_ids();
+        let (i, _, _) = (self.each_annots(&pages))
+            .find(|(_, _, list)| list.iter().any(|o| o.as_reference().ok() == Some(id)))
+            .ok_or_else(|| anyhow!("the annotation is on no page"))?;
+        Ok(pages[i])
     }
 
     /// Set a text box's text size and colour, fill and border, and draw it again. Refused,
@@ -439,7 +496,7 @@ impl Pdf {
             text_style(d, style);
             d.set("M", Object::string_literal(pdf_now()));
             p.fit_text_box(id)?;
-            p.draw_annotations(&[id]);
+            p.draw_annotations(&[id])?;
             Ok(())
         })
     }
@@ -459,9 +516,10 @@ impl Pdf {
         let (to_user, _, _) = self.vis_down(page);
         let new = mx::transform_rect(to_user, to);
         let d = self.doc.get_dictionary(id)?;
-        // From the box it is listed with, which the app moves.
+        // From the box it is listed with, which the app moves: refused, with nothing
+        // changed, when it can't be drawn to find it.
         let old = self
-            .annot_rect(d)
+            .annot_rect(d, &mut annot_ap::work())?
             .ok_or_else(|| anyhow!("the annotation has no box"))?;
         let (ow, oh) = (old[2] - old[0], old[3] - old[1]);
         let (nw, nh) = (new[2] - new[0], new[3] - new[1]);
@@ -483,7 +541,9 @@ impl Pdf {
             .is_ok_and(|s| s == b"Redact");
         let mut changed: Vec<(&[u8], Object)> = vec![(b"Rect", nums(&new).into())];
         for key in [&b"L"[..], b"Vertices", b"QuadPoints", b"CL"] {
-            if let Some(v) = self.numbers(d.get(key).ok()) {
+            // Each within the points it is drawn with.
+            let mut left = MAX_POINTS;
+            if let Some(v) = self.numbers_within(d.get(key).ok(), &mut left)? {
                 let mut v = map_points(map, &v);
                 // A redaction mark's one area stays `PAD` inside its box, as it was made,
                 // however far it is stretched (PF-37).
@@ -493,33 +553,30 @@ impl Pdf {
                 changed.push((key, nums(&v).into()));
             }
         }
-        let ink = d
-            .get(b"InkList")
-            .ok()
-            .and_then(|o| self.doc.dereference(o).ok())
-            .and_then(|(_, o)| o.as_array().ok());
-        if let Some(list) = ink {
+        if let Some(list) = self.strokes(d)? {
             let strokes: Vec<Object> = list
                 .iter()
-                .filter_map(|s| self.numbers(Some(s)))
-                .map(|v| nums(&map_points(map, &v)).into())
+                .map(|v| nums(&map_points(map, v)).into())
                 .collect();
             changed.push((b"InkList", strokes.into()));
         }
-        let d = self.doc.get_dictionary_mut(id)?;
-        for (k, v) in changed {
-            d.set(k, v);
-        }
-        d.set("M", Object::string_literal(pdf_now()));
-        if drawn && resized {
-            self.draw_annotations(&[id]);
-        }
-        Ok(())
+        self.atomically(|p| {
+            let d = p.doc.get_dictionary_mut(id)?;
+            for (k, v) in changed {
+                d.set(k, v);
+            }
+            d.set("M", Object::string_literal(pdf_now()));
+            if drawn && resized {
+                p.draw_annotations(&[id])?;
+            }
+            Ok(())
+        })
     }
 
     /// Make a text box tall enough for its text, as it is set inside the box's `/RD` margins
     /// and cloudy border: it grows downward as the page is shown, keeping its width, and
-    /// stops at the page's edge. It never shrinks. Not drawn here.
+    /// stops at the page's edge. It never shrinks. Not drawn here, but each measure is
+    /// charged as setting the text ([`annot_ap::SETTING`]), within a drawing budget.
     fn fit_text_box(&mut self, id: ObjectId) -> Result<()> {
         let d = self.doc.get_dictionary(id)?;
         let rect = self
@@ -528,15 +585,17 @@ impl Pdf {
         if d.get(b"Subtype").and_then(Object::as_name).ok() != Some(b"FreeText") {
             bail!("the annotation isn't a text box");
         }
-        let text = self.box_text(d);
+        let mut work = annot_ap::work();
+        let text = self.box_text(d, &mut work)?;
         let pb = self.page_box(self.annot_page(id)?);
         let m = Metrics::Set(self.setter(FontChoice::default(), &text));
         let mut r = rect;
         // Growing can make room for margins or a cloud the box had none for, which take
         // some of it back: measure again.
         for _ in 0..3 {
-            let g = self.box_geometry(d, r);
+            let g = self.box_geometry(d, r, &mut work)?;
             let look = g.look(None);
+            work.take(annot_ap::SETTING * text.len() as u64)?;
             let need = lines_height(&text, look.w, g.size, look.inset(), &m);
             if need <= look.h + 0.01 {
                 break;
@@ -587,7 +646,7 @@ impl Pdf {
             }
             // Replies are not shown, so they need no drawing.
             if !reply {
-                p.draw_annotations(&[id]);
+                p.draw_annotations(&[id])?;
             }
             Ok(id)
         })
@@ -616,11 +675,12 @@ impl Pdf {
         opacity: f32,
         contents: &str,
     ) -> Result<()> {
-        let old = self
-            .annotations()
-            .into_iter()
-            .find(|a| a.id == id)
-            .ok_or_else(|| anyhow!("no such annotation"))?;
+        let mut place = Place::drawn();
+        let old = self.listed_one(id, &mut place)?;
+        // Its text unread would be written over with what is shown for it.
+        if old.unread {
+            place.whole()?;
+        }
         let opacity = opacity.clamp(0.0, 1.0);
         let looks_new = old.color != color
             || (old.opacity - opacity).abs() > 1e-3
@@ -651,7 +711,7 @@ impl Pdf {
             self.fit_text_box(id)?;
         }
         if drawn && looks_new {
-            self.draw_annotations(&[id]);
+            self.draw_annotations(&[id])?;
         }
         if old.kind == AnnotKind::Stamp && (old.opacity - opacity).abs() > 1e-3 {
             self.restamp(id)?;

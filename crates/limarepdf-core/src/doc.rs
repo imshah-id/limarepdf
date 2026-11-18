@@ -53,7 +53,40 @@ pub(crate) fn pages(doc: &Document) -> impl Iterator<Item = ObjectId> + '_ {
 pub(crate) fn page_tree(doc: &Document) -> impl Iterator<Item = ObjectId> + '_ {
     #[allow(clippy::disallowed_methods)] // The one use, its guess hidden.
     let mut tree = doc.page_iter();
-    std::iter::from_fn(move || tree.next())
+    std::iter::from_fn(move || {
+        let id = tree.next();
+        #[cfg(any(test, feature = "test-seams"))]
+        if id.is_some() {
+            pages_seam::read();
+        }
+        id
+    })
+}
+
+/// A test seam (PB-29): the page-tree entries read ([`page_tree`]), on every thread, so a
+/// test can show an operation goes through the tree a few times, not once a page. Built
+/// only for tests (core's own, and through the `test-seams` feature).
+#[cfg(any(test, feature = "test-seams"))]
+pub mod pages_seam {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Mutex;
+
+    static READ: AtomicU64 = AtomicU64::new(0);
+    static COUNTING: Mutex<()> = Mutex::new(());
+
+    /// Runs `f`, and returns what it returned and the page-tree entries read meanwhile.
+    /// Entries read on any thread count, so a test binary counting runs only tests that
+    /// count through this (one at a time).
+    pub fn count<T>(f: impl FnOnce() -> T) -> (T, u64) {
+        let _one = COUNTING.lock().unwrap_or_else(|e| e.into_inner());
+        let start = READ.load(Ordering::Relaxed);
+        let out = f();
+        (out, READ.load(Ordering::Relaxed) - start)
+    }
+
+    pub(super) fn read() {
+        READ.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 /// Why a repaired document may read differently in other PDF apps.
@@ -63,6 +96,9 @@ const PAGES_MENDED: &str = "its list of pages is damaged, and LimarePDF rebuilt 
 /// Why a document is refused when no pages can be found in it.
 const NO_PAGES: &str =
     "LimarePDF can't find any pages in it (there are no pages, or the file is damaged)";
+/// Why a document is refused when its page tree is too damaged to mend.
+const PAGES_TOO_COMPLEX: &str =
+    "its list of pages is damaged in a way too complex for LimarePDF to rebuild";
 
 /// Document information dictionary fields.
 #[derive(Default, Clone, Debug, PartialEq, Eq)]
@@ -136,6 +172,7 @@ impl Pdf {
         };
         // The page tree is mended in the rebuilt file rather than in lopdf's reading, so that
         // the pages' content is found too when the table's offsets are wrong.
+        let mut too_complex = false;
         let repaired = rebuilt.and_then(|mut p| {
             crate::repair::unpack_object_streams(&mut p.doc);
             // The trailers may name no catalog, or the wrong object.
@@ -144,8 +181,16 @@ impl Pdf {
                 p.doc.trailer.set("Root", root);
             }
             let mut why = REPAIRED;
-            if p.page_count() == 0 && crate::repair::mend_page_tree(&mut p.doc, bytes) {
-                why = PAGES_MENDED;
+            if p.page_count() == 0 {
+                match crate::repair::mend_page_tree(&mut p.doc, bytes) {
+                    Ok(true) => why = PAGES_MENDED,
+                    Ok(false) => {}
+                    // Part mended: not a document to open.
+                    Err(_) => {
+                        too_complex = true;
+                        return None;
+                    }
+                }
             }
             (p.page_count() > 0).then_some((p, why))
         });
@@ -153,6 +198,7 @@ impl Pdf {
             Some(r) => r,
             // lopdf's own rebuild.
             None if pages > 0 => (opened.map_err(cannot_open)?, REPAIRED),
+            None if too_complex => bail!("cannot open PDF: {PAGES_TOO_COMPLEX}"),
             // Rather than an empty document, which other readers wouldn't show either.
             None => {
                 opened.map_err(cannot_open)?;
@@ -483,7 +529,8 @@ impl Pdf {
     /// A snapshot in which annotations whose subtype `hide` picks, and those in a layer
     /// that's off (which the renderer would draw, PB-181), are marked Hidden, and
     /// annotations without a drawing get LimarePDF's (the document itself keeps
-    /// none). In a signed document, or in any with `all_fields`, form fields are drawn this
+    /// none) as far as its budget goes, the rest shown without, as other readers show them
+    /// ([`Pdf::draw_shown`]). In a signed document, or in any with `all_fields`, form fields are drawn this
     /// way too, as [`Pdf::refresh_appearances`] would draw them (every field with
     /// `all_fields`, those LimarePDF lists for the app's): the app doesn't draw a signed
     /// document's fields into it when opening it, so that saving adds only the edits made to
@@ -514,7 +561,7 @@ impl Pdf {
         if fields {
             copy.refresh_reaching(reach);
         }
-        copy.draw_annotations(&missing);
+        copy.draw_shown(&missing);
         copy.mark_hidden(ids);
         let mut out = Vec::new();
         copy.doc.save_to(&mut out)?;
@@ -531,37 +578,20 @@ impl Pdf {
     }
 
     /// Annotations not Hidden (bit 2) whose subtype `hide` picks or that are in a layer
-    /// that's off, with their flags.
+    /// that's off, with their flags, each once however many pages list it.
     fn annots_where(&self, hide: impl Fn(&[u8]) -> bool) -> Vec<(ObjectId, i64)> {
         let mut layers = self.layers_off();
-        let mut out = Vec::new();
-        for page in self.page_ids() {
-            let Some(annots) = self
-                .doc
-                .get_dictionary(page)
-                .ok()
-                .and_then(|d| d.get(b"Annots").ok())
-            else {
-                continue;
-            };
-            let Ok((_, Object::Array(annots))) = self.doc.dereference(annots) else {
-                continue;
-            };
-            for r in annots {
-                let Ok(id) = r.as_reference() else { continue };
-                let Ok(d) = self.doc.get_dictionary(id) else {
-                    continue;
-                };
+        let pages = self.page_ids();
+        (self.listed_annots(&pages).into_iter())
+            .filter_map(|(_, id)| {
+                let d = self.doc.get_dictionary(id).ok()?;
                 let flags = d.get(b"F").ok().and_then(|f| self.num(f)).unwrap_or(0.0) as i64;
                 let sub = d.get(b"Subtype").and_then(|o| o.as_name()).unwrap_or(b"");
-                if flags & 2 == 0
-                    && (hide(sub) || (layers.as_mut()).is_some_and(|l| self.annot_layer_off(d, l)))
-                {
-                    out.push((id, flags));
-                }
-            }
-        }
-        out
+                (flags & 2 == 0
+                    && (hide(sub) || (layers.as_mut()).is_some_and(|l| self.annot_layer_off(d, l))))
+                .then_some((id, flags))
+            })
+            .collect()
     }
 
     pub fn to_bytes(&mut self) -> Result<Vec<u8>> {
@@ -602,15 +632,7 @@ impl Pdf {
     }
 
     pub(crate) fn inherited(&self, id: ObjectId, key: &[u8]) -> Option<Object> {
-        let mut cur = id;
-        for _ in 0..64 {
-            let d = self.doc.get_dictionary(cur).ok()?;
-            if let Ok(v) = d.get(key) {
-                return Some(v.clone());
-            }
-            cur = d.get(b"Parent").ok()?.as_reference().ok()?;
-        }
-        None
+        crate::unfillable::inherited_at(&self.doc, id, key).map(|(_, o)| o.clone())
     }
 
     pub(crate) fn num(&self, o: &Object) -> Option<f32> {

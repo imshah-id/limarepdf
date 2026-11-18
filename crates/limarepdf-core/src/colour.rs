@@ -3,10 +3,14 @@
 //! inspector and for telling a line's parts apart. Colour spaces are read from the page's
 //! resources: the device spaces, the calibrated and ICC-based ones by their components, Lab,
 //! Indexed, and Separation and DeviceN through their tint transforms (functions of types
-//! 0, 2, 3 and 4). Shown colours are approximate where a profile would decide.
+//! 0, 2, 3 and 4). Shown colours are approximate where a profile would decide. Reading a
+//! space is charged to its page's budget ([`Reading`]), and so is showing one of its colours,
+//! each time one is set ([`Space::cost`]).
 
+use crate::budget::{TooComplex, Work};
 use lopdf::content::Operation;
-use lopdf::{Dictionary, Document, Object};
+use lopdf::{Dictionary, Document, Object, ObjectId};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 /// How deep colour spaces and functions are read inside each other: an Indexed space's
@@ -123,42 +127,101 @@ pub(crate) enum Space {
     Inks {
         n: usize,
         alt: Arc<Space>,
-        tint: Function,
+        tint: Arc<Function>,
         none: bool,
     },
     /// Patterns, whose colour isn't one; and spaces that can't be read.
     Other,
 }
 
-impl Space {
-    /// The space `name` (the operand of `cs`) names, with `spaces` the page's
-    /// `/ColorSpace` resources.
-    pub(crate) fn named(doc: &Document, spaces: &Dictionary, name: &[u8]) -> Space {
-        match name {
-            b"DeviceGray" | b"G" => Space::Gray,
-            b"DeviceRGB" | b"RGB" => Space::Rgb,
-            b"DeviceCMYK" | b"CMYK" => Space::Cmyk,
-            _ => match spaces.get(name) {
-                Ok(o) => Space::of(doc, o, 0),
-                Err(_) => Space::Other,
-            },
+/// A colour space being read ([`Space::named`]), charging `work` a step for each space and
+/// function read, one for each part a stitching function lists, and one for each 1,024
+/// numbers of an array or KiB of samples, programs and tables. A function met again at the
+/// same depth is the one already read, so parts that share parts are read once each, not
+/// once for each way down to them.
+struct Reading<'a> {
+    doc: &'a Document,
+    work: &'a mut Work,
+    functions: HashMap<(ObjectId, usize), Option<Arc<Function>>>,
+    /// The budget's refusal, once it refused: nothing more is read.
+    refused: Option<TooComplex>,
+}
+
+impl<'a> Reading<'a> {
+    fn new(doc: &'a Document, work: &'a mut Work) -> Self {
+        Reading {
+            doc,
+            work,
+            functions: HashMap::new(),
+            refused: None,
         }
     }
 
-    fn of(doc: &Document, o: &Object, depth: usize) -> Space {
+    /// Take `n` steps; `None` once the budget refuses, the refusal kept for
+    /// [`Space::named`] to give.
+    fn take(&mut self, n: u64) -> Option<()> {
+        if self.refused.is_some() {
+            return None;
+        }
+        match self.work.take(n) {
+            Ok(()) => Some(()),
+            Err(e) => {
+                self.refused = Some(e);
+                None
+            }
+        }
+    }
+}
+
+impl Space {
+    /// The space `name` (the operand of `cs`) names, with `spaces` the page's
+    /// `/ColorSpace` resources; refused when reading it takes more than is left of `work`.
+    pub(crate) fn named(
+        doc: &Document,
+        spaces: &Dictionary,
+        name: &[u8],
+        work: &mut Work,
+    ) -> Result<Space, TooComplex> {
+        if let Some(space) = Space::device(name) {
+            return Ok(space);
+        }
+        let Ok(o) = spaces.get(name) else {
+            return Ok(Space::Other);
+        };
+        let mut r = Reading::new(doc, work);
+        let space = Space::of(&mut r, o, 0);
+        match r.refused {
+            Some(e) => Err(e),
+            None => Ok(space),
+        }
+    }
+
+    /// The device space `name` names, by its name or its short one.
+    fn device(name: &[u8]) -> Option<Space> {
+        match name {
+            b"DeviceGray" | b"G" => Some(Space::Gray),
+            b"DeviceRGB" | b"RGB" => Some(Space::Rgb),
+            b"DeviceCMYK" | b"CMYK" => Some(Space::Cmyk),
+            _ => None,
+        }
+    }
+
+    fn of(r: &mut Reading, o: &Object, depth: usize) -> Space {
+        let doc = r.doc;
         let Ok((_, o)) = doc.dereference(o) else {
             return Space::Other;
         };
-        if depth > MAX_NESTING {
+        if depth > MAX_NESTING || r.take(1).is_none() {
             return Space::Other;
         }
         let a = match o {
-            Object::Name(n) => return Space::named(doc, &Dictionary::new(), n),
+            Object::Name(n) => return Space::device(n).unwrap_or(Space::Other),
             Object::Array(a) => a,
             _ => return Space::Other,
         };
         let at = |i: usize| a.get(i).and_then(|o| doc.dereference(o).ok()).map(|x| x.1);
-        let inner = |i: usize| at(i).map_or(Space::Other, |o| Space::of(doc, o, depth + 1));
+        let inner =
+            |r: &mut Reading, i: usize| at(i).map_or(Space::Other, |o| Space::of(r, o, depth + 1));
         let Some(Ok(head)) = a.first().map(Object::as_name) else {
             return Space::Other;
         };
@@ -168,7 +231,7 @@ impl Space {
             b"DeviceCMYK" => Space::Cmyk,
             b"Lab" => {
                 let range = (at(1).and_then(|d| d.as_dict().ok()))
-                    .and_then(|d| numbers(doc, d.get(b"Range").ok()?))
+                    .and_then(|d| numbers(r, d.get(b"Range").ok()?))
                     // Two spans, each finite and in order, or the default (M-19).
                     .filter(|r| {
                         r.len() == 4
@@ -190,11 +253,11 @@ impl Space {
                     Some(3) => Space::Rgb,
                     Some(4) => Space::Cmyk,
                     _ => (s.dict.get(b"Alternate").ok())
-                        .map_or(Space::Other, |o| Space::of(doc, o, depth + 1)),
+                        .map_or(Space::Other, |o| Space::of(r, o, depth + 1)),
                 }
             }
             b"Indexed" | b"I" => {
-                let base = Arc::new(inner(1));
+                let base = Arc::new(inner(r, 1));
                 let last = at(2)
                     .and_then(|o| o.as_i64().ok())
                     .unwrap_or(0)
@@ -206,6 +269,9 @@ impl Space {
                         .unwrap_or_default(),
                     _ => Vec::new(),
                 };
+                if r.take(table.len() as u64 / 1024).is_none() {
+                    return Space::Other;
+                }
                 Space::Indexed {
                     base,
                     table,
@@ -216,23 +282,57 @@ impl Space {
                 let (n, none) = match at(1) {
                     Some(Object::Name(ink)) => (1, &ink[..] == b"None"),
                     Some(Object::Array(inks)) => {
+                        if r.take(inks.len() as u64 / 1024).is_none() {
+                            return Space::Other;
+                        }
                         let none = |o: &Object| o.as_name().ok() == Some(b"None");
                         (inks.len(), !inks.is_empty() && inks.iter().all(none))
                     }
                     _ => return Space::Other,
                 };
-                let Some(tint) = at(3).and_then(|f| Function::of(doc, f, depth + 1)) else {
+                let Some(tint) = at(3).and_then(|f| Function::of(r, f, depth + 1)) else {
                     return Space::Other;
                 };
                 Space::Inks {
                     n,
-                    alt: Arc::new(inner(2)),
+                    alt: Arc::new(inner(r, 2)),
                     tint,
                     none,
                 }
             }
             _ => Space::Other,
         }
+    }
+
+    /// How many values each of its colours has.
+    pub(crate) fn components(&self) -> usize {
+        match self {
+            Space::Gray | Space::Indexed { .. } => 1,
+            Space::Rgb | Space::Lab { .. } => 3,
+            Space::Cmyk => 4,
+            Space::Inks { n, .. } => *n,
+            Space::Other => 0,
+        }
+    }
+
+    /// What showing one of its colours takes, in values read and steps run: its values, and
+    /// what its base, or its tint transform and alternate, take.
+    fn units(&self) -> u64 {
+        let own = self.components() as u64;
+        match self {
+            Space::Indexed { base, .. } => own.saturating_add(base.units()),
+            Space::Inks { alt, tint, .. } => {
+                own.saturating_add(tint.units()).saturating_add(alt.units())
+            }
+            _ => own,
+        }
+    }
+
+    /// The steps showing one of its colours is charged each time one is set, in
+    /// `objects::STEPS`'s units: one for each 1,024 values read and steps run, so the device
+    /// spaces and ordinary spot colours cost nothing beyond their operator.
+    pub(crate) fn cost(&self) -> u64 {
+        self.units() / 1024
     }
 
     /// Its values when `cs` chooses it: black, or full ink.
@@ -267,7 +367,7 @@ impl Space {
             }),
             Space::Indexed { base, table, last } => {
                 let i = (v.first()?.round().max(0.0) as usize).min(*last);
-                let n = base.first().len();
+                let n = base.components();
                 let bytes = table.get(i * n..(i + 1) * n)?;
                 let values: Vec<f32> = match **base {
                     // Lab's bytes span its ranges.
@@ -345,24 +445,31 @@ pub(crate) enum Function {
     },
     /// Type 3: the domain in parts, each read by a function of its own.
     Stitching {
-        parts: Vec<Function>,
+        parts: Vec<Arc<Function>>,
         bounds: Vec<f32>,
         encode: Vec<f32>,
         domain: Vec<f32>,
         range: Vec<f32>,
+        /// What running it takes ([`Function::units`]), worked out once when it is read.
+        units: u64,
     },
     /// Type 4: a program in PDF's PostScript calculator language.
     Calculator {
         program: Vec<Ps>,
         domain: Vec<f32>,
         range: Vec<f32>,
+        /// The most steps a run takes ([`Ps::steps`]).
+        units: u64,
     },
 }
 
 /// The numbers of an array object, references followed.
-fn numbers(doc: &Document, o: &Object) -> Option<Vec<f32>> {
+fn numbers(r: &mut Reading, o: &Object) -> Option<Vec<f32>> {
+    let doc = r.doc;
     let (_, o) = doc.dereference(o).ok()?;
-    (o.as_array().ok()?.iter())
+    let a = o.as_array().ok()?;
+    r.take(a.len() as u64 / 1024)?;
+    (a.iter())
         .map(|x| doc.dereference(x).ok()?.1.as_float().ok())
         .collect()
 }
@@ -384,26 +491,46 @@ fn clip(values: &mut [f32], limits: &[f32]) {
 }
 
 impl Function {
-    fn of(doc: &Document, o: &Object, depth: usize) -> Option<Function> {
+    /// The function `o`, read once at each depth however often it is met ([`Reading`]).
+    fn of(r: &mut Reading, o: &Object, depth: usize) -> Option<Arc<Function>> {
         if depth > MAX_NESTING {
             return None;
         }
-        let (_, o) = doc.dereference(o).ok()?;
+        let doc = r.doc;
+        let (id, o) = doc.dereference(o).ok()?;
+        let key = id.map(|id| (id, depth));
+        if let Some(read) = key.and_then(|k| r.functions.get(&k)) {
+            return read.clone();
+        }
+        let f = Function::read(r, o, depth).map(Arc::new);
+        if let Some(k) = key {
+            r.functions.insert(k, f.clone());
+        }
+        f
+    }
+
+    fn read(r: &mut Reading, o: &Object, depth: usize) -> Option<Function> {
+        #[cfg(test)]
+        tests::READ.set(tests::READ.get() + 1);
+        r.take(1)?;
+        let doc = r.doc;
         let (dict, stream) = match o {
             Object::Dictionary(d) => (d, None),
             Object::Stream(s) => (&s.dict, Some(s)),
             _ => return None,
         };
-        let get = |k: &[u8]| numbers(doc, dict.get(k).ok()?);
-        let domain = get(b"Domain").filter(|d| d.len() >= 2 && d.len() % 2 == 0)?;
-        let range = get(b"Range").unwrap_or_default();
+        let get = |r: &mut Reading, k: &[u8]| numbers(r, dict.get(k).ok()?);
+        let domain = get(r, b"Domain").filter(|d| d.len() >= 2 && d.len() % 2 == 0)?;
+        let range = get(r, b"Range").unwrap_or_default();
         let int = |k: &[u8]| {
             let (_, o) = doc.dereference(dict.get(k).ok()?).ok()?;
             o.as_i64().ok()
         };
         Some(match int(b"FunctionType")? {
             0 => {
-                let size: Vec<usize> = get(b"Size")?.iter().map(|&s| s.max(1.0) as usize).collect();
+                let size: Vec<usize> = (get(r, b"Size")?.iter())
+                    .map(|&s| s.max(1.0) as usize)
+                    .collect();
                 let inputs = domain.len() / 2;
                 let outputs = range.len() / 2;
                 if size.len() != inputs || inputs == 0 || inputs > MAX_INPUTS || outputs == 0 {
@@ -413,15 +540,16 @@ impl Function {
                 if ![1, 2, 4, 8, 12, 16, 24, 32].contains(&bits) {
                     return None;
                 }
-                let encode = get(b"Encode")
+                let encode = get(r, b"Encode")
                     .filter(|e| e.len() == 2 * inputs)
                     .unwrap_or_else(|| size.iter().flat_map(|&s| [0.0, (s - 1) as f32]).collect());
-                let decode = get(b"Decode")
+                let decode = get(r, b"Decode")
                     .filter(|d| d.len() == range.len())
                     .unwrap_or_else(|| range.clone());
                 let data = stream?
                     .get_plain_content_with_limit(crate::MAX_CONTENT)
                     .ok()?;
+                r.take(data.len() as u64 / 1024)?;
                 Function::Sampled {
                     size,
                     bits: bits as usize,
@@ -434,8 +562,8 @@ impl Function {
                 }
             }
             2 => {
-                let c0 = get(b"C0").unwrap_or_else(|| vec![0.0]);
-                let c1 = get(b"C1").unwrap_or_else(|| vec![1.0]);
+                let c0 = get(r, b"C0").unwrap_or_else(|| vec![0.0]);
+                let c1 = get(r, b"C1").unwrap_or_else(|| vec![1.0]);
                 let n = (dict.get(b"N").ok())
                     .and_then(|o| doc.dereference(o).ok()?.1.as_float().ok())?;
                 if c0.len() != c1.len() {
@@ -451,18 +579,20 @@ impl Function {
             }
             3 => {
                 let (_, fs) = doc.dereference(dict.get(b"Functions").ok()?).ok()?;
-                let parts: Vec<Function> = (fs.as_array().ok()?.iter())
-                    .map(|f| Function::of(doc, f, depth + 1))
-                    .collect::<Option<_>>()?;
-                let bounds = get(b"Bounds").unwrap_or_default();
-                let encode = get(b"Encode")?;
-                if parts.is_empty()
-                    || bounds.len() + 1 != parts.len()
-                    || encode.len() != 2 * parts.len()
-                {
+                let fs = fs.as_array().ok()?;
+                let bounds = get(r, b"Bounds").unwrap_or_default();
+                let encode = get(r, b"Encode")?;
+                if fs.is_empty() || bounds.len() + 1 != fs.len() || encode.len() != 2 * fs.len() {
                     return None;
                 }
+                r.take(fs.len() as u64)?;
+                let parts: Vec<Arc<Function>> = (fs.iter())
+                    .map(|f| Function::of(r, f, depth + 1))
+                    .collect::<Option<_>>()?;
+                // Its part found among the bounds, and the dearest part run.
+                let dearest = parts.iter().map(|f| f.units()).max().unwrap_or(0);
                 Function::Stitching {
+                    units: dearest.saturating_add(bounds.len() as u64),
                     parts,
                     bounds,
                     encode,
@@ -474,14 +604,31 @@ impl Function {
                 let code = stream?
                     .get_plain_content_with_limit(crate::MAX_CONTENT)
                     .ok()?;
+                r.take(code.len() as u64 / 1024)?;
+                let program = Ps::program(&code)?;
                 Function::Calculator {
-                    program: Ps::program(&code)?,
+                    units: Ps::steps(&program),
+                    program,
                     domain,
                     range,
                 }
             }
             _ => return None,
         })
+    }
+
+    /// What running it once takes, in values read and steps run ([`Space::cost`]): a sampled
+    /// function reads each corner of the input's cell for each output, an exponential one
+    /// works out each output, a stitching one finds its part and runs it, and a calculator
+    /// runs its program.
+    fn units(&self) -> u64 {
+        match self {
+            Function::Sampled { size, outputs, .. } => {
+                (1u64 << size.len()).saturating_mul(*outputs as u64)
+            }
+            Function::Exponential { c0, .. } => c0.len() as u64,
+            Function::Stitching { units, .. } | Function::Calculator { units, .. } => *units,
+        }
     }
 
     /// The function's outputs for `input`, or `None` when it can't give them.
@@ -558,6 +705,7 @@ impl Function {
                 encode,
                 domain,
                 range,
+                ..
             } => {
                 let mut x = vec![*input.first()?];
                 clip(&mut x, domain);
@@ -574,6 +722,7 @@ impl Function {
                 program,
                 domain,
                 range,
+                ..
             } => {
                 let mut x = input.to_vec();
                 clip(&mut x, domain);
@@ -667,6 +816,18 @@ impl Ps {
                 },
             }
         }
+    }
+
+    /// The most steps a run of `program` takes: each step, and the longer block of each
+    /// `ifelse`.
+    fn steps(program: &[Ps]) -> u64 {
+        (program.iter())
+            .map(|step| match step {
+                Ps::If(then) => 1 + Ps::steps(then),
+                Ps::IfElse(then, otherwise) => 1 + Ps::steps(then).max(Ps::steps(otherwise)),
+                Ps::Num(_) | Ps::Op(_) => 1,
+            })
+            .sum()
     }
 
     /// Run `program` on `stack`; `None` on an error.
@@ -835,14 +996,27 @@ impl Ps {
 mod tests {
     use super::*;
     use lopdf::{dictionary, Stream};
+    use std::cell::Cell;
+
+    thread_local! {
+        /// Functions read on this thread.
+        pub(super) static READ: Cell<usize> = const { Cell::new(0) };
+    }
 
     fn near(a: &[f32], b: &[f32]) -> bool {
         a.len() == b.len() && a.iter().zip(b).all(|(x, y)| (x - y).abs() < 0.01)
     }
 
-    fn function(doc: &mut Document, o: Object) -> Function {
+    fn function(doc: &mut Document, o: Object) -> Arc<Function> {
         let id = doc.add_object(o);
-        Function::of(doc, &Object::Reference(id), 0).expect("a function")
+        let mut work = Work::new("reading", u64::MAX);
+        Function::of(&mut Reading::new(doc, &mut work), &Object::Reference(id), 0)
+            .expect("a function")
+    }
+
+    fn space_of(doc: &Document, o: &Object) -> Space {
+        let mut work = Work::new("reading", u64::MAX);
+        Space::of(&mut Reading::new(doc, &mut work), o, 0)
     }
 
     #[test]
@@ -875,6 +1049,34 @@ mod tests {
         assert!(near(&f.eval(&[0.25]).unwrap(), &[0.5]));
         assert!(near(&f.eval(&[0.75]).unwrap(), &[0.5]));
         assert!(near(&f.eval(&[1.0]).unwrap(), &[0.0]));
+    }
+
+    /// A stitching function whose parts share their parts reads each function once, not once
+    /// for each way down to it: three levels of 20 parts over one function read 8,421.
+    #[test]
+    fn parts_shared_by_parts_are_read_once() {
+        let mut doc = Document::with_version("1.7");
+        // `n` parts, each `part`, over equal spans of 0 to 1.
+        let stitching = |part: Object, n: usize| {
+            dictionary! {
+                "FunctionType" => 3, "Domain" => vec![0.into(), 1.into()],
+                "Functions" => vec![part; n],
+                "Bounds" => (1..n).map(|i| Object::Real(i as f32 / n as f32)).collect::<Vec<_>>(),
+                "Encode" => (0..n).flat_map(|_| [0.into(), 1.into()]).collect::<Vec<Object>>(),
+            }
+        };
+        let mut part = doc.add_object(dictionary! {
+            "FunctionType" => 2, "Domain" => vec![0.into(), 1.into()],
+            "C0" => vec![0.into()], "C1" => vec![1.into()], "N" => 1,
+        });
+        for _ in 0..2 {
+            part = doc.add_object(stitching(part.into(), 20));
+        }
+        READ.set(0);
+        let f = function(&mut doc, stitching(part.into(), 20).into());
+        assert_eq!(READ.get(), 4);
+        assert!(near(&f.eval(&[0.0]).unwrap(), &[0.0]));
+        assert!(near(&f.eval(&[1.0]).unwrap(), &[1.0]));
     }
 
     #[test]
@@ -947,6 +1149,48 @@ mod tests {
         assert!(Ps::program(b"{ 1 { 2 } }").is_none(), "a block no if takes");
     }
 
+    /// What running a function takes, as showing a colour is charged it ([`Space::cost`]): a
+    /// sampled function reads each corner of the input's cell for each output, a calculator
+    /// runs its steps and the longer block of each `ifelse`, and a stitching function finds
+    /// its part among its bounds and is charged its dearest part.
+    #[test]
+    fn functions_take_what_their_kind_runs() {
+        let mut doc = Document::with_version("1.7");
+        let unit = || vec![Object::from(0), 1.into()];
+        // Three inputs and two outputs: 8 corners, each read for both.
+        let sampled = Stream::new(
+            dictionary! {
+                "FunctionType" => 0, "Domain" => [unit(), unit(), unit()].concat(),
+                "Range" => [unit(), unit()].concat(), "Size" => vec![2.into(); 3],
+                "BitsPerSample" => 8,
+            },
+            vec![0; 16],
+        );
+        assert_eq!(function(&mut doc, sampled.into()).units(), 16);
+        // dup, 0.5 and gt; the ifelse and the four steps of its longer block.
+        let calculator: Object = Stream::new(
+            dictionary! { "FunctionType" => 4, "Domain" => unit(), "Range" => unit() },
+            b"{ dup 0.5 gt { pop 1 } { 2 mul 1 add } ifelse }".to_vec(),
+        )
+        .into();
+        assert_eq!(function(&mut doc, calculator.clone()).units(), 8);
+        let exponential: Object = dictionary! {
+            "FunctionType" => 2, "Domain" => unit(), "C0" => vec![0.into()],
+            "C1" => vec![1.into()], "N" => 1,
+        }
+        .into();
+        assert_eq!(function(&mut doc, exponential.clone()).units(), 1);
+        let parts = [calculator, exponential.clone(), exponential];
+        let stitched = dictionary! {
+            "FunctionType" => 3, "Domain" => unit(),
+            "Functions" => parts.map(|f| Object::Reference(doc.add_object(f))).to_vec(),
+            "Bounds" => vec![0.25.into(), 0.5.into()],
+            "Encode" => [unit(), unit(), unit()].concat(),
+        };
+        // Its two bounds, and the calculator.
+        assert_eq!(function(&mut doc, stitched.into()).units(), 10);
+    }
+
     #[test]
     fn spaces_show_their_colours() {
         let mut doc = Document::with_version("1.7");
@@ -979,7 +1223,10 @@ mod tests {
         let spaces = dictionary! {
             "CS0" => red, "CS1" => none, "CS2" => indexed, "CS3" => lab,
         };
-        let space = |n: &str| Space::named(&doc, &spaces, n.as_bytes());
+        let space = |n: &str| {
+            let mut work = Work::new("reading", u64::MAX);
+            Space::named(&doc, &spaces, n.as_bytes(), &mut work).expect("within the budget")
+        };
         let full = space("CS0");
         assert_eq!(full.first(), [1.0]);
         assert!(near(&full.rgb(&full.first()).unwrap(), &[1.0, 0.0, 0.0]));
@@ -1016,7 +1263,7 @@ mod tests {
                 .into(),
             ])
         };
-        let lab = |range: &[f32]| Space::of(&doc, &lab_object(range), 0);
+        let lab = |range: &[f32]| space_of(&doc, &lab_object(range));
         let plain = lab(&[-100.0, 100.0, -100.0, 100.0]);
         let want = plain.rgb(&[50.0, 60.0, -60.0]).unwrap();
         for range in [
@@ -1032,7 +1279,7 @@ mod tests {
             // As the base of an indexed space, its bytes span the default range.
             let table = Object::string_literal(vec![128, 255, 0]);
             let o = Object::Array(vec!["Indexed".into(), lab_object(&range), 0.into(), table]);
-            let indexed = Space::of(&doc, &o, 0);
+            let indexed = space_of(&doc, &o);
             let base = plain.rgb(&[128.0 / 255.0 * 100.0, 100.0, -100.0]).unwrap();
             assert!(near(&indexed.rgb(&[0.0]).unwrap(), &base), "{range:?}");
         }

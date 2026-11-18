@@ -93,7 +93,7 @@ The Linux job also makes `limarepdf_<version>-1_amd64.deb` and `limarepdf-<versi
 `cargo-generate-rpm`, from the `[package.metadata.deb]` and `[package.metadata.generate-rpm]` sections of
 `crates/limarepdf-gui/Cargo.toml`. Their dependency lists name the libraries limarepdf loads at run time; check them when
 eframe or rfd changes (`strings target/release/limarepdf | grep '\.so'` lists them). The rpm's glibc version
-(`libc.so.6(GLIBC_2.39)(64bit)`) is written by hand, since the automatic scan is off; the job fails, naming the
+(`libc.so.6(GLIBC_2.43)(64bit)`) is written by hand, since the automatic scan is off; the job fails, naming the
 version to set, when the binaries need a different one (`ubuntu-latest` moving to a newer Ubuntu would do it:
 then update the floor in install.md, the README and feature-status.md too). The deb's comes from `dpkg-shlibdeps`. A quick install test:
 `podman run --rm -v $PWD:/p:Z debian:stable bash -c 'apt-get update && apt-get install -y /p/limarepdf_*.deb && limarepdf-cli --version'`

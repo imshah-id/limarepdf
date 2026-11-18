@@ -284,6 +284,7 @@ fn widget(p: &mut Pdf, extra: Dictionary) -> ObjectId {
 /// A form holding values in every place a value can be: a text field's value, default and
 /// rich text; a read-only field; a value inherited from a parent; a ticked checkbox; a chosen
 /// and a typed drop-down value; and a signed signature field. Options and names aren't values.
+/// Beside them, a text widget and a signed signature widget the field list leaves out.
 fn filled_form() -> Pdf {
     let mut p = make(
         "BT /F1 12 Tf 10 180 Td (Page text) Tj ET",
@@ -367,6 +368,14 @@ fn filled_form() -> Pdf {
             "AP" => dictionary! { "N" => shown },
         },
     );
+    // And a signed signature widget it leaves out.
+    widget(
+        &mut p,
+        dictionary! {
+            "FT" => "Sig", "T" => s("unlisted"),
+            "V" => dictionary! { "Type" => "Sig", "Name" => s("WALRUS-UNLISTED-SIGNER") },
+        },
+    );
     p
 }
 
@@ -380,9 +389,34 @@ const FORM_VALUES: [&str; 7] = [
     "WALRUS-ORPHAN",
 ];
 
+/// Give every node's `/FT` through a reference to its name.
+fn kinds_by_reference(p: &mut Pdf) {
+    let typed: Vec<(ObjectId, Object)> = (p.doc.objects.iter())
+        .filter_map(|(&id, o)| Some((id, o.as_dict().ok()?.get(b"FT").ok()?.clone())))
+        .filter(|(_, ft)| ft.as_name().is_ok())
+        .collect();
+    for (id, ft) in typed {
+        let ft = p.doc.add_object(ft);
+        p.doc.get_dictionary_mut(id).unwrap().set("FT", ft);
+    }
+}
+
 #[test]
 fn form_values_are_cleared_everywhere_they_are_kept() {
+    form_values_cleared(filled_form());
+}
+
+/// As where a field's kind is given directly: a signature field given its kind through a
+/// reference keeps its signature, and a text widget the tree leaves out loses its drawing.
+/// Before, the signature went and the drawing stayed.
+#[test]
+fn form_values_are_cleared_alike_when_kinds_are_given_through_references() {
     let mut p = filled_form();
+    kinds_by_reference(&mut p);
+    form_values_cleared(p);
+}
+
+fn form_values_cleared(mut p: Pdf) {
     Saved::of(&mut p).assert_kept(&FORM_VALUES);
     let rep = p.remove_hidden(&[Hidden::FormValues]).unwrap();
     assert_eq!(rep.count(Hidden::FormValues), 7, "{rep:?}");
@@ -396,8 +430,13 @@ fn form_values_are_cleared_everywhere_they_are_kept() {
     assert!(held.is_empty(), "{held:?}");
     let colour = fields.iter().find(|f| f.name == "colour").unwrap();
     assert!(!colour.appearance.contains("WALRUS"), "{colour:?}");
-    // Kept: the signature, the options, every field and the page.
-    saved.assert_kept(&["WALRUS-SIGNER", "WALRUS-OPTION-Red", "Page text"]);
+    // Kept: the signatures, the options, every field and the page.
+    saved.assert_kept(&[
+        "WALRUS-SIGNER",
+        "WALRUS-UNLISTED-SIGNER",
+        "WALRUS-OPTION-Red",
+        "Page text",
+    ]);
     let names: Vec<&str> = fields.iter().map(|f| f.name.as_str()).collect();
     assert_eq!(
         names,
@@ -424,6 +463,46 @@ fn form_values_are_cleared_everywhere_they_are_kept() {
             FieldValue::None => true,
         };
         assert!(empty, "{f:?}");
+    }
+}
+
+/// A signed signature widget `K` that a node `X` of no kind lists before signature field `T`
+/// does, through its own `/Kids` array, below an untitled node both list, or through the one
+/// array both list: the form shows it as `T.K`, and removing form values keeps its signature.
+/// Before, the signature went, as the value of `X.K`, of no kind.
+#[test]
+fn a_signature_a_node_of_no_kind_lists_first_is_kept() {
+    for shape in ["own arrays", "below a node", "one array"] {
+        let mut p = make(
+            "BT /F1 12 Tf 10 180 Td (Page text) Tj ET",
+            Dictionary::new(),
+        );
+        let signed = dictionary! { "Type" => "Sig", "Name" => s("WALRUS-SHARED-SIGNER") };
+        let k = widget(&mut p, dictionary! { "T" => s("K"), "V" => signed });
+        let mut kids = Object::from(vec![Object::Reference(k)]);
+        if shape == "below a node" {
+            let m = p.doc.add_object(dictionary! { "Kids" => kids });
+            kids = vec![Object::Reference(m)].into();
+        } else if shape == "one array" {
+            kids = p.doc.add_object(kids).into();
+        }
+        let x = p
+            .doc
+            .add_object(dictionary! { "T" => s("X"), "Kids" => kids.clone() });
+        let t = p
+            .doc
+            .add_object(dictionary! { "FT" => "Sig", "T" => s("T"), "Kids" => kids });
+        let fields = vec![Object::Reference(x), Object::Reference(t)];
+        catalog_set(
+            &mut p,
+            "AcroForm",
+            dictionary! { "Fields" => fields }.into(),
+        );
+        let names: Vec<String> = p.form_fields().into_iter().map(|f| f.name).collect();
+        assert!(names.iter().any(|n| n == "T.K"), "{shape}: {names:?}");
+        p.remove_hidden(&[Hidden::FormValues]).unwrap();
+        let kept = Saved::of(&mut p).places("WALRUS-SHARED-SIGNER");
+        assert!(!kept.is_empty(), "{shape}: the signature went");
     }
 }
 
@@ -1172,6 +1251,63 @@ fn hidden_layers_in_forms_nested_40_deep_are_removed() {
         "{e:#}"
     );
     assert_eq!(p.state_since(&before), []);
+}
+
+/// Two pages whose resources print alike (lopdf's `Debug`, which the walk once told them
+/// apart by): the first's forms are one named `A h 0 R/B`, the second's `A` (`h`) and `B`.
+/// Only the second draws `h`, a form without resources showing text in a hidden layer with the
+/// page's: it is checked too, and the text leaves the file.
+#[test]
+fn hidden_layers_drawn_with_resources_printing_like_others_are_removed() {
+    let mut p = Pdf::new();
+    let off = add_layers(&mut p);
+    let font = helvetica(&mut p);
+    let form = |content: &str| {
+        Stream::new(
+            dictionary! {
+                "Type" => "XObject", "Subtype" => "Form", "BBox" => rect([0, 0, 300, 200]),
+            },
+            content.as_bytes().to_vec(),
+        )
+    };
+    let h = p.doc.add_object(form(
+        "/OC /L1 BDC BT /F1 12 Tf 30 150 Td (WALRUS-TWIN) Tj ET EMC \
+         BT /F1 12 Tf 30 120 Td (Visible twin) Tj ET",
+    ));
+    let v = p.doc.add_object(form(""));
+    let pages = [
+        (
+            dictionary! { format!("A {} 0 R/B", h.0) => v },
+            "BT /F1 12 Tf 10 20 Td (Page one) Tj ET",
+        ),
+        (
+            dictionary! { "A" => h, "B" => v },
+            "BT /F1 12 Tf 10 20 Td (Page two) Tj ET q /A Do Q",
+        ),
+    ];
+    for (i, (forms, content)) in pages.into_iter().enumerate() {
+        p.insert_blank(i, 300.0, 200.0).unwrap();
+        let s = Stream::new(Dictionary::new(), content.as_bytes().to_vec());
+        let s = p.doc.add_object(s);
+        let page = p.page_ids()[i];
+        let d = p.doc.get_dictionary_mut(page).unwrap();
+        d.set("Contents", s);
+        d.set(
+            "Resources",
+            dictionary! {
+                "Font" => dictionary! { "F1" => font }, "Properties" => dictionary! { "L1" => off },
+                "XObject" => forms,
+            },
+        );
+    }
+    Saved::of(&mut p.clone()).assert_kept(&["WALRUS-TWIN"]);
+    let rep = p.remove_hidden(&[Hidden::HiddenLayers]).unwrap();
+    assert_eq!(rep.count(Hidden::HiddenLayers), 1);
+    let saved = Saved::of(&mut p);
+    saved.assert_gone(&["WALRUS-TWIN"]);
+    saved.assert_kept(&["Visible twin", "Page one", "Page two"]);
+    let users = saved.hidden_layer_users();
+    assert!(users.is_empty(), "{users:?}");
 }
 
 #[test]

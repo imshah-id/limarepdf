@@ -966,10 +966,8 @@ impl Pdf {
     /// annotations, so they can be moved; [`Pdf::finish_signing`] draws them in. Past the
     /// annotations a page shows too (PB-02).
     pub fn sign_items(&self) -> usize {
-        self.page_ids()
-            .into_iter()
-            .flat_map(|p| self.all_annot_refs(p))
-            .filter(|&id| self.doc.get_dictionary(id).is_ok_and(is_sign_item))
+        (self.listed_annots(&self.page_ids()).into_iter())
+            .filter(|&(_, id)| self.doc.get_dictionary(id).is_ok_and(is_sign_item))
             .count()
     }
 
@@ -1011,10 +1009,8 @@ impl Pdf {
     /// signature on a document someone already signed: drawing them in would change page
     /// content, which earlier signatures don't allow. Returns how many were locked.
     pub(crate) fn lock_sign_items(&mut self) -> Result<usize> {
-        let items: Vec<ObjectId> = self
-            .page_ids()
-            .into_iter()
-            .flat_map(|p| self.all_annot_refs(p))
+        let items: Vec<ObjectId> = (self.listed_annots(&self.page_ids()).into_iter())
+            .map(|(_, id)| id)
             .filter(|&id| self.doc.get_dictionary(id).is_ok_and(is_sign_item))
             .collect();
         for &id in &items {

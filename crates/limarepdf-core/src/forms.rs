@@ -6,6 +6,7 @@ use crate::matrix::{self as mx, M};
 use crate::{Align, FontChoice, Pdf};
 use lopdf::{Dictionary, Object, ObjectId};
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 
 /// Limits that keep a malformed or hostile file from running away.
 const MAX_FIELDS: usize = 10_000;
@@ -133,6 +134,36 @@ struct Inherited {
     q: Option<i64>,
 }
 
+/// The kind of a terminal field that inherits `inh`, or `None` for a node of no kind, which
+/// is no field.
+fn field_kind(inh: &Inherited) -> Option<FieldKind> {
+    let ff = inh.ff;
+    Some(match inh.ft.as_deref()? {
+        b"Tx" => FieldKind::Text {
+            multiline: ff & MULTILINE != 0,
+            password: ff & PASSWORD != 0,
+            comb: ff & COMB != 0,
+            max_len: inh.max_len,
+        },
+        b"Btn" if ff & PUSH_BUTTON != 0 => FieldKind::Button,
+        b"Btn" if ff & RADIO != 0 => FieldKind::Radio,
+        b"Btn" => FieldKind::Check,
+        b"Ch" => FieldKind::Choice {
+            combo: ff & COMBO != 0,
+            editable: ff & EDIT != 0,
+            multi: ff & MULTI_SELECT != 0,
+        },
+        b"Sig" => FieldKind::Signature,
+        _ => return None,
+    })
+}
+
+/// Whether a node whose own or inherited `/FT` is `ft` has a kind: whether [`field_kind`]
+/// gives it one.
+pub(crate) fn of_a_kind(ft: Option<&[u8]>) -> bool {
+    matches!(ft, Some(b"Tx" | b"Btn" | b"Ch" | b"Sig"))
+}
+
 /// Where a field is in the file, and what writing its value needs besides [`Field`].
 pub(crate) struct Node {
     /// The terminal field's dictionary, which holds `/V`.
@@ -161,16 +192,37 @@ pub(crate) enum Reach {
 
 /// State kept while walking the field tree.
 struct Walk {
-    /// Each annotation's page, from the pages' `/Annots`.
-    pages: HashMap<ObjectId, usize>,
+    /// Each annotation's page and its object, from the pages' `/Annots`.
+    pages: HashMap<ObjectId, (usize, ObjectId)>,
     /// Each page's matrix from user space to displayed-page points.
     to_vis: HashMap<usize, Option<M>>,
+    /// The nodes walked with a kind.
     seen: HashSet<ObjectId>,
+    /// The nodes walked with no kind: each is walked once more should it be reached with one.
+    untyped: HashSet<ObjectId>,
     out: Vec<(Field, Node)>,
     /// How many fields the walk takes.
     limit: usize,
     /// Whether a field was left out for being nested more than [`MAX_DEPTH`] deep.
     too_deep: bool,
+    /// Each `/Kids` array object reached, by its object.
+    kids: HashMap<ObjectId, Kids>,
+    /// The widgets fields have taken.
+    claimed: HashSet<ObjectId>,
+}
+
+/// A node's kids, told apart.
+#[derive(Clone)]
+struct Kids {
+    /// Those that are fields of their own.
+    fields: Rc<[ObjectId]>,
+    /// Those that are the node's widgets.
+    widgets: Rc<[ObjectId]>,
+    /// For a `/Kids` array object, the shallowest depth a node took its kids from.
+    taken: Option<usize>,
+    /// For a `/Kids` array object, the shallowest depth a node of no kind walked its kids
+    /// from.
+    looked: Option<usize>,
 }
 
 impl Pdf {
@@ -257,12 +309,15 @@ impl Pdf {
             pages: self.annot_pages(),
             to_vis: HashMap::new(),
             seen: HashSet::new(),
+            untyped: HashSet::new(),
             out: Vec::new(),
             limit: match reach {
                 Reach::Listed => MAX_FIELDS,
                 Reach::Every => usize::MAX,
             },
             too_deep: false,
+            kids: HashMap::new(),
+            claimed: HashSet::new(),
         };
         for f in fields {
             if let Ok(id) = f.as_reference() {
@@ -273,29 +328,50 @@ impl Pdf {
     }
 
     /// Every node of the field tree, fields and widgets, each once, with whether it belongs to
-    /// a signature field (by its own or an inherited `/FT`). Unlike [`Pdf::every_form_field`]
-    /// it fails rather than skip what is nested too deep: for removing values, where a node
-    /// left out could keep one.
+    /// a signature field (by its own or an inherited `/FT`), as [`Pdf::form_nodes`] reads it:
+    /// a node a node of no kind reaches first is the first node's with a kind to list it after.
+    /// Unlike [`Pdf::every_form_field`] it fails rather than skip what is nested too deep: for
+    /// removing values, where a node left out could keep one.
     pub(crate) fn value_nodes(&self) -> anyhow::Result<Vec<(ObjectId, bool)>> {
-        fn walk(
-            p: &Pdf,
+        #[derive(Default)]
+        struct Walk {
+            /// Each node read, with its place in `out` and whether it has a kind.
+            at: HashMap<ObjectId, (usize, bool)>,
+            /// `/Kids` array objects walked through a node with a kind, and through one of
+            /// no kind.
+            taken: HashSet<ObjectId>,
+            looked: HashSet<ObjectId>,
+            out: Vec<(ObjectId, bool)>,
+        }
+        fn walk<'p>(
+            p: &'p Pdf,
             id: ObjectId,
-            sig: bool,
+            ft: Option<&'p [u8]>,
             depth: usize,
-            seen: &mut HashSet<ObjectId>,
-            out: &mut Vec<(ObjectId, bool)>,
+            w: &mut Walk,
         ) -> anyhow::Result<()> {
-            if !seen.insert(id) {
-                return Ok(());
-            }
+            #[cfg(test)]
+            tests::LOOKED.set(tests::LOOKED.get() + 1);
             let Ok(d) = p.doc.get_dictionary(id) else {
                 return Ok(());
             };
-            let sig = match d.get(b"FT").and_then(|o| o.as_name()) {
-                Ok(ft) => ft == b"Sig",
-                Err(_) => sig,
+            let ft = d.get(b"FT").ok().and_then(|o| p.name_value(o)).or(ft);
+            let typed = of_a_kind(ft);
+            let sig = ft == Some(b"Sig");
+            // A node read first with no kind is read again when a node with a kind lists it,
+            // its kids too.
+            let at = match w.at.get(&id) {
+                Some(&(_, was)) if was || !typed => return Ok(()),
+                Some(&(i, _)) => {
+                    w.out[i].1 = sig;
+                    i
+                }
+                None => {
+                    w.out.push((id, sig));
+                    w.out.len() - 1
+                }
             };
-            out.push((id, sig));
+            w.at.insert(id, (at, typed));
             let kids = d
                 .get(b"Kids")
                 .ok()
@@ -307,10 +383,20 @@ impl Pdf {
             if kids.is_some() && depth > MAX_DEPTH {
                 anyhow::bail!("the form's fields are nested more than {MAX_DEPTH} deep");
             }
+            // A `/Kids` array object that more than one node lists, as no well-made form
+            // has, is passed over once its kids are walked, as each was then: by a node of no
+            // kind, only once a node with a kind or one of no kind walked them.
+            let list = d.get(b"Kids").and_then(|o| o.as_reference()).ok();
+            if list.is_some_and(|l| w.taken.contains(&l) || !typed && w.looked.contains(&l)) {
+                return Ok(());
+            }
             for k in kids.into_iter().flatten() {
                 if let Ok(k) = k.as_reference() {
-                    walk(p, k, sig, depth + 1, seen, out)?;
+                    walk(p, k, ft, depth + 1, w)?;
                 }
+            }
+            if let Some(l) = list {
+                if typed { &mut w.taken } else { &mut w.looked }.insert(l);
             }
             Ok(())
         }
@@ -319,13 +405,13 @@ impl Pdf {
             .and_then(|f| f.get(b"Fields").ok())
             .and_then(|o| self.doc.dereference(o).ok())
             .and_then(|(_, o)| o.as_array().ok());
-        let (mut seen, mut out) = (HashSet::new(), Vec::new());
+        let mut w = Walk::default();
         for f in fields.into_iter().flatten() {
             if let Ok(id) = f.as_reference() {
-                walk(self, id, false, 0, &mut seen, &mut out)?;
+                walk(self, id, None, 0, &mut w)?;
             }
         }
-        Ok(out)
+        Ok(w.out)
     }
 
     /// Whether this is an XFA-only ("dynamic XFA") form: one made for Adobe Reader, whose
@@ -355,44 +441,44 @@ impl Pdf {
         self.doc.dereference(form).ok()?.1.as_dict().ok()
     }
 
-    /// Each annotation listed on a page, with that page.
-    fn annot_pages(&self) -> HashMap<ObjectId, usize> {
-        let mut map = HashMap::new();
-        for (i, id) in self.page_ids().into_iter().enumerate() {
-            let annots = self
-                .doc
-                .get_dictionary(id)
-                .ok()
-                .and_then(|d| d.get(b"Annots").ok())
-                .and_then(|o| self.doc.dereference(o).ok())
-                .and_then(|(_, o)| o.as_array().ok());
-            for a in annots.into_iter().flatten() {
-                if let Ok(a) = a.as_reference() {
-                    map.entry(a).or_insert(i);
-                }
-            }
-        }
-        map
+    /// Each annotation listed on a page, with the first page (zero-based) that lists it and
+    /// its object.
+    fn annot_pages(&self) -> HashMap<ObjectId, (usize, ObjectId)> {
+        let pages = self.page_ids();
+        (self.listed_annots(&pages).into_iter())
+            .map(|(i, a)| (a, (i, pages[i])))
+            .collect()
     }
 
     fn walk_field(&self, id: ObjectId, parent: &str, inh: &Inherited, depth: usize, w: &mut Walk) {
+        #[cfg(test)]
+        tests::LOOKED.set(tests::LOOKED.get() + 1);
         if depth > MAX_DEPTH {
             w.too_deep |= self.doc.get_dictionary(id).is_ok();
             return;
         }
-        if w.out.len() >= w.limit || !w.seen.insert(id) {
+        if w.out.len() >= w.limit || w.seen.contains(&id) {
             return;
         }
         let Ok(d) = self.doc.get_dictionary(id) else {
             return;
         };
+        // A node reached first with no kind, as a kid of a node of no kind, is walked again
+        // should a node with a kind list it: its kid fields are then that node's.
+        let ft = d.get(b"FT").ok().and_then(|o| self.name_value(o));
+        let typed = of_a_kind(ft.or(inh.ft.as_deref()));
+        if typed {
+            w.seen.insert(id);
+        } else if !w.untyped.insert(id) {
+            return;
+        }
         let name = match d.get(b"T").ok().and_then(|o| self.text_value(o)) {
             Some(t) if parent.is_empty() => t,
             Some(t) => format!("{parent}.{t}"),
             None => parent.to_string(),
         };
         let mut inh = inh.clone();
-        if let Some(ft) = d.get(b"FT").ok().and_then(|o| o.as_name().ok()) {
+        if let Some(ft) = ft {
             inh.ft = Some(ft.to_vec());
         }
         if let Some(ff) = d.get(b"Ff").ok().and_then(|o| self.int_value(o)) {
@@ -417,8 +503,84 @@ impl Pdf {
             inh.opt = Some(opt.clone());
         }
 
-        // Kids with a name are fields of their own; kids without one are this field's
-        // widgets.
+        // A `/Kids` array object that more than one node lists, as no well-made form has, is
+        // taken once its kids are walked: a node listing it after that takes them only from
+        // nearer the top, where kids too deep before are not. A node listing it while they are
+        // walked, through a loop, walks them as a node with its own list would, and names
+        // them as `sig_changes`' roles do. A node of no kind walks them without taking them,
+        // as fields of no kind a node with a kind may list after it, and a node of no kind
+        // listing it after that passes over them as for a taken list.
+        let list = d.get(b"Kids").and_then(|o| o.as_reference()).ok();
+        let kids = match list.and_then(|l| w.kids.get(&l)) {
+            Some(k) => k.clone(),
+            None => self.kids_of(d),
+        };
+        let taken = kids.taken.is_some_and(|t| t <= depth)
+            || !typed && kids.looked.is_some_and(|t| t <= depth);
+        let take = |w: &mut Walk| {
+            if let Some(l) = list.filter(|_| !taken) {
+                let k = Kids {
+                    taken: Some(depth),
+                    ..kids.clone()
+                };
+                w.kids.insert(l, k);
+            }
+        };
+        if !kids.fields.is_empty() {
+            if taken {
+                // Each was walked, or left out as too deep, from there.
+                w.too_deep |= depth + 1 > MAX_DEPTH;
+            } else {
+                for &k in kids.fields.iter() {
+                    self.walk_field(k, &name, &inh, depth + 1, w);
+                }
+                if typed {
+                    take(w);
+                } else if let Some(l) = list {
+                    w.kids.entry(l).or_insert(kids).looked = Some(depth);
+                }
+            }
+            return;
+        }
+        // A node of no kind is no field: it takes neither its list nor its widgets, but keeps
+        // the list told apart for the next node listing it.
+        let Some(kind) = field_kind(&inh) else {
+            if let Some(l) = list {
+                w.kids.entry(l).or_insert(kids);
+            }
+            return;
+        };
+        take(w);
+        // A widget that more than one field lists, as no well-made form has, goes to the
+        // first.
+        let widgets = if kids.widgets.is_empty() && d.has(b"Rect") {
+            vec![id]
+        } else if taken {
+            Vec::new()
+        } else {
+            let mut ws = kids.widgets.to_vec();
+            ws.retain(|&k| {
+                #[cfg(test)]
+                tests::LOOKED.set(tests::LOOKED.get() + 1);
+                w.claimed.insert(k)
+            });
+            ws
+        };
+        let field = self.make_field(name, d, kind, &inh, &widgets, w);
+        let node = Node {
+            id,
+            widgets,
+            da: inh.da,
+            q: inh.q.unwrap_or(0),
+            dv: inh.dv,
+            opt: inh.opt.map(|o| self.options(&o)).unwrap_or_default(),
+        };
+        w.out.push((field, node));
+    }
+
+    /// The kids a field tree node `d` lists: those with a name, or with no `/Rect`, are
+    /// fields of their own; the others are its widgets.
+    fn kids_of(&self, d: &Dictionary) -> Kids {
         let kids: Vec<ObjectId> = d
             .get(b"Kids")
             .ok()
@@ -427,62 +589,31 @@ impl Pdf {
             .map(|a| a.iter().filter_map(|k| k.as_reference().ok()).collect())
             .unwrap_or_default();
         let (fields, widgets): (Vec<ObjectId>, Vec<ObjectId>) = kids.into_iter().partition(|k| {
+            #[cfg(test)]
+            tests::LOOKED.set(tests::LOOKED.get() + 1);
             self.doc
                 .get_dictionary(*k)
                 .is_ok_and(|k| k.has(b"T") || !k.has(b"Rect"))
         });
-        if !fields.is_empty() {
-            for k in fields {
-                self.walk_field(k, &name, &inh, depth + 1, w);
-            }
-            return;
-        }
-        let widgets = if widgets.is_empty() && d.has(b"Rect") {
-            vec![id]
-        } else {
-            widgets
-        };
-        if let Some(field) = self.make_field(name, d, &inh, &widgets, w) {
-            let node = Node {
-                id,
-                widgets,
-                da: inh.da,
-                q: inh.q.unwrap_or(0),
-                dv: inh.dv,
-                opt: inh.opt.map(|o| self.options(&o)).unwrap_or_default(),
-            };
-            w.out.push((field, node));
+        Kids {
+            fields: fields.into(),
+            widgets: widgets.into(),
+            taken: None,
+            looked: None,
         }
     }
 
-    /// A terminal field from its dictionary, what it inherits and its widgets.
+    /// A terminal field of `kind` from its dictionary, what it inherits and its widgets.
     fn make_field(
         &self,
         name: String,
         d: &Dictionary,
+        kind: FieldKind,
         inh: &Inherited,
         widgets: &[ObjectId],
         w: &mut Walk,
-    ) -> Option<Field> {
+    ) -> Field {
         let ff = inh.ff;
-        let kind = match inh.ft.as_deref()? {
-            b"Tx" => FieldKind::Text {
-                multiline: ff & MULTILINE != 0,
-                password: ff & PASSWORD != 0,
-                comb: ff & COMB != 0,
-                max_len: inh.max_len,
-            },
-            b"Btn" if ff & PUSH_BUTTON != 0 => FieldKind::Button,
-            b"Btn" if ff & RADIO != 0 => FieldKind::Radio,
-            b"Btn" => FieldKind::Check,
-            b"Ch" => FieldKind::Choice {
-                combo: ff & COMBO != 0,
-                editable: ff & EDIT != 0,
-                multi: ff & MULTI_SELECT != 0,
-            },
-            b"Sig" => FieldKind::Signature,
-            _ => return None,
-        };
         let opt = inh
             .opt
             .as_ref()
@@ -511,7 +642,7 @@ impl Pdf {
             FieldKind::Choice { .. } => opt,
             _ => Vec::new(),
         };
-        Some(Field {
+        Field {
             name,
             kind,
             value,
@@ -522,7 +653,7 @@ impl Pdf {
             text_size: inh.da.as_deref().map_or(0.0, |da| parse_da(da).1),
             font: self.da_font(inh.da.as_deref()),
             widgets: ws,
-        })
+        }
     }
 
     /// The font a value is set in for the `/DA` `da` when the font it names can't be used
@@ -539,13 +670,15 @@ impl Pdf {
 
     /// A widget annotation, if it is on a page.
     fn widget(&self, id: ObjectId, w: &mut Walk) -> Option<Widget> {
+        #[cfg(test)]
+        tests::LOOKED.set(tests::LOOKED.get() + 1);
         let d = self.doc.get_dictionary(id).ok()?;
-        let page = *w.pages.get(&id)?;
+        let (page, pid) = *w.pages.get(&id)?;
         let rect = self.rect(d.get(b"Rect").ok()?)?;
-        let to_vis = *w.to_vis.entry(page).or_insert_with(|| {
-            let pid = self.page_id_at(page).ok()?;
-            mx::inv(self.vis_down(pid).0)
-        });
+        let to_vis = *w
+            .to_vis
+            .entry(page)
+            .or_insert_with(|| mx::inv(self.vis_down(pid).0));
         let on_state = self.on_state(id);
         let flags = d
             .get(b"F")
@@ -679,6 +812,10 @@ impl Pdf {
         self.doc.dereference(o).ok()?.1.as_i64().ok()
     }
 
+    pub(crate) fn name_value<'a>(&'a self, o: &'a Object) -> Option<&'a [u8]> {
+        self.doc.dereference(o).ok()?.1.as_name().ok()
+    }
+
     /// A string's raw bytes.
     pub(crate) fn string_bytes(&self, o: &Object) -> Option<Vec<u8>> {
         match self.doc.dereference(o).ok()?.1 {
@@ -696,4 +833,239 @@ pub(crate) fn button_export(state: &str, opt: &[(String, String)]) -> String {
         .ok()
         .and_then(|i| opt.get(i))
         .map_or_else(|| state.to_string(), |o| o.0.clone())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lopdf::dictionary;
+    use std::cell::Cell;
+
+    thread_local! {
+        /// Field tree entries looked at on this thread: nodes walked, kids told apart and
+        /// widgets read.
+        pub(super) static LOOKED: Cell<usize> = const { Cell::new(0) };
+    }
+
+    /// A form of `n` fields, `field(i)` each, listed in `/Fields` and each with the same
+    /// `/Kids` array object, which `kids` makes from the fields' ids.
+    fn sharing(
+        n: usize,
+        field: impl Fn(usize) -> Dictionary,
+        kids: impl FnOnce(&mut Pdf, &[ObjectId]) -> Vec<Object>,
+    ) -> Pdf {
+        let mut p = Pdf::new();
+        p.insert_blank(0, 300.0, 200.0).unwrap();
+        let shared = p.doc.new_object_id();
+        let ids: Vec<ObjectId> = (0..n)
+            .map(|i| {
+                let mut d = field(i);
+                d.set("Kids", shared);
+                p.doc.add_object(d)
+            })
+            .collect();
+        let list = kids(&mut p, &ids);
+        p.doc.objects.insert(shared, Object::Array(list));
+        let fields: Vec<Object> = ids.iter().map(|&id| id.into()).collect();
+        let form = dictionary! { "Fields" => fields };
+        p.doc.catalog_mut().unwrap().set("AcroForm", form);
+        p
+    }
+
+    fn name(i: usize) -> Object {
+        Object::string_literal(format!("f{i}"))
+    }
+
+    fn text_field(i: usize) -> Dictionary {
+        dictionary! { "FT" => "Tx", "T" => name(i) }
+    }
+
+    fn widget() -> Dictionary {
+        let rect: Vec<Object> = vec![0.into(), 0.into(), 10.into(), 10.into()];
+        dictionary! { "Subtype" => "Widget", "Rect" => rect }
+    }
+
+    /// How many widgets each field takes.
+    fn taken(p: &Pdf) -> Vec<usize> {
+        let out = p.field_nodes(Reach::Every).0;
+        out.iter().map(|(_, node)| node.widgets.len()).collect()
+    }
+
+    #[test]
+    fn fields_sharing_their_kids_are_walked_once() {
+        // Each field lists the same `n` fields as its kids: they were told apart and walked
+        // again for each field.
+        let n = 2_000;
+        let p = sharing(
+            n,
+            |i| dictionary! { "T" => name(i) },
+            |p, _| {
+                let kid = |i| p.doc.add_object(text_field(n + i)).into();
+                (0..n).map(kid).collect()
+            },
+        );
+        LOOKED.set(0);
+        let out = p.field_nodes(Reach::Every).0;
+        assert!(LOOKED.get() < 4 * n, "looked at {} entries", LOOKED.get());
+        assert_eq!(out.len(), n);
+        assert_eq!(out[0].0.name, format!("f0.f{n}"));
+        LOOKED.set(0);
+        assert_eq!(p.value_nodes().unwrap().len(), 2 * n);
+        assert!(LOOKED.get() < 4 * n, "looked at {} entries", LOOKED.get());
+
+        // Each field lists every field, a loop: the kids are walked again only as the walk
+        // goes deeper, to as deep as fields may be.
+        let p = sharing(
+            n,
+            |i| dictionary! { "T" => name(i) },
+            |_, ids| ids.iter().map(|&id| id.into()).collect(),
+        );
+        LOOKED.set(0);
+        assert!(p.field_nodes(Reach::Every).1);
+        let most = 4 * (MAX_DEPTH + 2) * n;
+        assert!(LOOKED.get() < most, "looked at {} entries", LOOKED.get());
+    }
+
+    #[test]
+    fn widgets_shared_by_fields_go_to_the_first() {
+        // Each field lists the same widgets as its kids: they were read again for each
+        // field, and each field took them all.
+        let (n, m) = (2_000, 2_000);
+        let p = sharing(n, text_field, |p, _| {
+            (0..m).map(|_| p.doc.add_object(widget()).into()).collect()
+        });
+        let most = 4 * (n + m);
+        LOOKED.set(0);
+        let each = taken(&p);
+        assert!(LOOKED.get() < most, "looked at {} entries", LOOKED.get());
+        assert_eq!(each.len(), n);
+        assert_eq!(each[0], m);
+        assert!(each[1..].iter().all(|&t| t == 0));
+        LOOKED.set(0);
+        assert_eq!(p.value_nodes().unwrap().len(), n + m);
+        assert!(LOOKED.get() < most, "looked at {} entries", LOOKED.get());
+
+        // As when each field lists the widget in an array of its own.
+        let mut p = Pdf::new();
+        let w = p.doc.add_object(widget());
+        let fields: Vec<Object> = (0..2)
+            .map(|i| {
+                let mut f = text_field(i);
+                f.set("Kids", vec![w.into()]);
+                p.doc.add_object(f).into()
+            })
+            .collect();
+        let form = dictionary! { "Fields" => fields };
+        p.doc.catalog_mut().unwrap().set("AcroForm", form);
+        assert_eq!(taken(&p), [1, 0]);
+    }
+
+    #[test]
+    fn nodes_of_no_kind_sharing_widgets_read_them_once() {
+        // Nodes of no kind, then a field, list the same widgets: each node of no kind read
+        // them again, and the field still takes them all.
+        let (n, m) = (2_000, 2_000);
+        let node = |i| match i {
+            i if i == n - 1 => text_field(i),
+            i => dictionary! { "T" => name(i) },
+        };
+        let p = sharing(n, node, |p, _| {
+            (0..m).map(|_| p.doc.add_object(widget()).into()).collect()
+        });
+        LOOKED.set(0);
+        assert_eq!(taken(&p), [m]);
+        let most = 4 * (n + m);
+        assert!(LOOKED.get() < most, "looked at {} entries", LOOKED.get());
+    }
+
+    /// `/Fields [x, t]`, x of no kind and t a text field, both listing kid k, a field of no
+    /// kind of its own with a widget, in a `/Kids` array of their own each or the same one.
+    fn kid_of_a_node_of_no_kind_first(shared: bool) -> Pdf {
+        let mut p = Pdf::new();
+        p.insert_blank(0, 300.0, 200.0).unwrap();
+        let w = p.doc.add_object(widget());
+        let k = dictionary! { "T" => "k", "Kids" => vec![w.into()] };
+        let k: Object = p.doc.add_object(k).into();
+        let mut list = || -> Object {
+            match shared {
+                true => p.doc.add_object(vec![k.clone()]).into(),
+                false => vec![k.clone()].into(),
+            }
+        };
+        let x_list = list();
+        let t_list = if shared { x_list.clone() } else { list() };
+        let x = dictionary! { "T" => "x", "Kids" => x_list };
+        let t = dictionary! { "FT" => "Tx", "T" => "t", "Kids" => t_list };
+        let (x, t) = (p.doc.add_object(x), p.doc.add_object(t));
+        let form = dictionary! { "Fields" => vec![x.into(), t.into()] };
+        p.doc.catalog_mut().unwrap().set("AcroForm", form);
+        p
+    }
+
+    #[test]
+    fn a_kid_listed_first_by_a_node_of_no_kind_is_the_next_fields() {
+        // k was marked seen under x, where it is no field, and t's list taken: t lost it.
+        for shared in [false, true] {
+            let p = kid_of_a_node_of_no_kind_first(shared);
+            let out = p.field_nodes(Reach::Every).0;
+            let got: Vec<_> = (out.iter())
+                .map(|(f, n)| (f.name.as_str(), n.widgets.len()))
+                .collect();
+            assert_eq!(got, [("t.k", 1)], "shared {shared}");
+        }
+    }
+
+    #[test]
+    fn nodes_of_no_kind_sharing_kid_fields_walk_them_once() {
+        // Nodes of no kind, then a field, list the same kid fields of no kind of their own:
+        // each is walked once as no field and once as the field's.
+        let n = 2_000;
+        let node = |i| match i {
+            i if i == n - 1 => text_field(i),
+            i => dictionary! { "T" => name(i) },
+        };
+        let p = sharing(n, node, |p, _| {
+            let kid = |i| p.doc.add_object(dictionary! { "T" => name(n + i) }).into();
+            (0..n).map(kid).collect()
+        });
+        LOOKED.set(0);
+        let out = p.field_nodes(Reach::Every).0;
+        assert!(LOOKED.get() < 6 * n, "looked at {} entries", LOOKED.get());
+        assert_eq!(out.len(), n);
+        assert_eq!(out[0].0.name, format!("f{}.f{n}", n - 1));
+        LOOKED.set(0);
+        assert_eq!(p.value_nodes().unwrap().len(), 2 * n);
+        assert!(LOOKED.get() < 6 * n, "looked at {} entries", LOOKED.get());
+    }
+
+    #[test]
+    fn nodes_of_no_kind_reached_again_are_walked_once() {
+        // Two fields below 20 layers of two nodes of no kind, each listing both nodes of the
+        // layer below it: 2^20 ways down, each node walked once.
+        let layers = 20;
+        let mut p = Pdf::new();
+        p.insert_blank(0, 300.0, 200.0).unwrap();
+        let mut below: Vec<Object> = (0..2)
+            .map(|i| p.doc.add_object(text_field(i)).into())
+            .collect();
+        for l in 0..layers {
+            below = (0..2)
+                .map(|i| {
+                    let d = dictionary! { "T" => name(2 * l + i + 2), "Kids" => below.clone() };
+                    p.doc.add_object(d).into()
+                })
+                .collect();
+        }
+        let form = dictionary! { "Fields" => below };
+        p.doc.catalog_mut().unwrap().set("AcroForm", form);
+        LOOKED.set(0);
+        let out = p.field_nodes(Reach::Every).0;
+        let looked = LOOKED.get();
+        assert!(looked < 10 * layers, "looked at {looked} entries");
+        assert_eq!(out.len(), 2);
+        LOOKED.set(0);
+        assert_eq!(p.value_nodes().unwrap().len(), 2 * layers + 2);
+        let looked = LOOKED.get();
+        assert!(looked < 10 * layers, "looked at {looked} entries");
+    }
 }

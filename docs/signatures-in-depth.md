@@ -589,7 +589,17 @@ those parts allows it. So an object that is both page content and, say, a commen
 as "just a comment". Pointers from one structure to another (a bookmark to a page, a tag to an annotation) don't
 count as parts. A signature field added with an action on it or on its widget (one run when its page opens, say)
 is refused for the action, even where adding the field is allowed: the field is listed as added beside the refused
-action.
+action. Signing in a field counts as signing only when LimarePDF lists that signature, since nothing else checks it:
+one it doesn't list (in a field nested more than 32 levels deep, say, or on one of a field's widgets rather than the
+field itself) is refused as a signature it can't check, and so is an earlier signature put in a field, as nothing
+was signed there. A signature field's widgets are judged with the field,
+whether they are the field itself or kids of it: their drawing may change as the field is signed, and not after. A
+form field moved into a signature field or out of one,
+moved under another field or listed again under one, or renamed by a change to a field above it is refused too, and
+so is a signature field added with a field of another kind inside it (a text field, say), as adding one is never
+allowed, on its own or not. So is any change to a field whose `/Parent` names a field other than the one listing it,
+or to that field when nothing else lists it, as readers that go by `/Parent` would give it another name, type or
+value. A signature field added around one signed earlier counts as added, not as signed.
 
 LimarePDF reads the later additions with its own strict reader rather than the lenient one it uses to open files, and
 refuses as malformed:
@@ -656,6 +666,18 @@ The full record, with the files used, is in [Testing](developer/testing.md#digit
 - An allowed change can still change what the page shows (a form field filled in, a comment placed over text).
   LimarePDF lists it; it can't tell whether that was the intent.
 - Malformed later additions are refused even when another reader can repair them.
+- A document too large to judge shows "the later additions are malformed: the document is too complex to check",
+  never allowed: past 500,000 distinct nodes of its page tree or of its form fields, past 4,000,000 steps walking
+  them, past 4,000,000 steps giving its objects their parts, or past 4,000,000 steps comparing its pages' annotation
+  lists with the next version's. Walking them, each kid a node lists is a step, as is each 64 bytes of a field's
+  name, so a couple of thousand fields that all list the same couple of thousand kids are enough; how deeply they
+  nest isn't limited. Comparing annotation lists, each entry is a step, as is each change found for each page it
+  shows on, and each comparison of two annotations written into a list directly (which the format doesn't allow),
+  so a page or two with a couple of thousand of those is enough.
+  Giving parts, each object in such an annotation is a step for each page sharing its list, so a thousand pages
+  sharing 500 of them of ten objects each is enough there; an object shared by many pages costs each page after the
+  first a step for each of its references that page reached already, so a hundred pages sharing resources of 100
+  objects that each refer to the same 500 others is enough as well. Ordinary documents come nowhere near these.
 - Files that PDF apps read differently (something uses a part the file deletes or doesn't list, or the file is
   damaged) are shown as the PDF standard says, which other apps may not do. Their signatures show *can't check*
   even where another app calls them valid, and LimarePDF signs such a file only by writing it out in full first, which it

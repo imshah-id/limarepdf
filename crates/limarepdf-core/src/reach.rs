@@ -12,18 +12,20 @@
 //! reading the content: every drawing the pages keep in the file through them.
 
 use crate::budget::{self, TooComplex, Work};
+use crate::unfillable::inherited_at;
 use crate::Pdf;
 use lopdf::content::{Content, Operation};
 use lopdf::{Dictionary, Object, ObjectId};
 use std::collections::{HashMap, HashSet};
-use std::hash::{Hash, Hasher};
+use std::hash::{BuildHasher, DefaultHasher, Hash, Hasher, RandomState};
 use std::rc::Rc;
 
 /// The steps a walk may take: one for each drawing reached, each time it is reached, one for
-/// each name looked up, and one for each entry of the resources a drawing without its own
-/// is told apart by (following every listed name, those of every drawing). 32 times the most the test files take (129,066, a 109-page file from
-/// pdf.js's tests; the 1,080 files that open, measured 2026-11-04), so a document like it of
-/// about 3,500 pages still passes.
+/// each name looked up, one for each KiB of the resources read (once where they are
+/// written), which tells them apart, and one for each KiB of what it keeps of marked
+/// content: properties written in the resources, and alternative text. 32 times the most
+/// the test files take (129,066, a 109-page file from pdf.js's tests; the 1,080 files that
+/// open, measured 2026-11-04), so a document like it of about 3,500 pages still passes.
 pub(crate) const STEPS: u64 = 1 << 22;
 
 /// What a walk's refusal says it was doing.
@@ -110,8 +112,11 @@ impl Uses {
     /// use.
     fn listed(pdf: &Pdf, res: &Dictionary) -> Uses {
         let all = |key: &[u8]| -> Vec<Vec<u8>> {
-            let d = pdf.resolved_dict(res.get(key).ok());
-            d.iter().map(|(k, _)| k.clone()).collect()
+            let d = res.get(key).ok().and_then(|o| pdf.dict_of(o));
+            d.iter()
+                .flat_map(|d| d.iter())
+                .map(|(k, _)| k.clone())
+                .collect()
         };
         Uses {
             xobjects: all(b"XObject"),
@@ -351,25 +356,111 @@ struct Walk<'a> {
     work: &'a mut Work,
     cache: &'a mut Decoded,
     reach: Reach,
-    /// The node of each drawing followed, by stream and the fingerprint of the resources it
-    /// draws with when they aren't its own.
-    seen: HashMap<(ObjectId, Option<u64>), usize>,
+    /// The node of each drawing followed, by stream and the set of the resources it draws
+    /// with when they aren't its own.
+    seen: HashMap<(ObjectId, Option<usize>), usize>,
     held: HashSet<ObjectId>,
     /// Drawings to follow: the node, what its content uses, its resources.
-    todo: Vec<(usize, Option<Rc<Uses>>, Rc<Dictionary>)>,
+    todo: Vec<(usize, Option<Rc<Uses>>, Res)>,
     /// Every name the resources list is followed, as for content that can't be read, and
     /// the content isn't read ([`Pdf::reach_listed`]).
     listed: bool,
-    /// The resources followed, by fingerprint, when `listed`: what they list is the same
-    /// wherever they are, so each set is followed once.
-    followed: HashSet<u64>,
+    /// The sets of resources followed, when `listed`: what they list is the same wherever
+    /// they are, so each set is followed once.
+    followed: HashSet<usize>,
+    /// The resources read, by where they are written: each is read once.
+    read: HashMap<Source, Res>,
+    /// What the pages' content uses, by where it is written: each is read once. Kept for
+    /// this walk only, as Remove hidden information rewrites content in place.
+    contents: HashMap<Contents, Option<Rc<Uses>>>,
+    /// The sets of resources read, by their hash ([`weigh`]): each set's dictionary and
+    /// number.
+    sets: HashMap<u64, Vec<(Rc<Dictionary>, usize)>>,
+    /// The sets read so far.
+    made: usize,
+    /// The hash's keys, random, so that no file can choose resources that collide.
+    keys: RandomState,
 }
 
-/// Resources told apart: the same entries, the same fingerprint.
-fn fingerprint(res: &Dictionary) -> u64 {
-    let mut h = std::hash::DefaultHasher::new();
-    format!("{res:?}").hash(&mut h);
-    h.finish()
+/// Resources as a walk holds them: the dictionary, and the number of its set, the same for
+/// the same entries ([`Walk::told`]).
+#[derive(Clone)]
+struct Res(Rc<Dictionary>, usize);
+
+/// Where resources are written.
+#[derive(PartialEq, Eq, Hash)]
+enum Source {
+    /// An object of their own.
+    Object(ObjectId),
+    /// In the object whose `/Resources` they are: a page or page-tree node, a drawing, a
+    /// Type 3 font.
+    In(ObjectId),
+    /// In a Type 3 font written in a set of resources ([`Res`]), by the font's name there:
+    /// the same set lists the same font by that name.
+    Font(usize, Vec<u8>),
+}
+
+/// Where a page's content is written.
+#[derive(PartialEq, Eq, Hash)]
+enum Contents {
+    /// The object the page's `/Contents` refers to: a stream, or an array listing them.
+    Object(ObjectId),
+    /// The streams an array written in the page lists.
+    Streams(Vec<ObjectId>),
+}
+
+/// Feed dictionary `d` to `h` as what decides its equality (`PartialEq`): its entries in any
+/// order, each hashed on its own with `keys`. Returns its weight, 8 for each object it holds
+/// and one for each byte of a key, name, string or stream's content: what reading and
+/// comparing it takes.
+fn weigh_dict(d: &Dictionary, keys: &RandomState, h: &mut DefaultHasher) -> u64 {
+    let (mut sum, mut weight) = (0u64, 8);
+    for (k, v) in d {
+        let mut entry = keys.build_hasher();
+        k.hash(&mut entry);
+        weight += k.len() as u64 + weigh(v, keys, &mut entry);
+        sum = sum.wrapping_add(entry.finish());
+    }
+    h.write_u64(sum);
+    weight
+}
+
+/// [`weigh_dict`] for any object; 0 and -0 alike, as they are equal.
+pub(crate) fn weigh(o: &Object, keys: &RandomState, h: &mut DefaultHasher) -> u64 {
+    std::mem::discriminant(o).hash(h);
+    match o {
+        Object::Null => 8,
+        Object::Boolean(b) => {
+            b.hash(h);
+            8
+        }
+        Object::Integer(i) => {
+            i.hash(h);
+            8
+        }
+        Object::Real(r) => {
+            let r = if *r == 0.0 { 0.0 } else { *r };
+            r.to_bits().hash(h);
+            8
+        }
+        Object::Name(b) | Object::String(b, _) => {
+            b.hash(h);
+            8 + b.len() as u64
+        }
+        Object::Array(a) => {
+            a.len().hash(h);
+            8 + a.iter().map(|o| weigh(o, keys, h)).sum::<u64>()
+        }
+        Object::Dictionary(d) => weigh_dict(d, keys, h),
+        Object::Stream(s) => {
+            s.content.hash(h);
+            weigh_dict(&s.dict, keys, h) + s.content.len() as u64
+        }
+        Object::Reference(id) => {
+            id.hash(h);
+            8
+        }
+    }
 }
 
 impl Pdf {
@@ -395,7 +486,7 @@ impl Pdf {
             return (looks, held);
         };
         held.extend(ap.as_reference().ok());
-        for (_, look) in self.resolved_dict(Some(ap)).iter() {
+        for (_, look) in self.dict_of(ap).iter().flat_map(|d| d.iter()) {
             // A drawing, or a dictionary of drawings by state.
             match self.doc.dereference(look) {
                 Ok((id, Object::Dictionary(states))) => {
@@ -432,7 +523,7 @@ impl Pdf {
         let pages = self.page_ids();
         let mut w = Walk::new(self, work, cache, listed);
         w.reach.nodes.resize_with(pages.len(), Node::default);
-        let no_resources = Rc::new(Dictionary::new());
+        let no_resources = w.told(Dictionary::new())?;
         for (i, &page) in pages.iter().enumerate() {
             w.work.take(1)?;
             let mut cur = Some(page);
@@ -442,18 +533,19 @@ impl Pdf {
                     .and_then(|d| d.get(b"Parent").ok())
                     .and_then(|o| o.as_reference().ok());
             }
-            let res = Rc::new(self.resolved_dict(self.inherited(page, b"Resources").as_ref()));
+            let res = match inherited_at(&self.doc, page, b"Resources") {
+                Some((at, o)) => w.res(Source::In(at), o)?,
+                None => no_resources.clone(),
+            };
             let uses = match listed {
                 true => None,
-                false => (self.doc)
-                    .get_page_content_with_limit(page, crate::MAX_CONTENT)
-                    .ok()
-                    .and_then(|d| Uses::of_data(&d))
-                    .map(Rc::new),
+                false => w.page_uses(page),
             };
-            w.reach.nodes[i].res = res.clone();
+            w.reach.nodes[i].res = res.0.clone();
             w.todo.push((i, uses, res));
-            for annot in self.all_annot_refs(page) {
+            // Each page's list, shared or not: what a page draws is its own.
+            let list = self.annots_array(page).unwrap_or_default();
+            for annot in list.iter().filter_map(|o| o.as_reference().ok()) {
                 w.work.take(1)?;
                 let looks = (self.doc.get_dictionary(annot).ok())
                     .map(|d| self.appearances_of(d).0)
@@ -480,7 +572,7 @@ impl Pdf {
         cache: &mut Decoded,
     ) -> Result<HashSet<ObjectId>, TooComplex> {
         let mut w = Walk::new(self, work, cache, false);
-        let no_resources = Rc::new(Dictionary::new());
+        let no_resources = w.told(Dictionary::new())?;
         for &id in ids {
             w.drawing(id, &no_resources)?;
         }
@@ -501,6 +593,11 @@ impl<'a> Walk<'a> {
             todo: Vec::new(),
             listed,
             followed: HashSet::new(),
+            read: HashMap::new(),
+            contents: HashMap::new(),
+            sets: HashMap::new(),
+            made: 0,
+            keys: RandomState::new(),
         }
     }
 }
@@ -514,26 +611,68 @@ impl Walk<'_> {
         Ok(())
     }
 
+    /// The resources `o` (a `/Resources` entry) written at `at`, read the first time
+    /// ([`Walk::told`]), and as read after.
+    fn res(&mut self, at: Source, o: &Object) -> Result<Res, TooComplex> {
+        let at = match o {
+            Object::Reference(id) => Source::Object(*id),
+            _ => at,
+        };
+        if let Some(res) = self.read.get(&at) {
+            return Ok(res.clone());
+        }
+        let res = self.told(self.pdf.resolved_dict(Some(o)))?;
+        self.read.insert(at, res.clone());
+        Ok(res)
+    }
+
+    /// What the content of page `page` uses, read the first time the walk meets where it is
+    /// written ([`Contents`]), however many pages share it; `None` when it can't be read.
+    fn page_uses(&mut self, page: ObjectId) -> Option<Rc<Uses>> {
+        let doc = &self.pdf.doc;
+        let at = match doc.get_dictionary(page).and_then(|d| d.get(b"Contents")) {
+            Ok(Object::Reference(id)) => Contents::Object(*id),
+            _ => Contents::Streams(doc.get_page_contents(page)),
+        };
+        (self.contents.entry(at))
+            .or_insert_with(|| {
+                #[cfg(test)]
+                tests::PAGES_READ.set(tests::PAGES_READ.get() + 1);
+                doc.get_page_content_with_limit(page, crate::MAX_CONTENT)
+                    .ok()
+                    .and_then(|d| Uses::of_data(&d))
+                    .map(Rc::new)
+            })
+            .clone()
+    }
+
+    /// Resources `d`, just read, charged a step per KiB of them ([`weigh_dict`]) and told
+    /// apart: the set of the same entries read before, with its dictionary, or a new one.
+    fn told(&mut self, d: Dictionary) -> Result<Res, TooComplex> {
+        #[cfg(test)]
+        tests::TOLD.set(tests::TOLD.get() + 1);
+        let mut h = self.keys.build_hasher();
+        self.work.take(weigh_dict(&d, &self.keys, &mut h) / 1024)?;
+        let sets = self.sets.entry(h.finish()).or_default();
+        if let Some((same, set)) = sets.iter().find(|(s, _)| **s == d) {
+            return Ok(Res(same.clone(), *set));
+        }
+        let res = Res(Rc::new(d), self.made);
+        sets.push((res.0.clone(), res.1));
+        self.made += 1;
+        Ok(res)
+    }
+
     /// The node of drawing `id`, drawn where the resources are `outer`; followed later when
     /// new. `None` when it isn't a stream.
-    fn drawing(
-        &mut self,
-        id: ObjectId,
-        outer: &Rc<Dictionary>,
-    ) -> Result<Option<usize>, TooComplex> {
+    fn drawing(&mut self, id: ObjectId, outer: &Res) -> Result<Option<usize>, TooComplex> {
         self.work.take(1)?;
         let pdf = self.pdf;
         let Ok(s) = pdf.doc.get_object(id).and_then(|o| o.as_stream()) else {
             return Ok(None);
         };
         let own = s.dict.get(b"Resources").ok();
-        let key = match own {
-            Some(_) => (id, None),
-            None => {
-                self.work.take(outer.len() as u64)?;
-                (id, Some(fingerprint(outer)))
-            }
-        };
+        let key = (id, own.is_none().then_some(outer.1));
         if let Some(&n) = self.seen.get(&key) {
             return Ok(Some(n));
         }
@@ -546,11 +685,11 @@ impl Walk<'_> {
         let res = match own {
             Some(o) => {
                 self.hold(id)?;
-                Rc::new(pdf.resolved_dict(Some(o)))
+                self.res(Source::In(id), o)?
             }
             None => outer.clone(),
         };
-        self.reach.nodes[n].res = res.clone();
+        self.reach.nodes[n].res = res.0.clone();
         let uses = match self.listed {
             true => None,
             false => pdf.uses_of(id, self.cache),
@@ -563,38 +702,43 @@ impl Walk<'_> {
     fn run(&mut self) -> Result<(), TooComplex> {
         let pdf = self.pdf;
         while let Some((n, uses, res)) = self.todo.pop() {
-            if self.listed {
-                self.work.take(res.len() as u64)?;
-                if !self.followed.insert(fingerprint(&res)) {
-                    continue;
-                }
+            if self.listed && !self.followed.insert(res.1) {
+                continue;
             }
-            let entries = |key: &[u8]| pdf.resolved_dict(res.get(key).ok());
+            let entries = |key: &[u8]| res.0.get(key).ok().and_then(|o| pdf.dict_of(o));
             let listed;
             let u = match &uses {
                 Some(u) => u.as_ref(),
                 None => {
-                    listed = Uses::listed(pdf, &res);
+                    listed = Uses::listed(pdf, &res.0);
                     &listed
                 }
             };
+            self.work.take(text(&u.alt) / 1024)?;
             let node = &mut self.reach.nodes[n];
             node.unread = uses.is_none();
             node.alt.extend(u.alt.iter().cloned());
             let properties = entries(b"Properties");
             for nm in &u.properties {
                 self.work.take(1)?;
-                let entry = properties.get(nm).ok();
-                let d = pdf.resolved_dict(entry);
+                let Some(entry) = named(properties, nm) else {
+                    continue;
+                };
+                let alt = (pdf.dict_of(entry))
+                    .map(|d| alt_texts(Some(&pdf.doc), d))
+                    .unwrap_or_default();
+                // Kept: the properties as the resources list them, and their text.
+                let kept = weigh(entry, &self.keys, &mut self.keys.build_hasher()) + text(&alt);
+                self.work.take(kept / 1024)?;
                 let node = &mut self.reach.nodes[n];
-                node.alt.extend(alt_texts(Some(&pdf.doc), &d));
-                node.properties.extend(entry.cloned());
+                node.alt.extend(alt);
+                node.properties.push(entry.clone());
             }
             let mut draws = Vec::new();
             let xobjects = entries(b"XObject");
             for nm in &u.xobjects {
                 self.work.take(1)?;
-                let Some(id) = xobjects.get(nm).ok().and_then(|o| o.as_reference().ok()) else {
+                let Some(id) = named(xobjects, nm).and_then(|o| o.as_reference().ok()) else {
                     continue;
                 };
                 self.reach.drawn.insert(id);
@@ -607,7 +751,7 @@ impl Walk<'_> {
             let patterns = entries(b"Pattern");
             for nm in &u.patterns {
                 self.work.take(1)?;
-                if let Some(id) = patterns.get(nm).ok().and_then(|o| o.as_reference().ok()) {
+                if let Some(id) = named(patterns, nm).and_then(|o| o.as_reference().ok()) {
                     self.reach.painted.insert(id);
                     draws.extend(self.drawing(id, &res)?);
                 }
@@ -615,8 +759,8 @@ impl Walk<'_> {
             let states = entries(b"ExtGState");
             for nm in &u.states {
                 self.work.take(1)?;
-                let gs = pdf.resolved_dict(states.get(nm).ok());
-                if let Some(id) = mask_drawing(pdf, &gs) {
+                let gs = named(states, nm).and_then(|o| pdf.dict_of(o));
+                if let Some(id) = gs.and_then(|gs| mask_drawing(pdf, gs)) {
                     self.reach.painted.insert(id);
                     draws.extend(self.drawing(id, &res)?);
                 }
@@ -624,8 +768,10 @@ impl Walk<'_> {
             let fonts = entries(b"Font");
             for nm in &u.fonts {
                 self.work.take(1)?;
-                let entry = fonts.get(nm).ok();
-                let font = pdf.resolved_dict(entry);
+                let entry = named(fonts, nm);
+                let Some(font) = entry.and_then(|o| pdf.dict_of(o)) else {
+                    continue;
+                };
                 if font.get(b"Subtype").and_then(|o| o.as_name()).ok() != Some(b"Type3") {
                     continue;
                 }
@@ -633,15 +779,19 @@ impl Walk<'_> {
                 // font is used.
                 let fres = match font.get(b"Resources") {
                     Ok(o) => {
-                        if let Some(id) = entry.and_then(|e| e.as_reference().ok()) {
-                            self.hold(id)?;
-                        }
-                        Rc::new(pdf.resolved_dict(Some(o)))
+                        let at = match entry.and_then(|e| e.as_reference().ok()) {
+                            Some(id) => {
+                                self.hold(id)?;
+                                Source::In(id)
+                            }
+                            None => Source::Font(res.1, nm.clone()),
+                        };
+                        self.res(at, o)?
                     }
                     Err(_) => res.clone(),
                 };
-                let procs = pdf.resolved_dict(font.get(b"CharProcs").ok());
-                for (_, g) in procs.iter() {
+                let procs = font.get(b"CharProcs").ok().and_then(|o| pdf.dict_of(o));
+                for (_, g) in procs.iter().flat_map(|d| d.iter()) {
                     if let Ok(id) = g.as_reference() {
                         draws.extend(self.drawing(id, &fres)?);
                     }
@@ -655,8 +805,18 @@ impl Walk<'_> {
 
 /// The drawing of the soft mask graphics state `gs` sets, if it sets one.
 pub(crate) fn mask_drawing(pdf: &Pdf, gs: &Dictionary) -> Option<ObjectId> {
-    let mask = pdf.resolved_dict(gs.get(b"SMask").ok());
-    mask.get(b"G").ok().and_then(|o| o.as_reference().ok())
+    let mask = pdf.dict_of(gs.get(b"SMask").ok()?)?;
+    mask.get(b"G").ok()?.as_reference().ok()
+}
+
+/// Entry `name` of dictionary `d`, when there is one.
+fn named<'a>(d: Option<&'a Dictionary>, name: &[u8]) -> Option<&'a Object> {
+    d?.get(name).ok()
+}
+
+/// The bytes of alternative text `alt`.
+fn text(alt: &[String]) -> u64 {
+    alt.iter().map(|a| a.len() as u64).sum()
 }
 
 /// Whether object `id` is a form XObject.
@@ -669,6 +829,14 @@ pub(crate) fn is_form(pdf: &Pdf, id: ObjectId) -> bool {
 mod tests {
     use super::*;
     use lopdf::{dictionary, Stream};
+    use std::cell::Cell;
+
+    thread_local! {
+        /// Sets of resources told apart on this thread.
+        pub(super) static TOLD: Cell<usize> = const { Cell::new(0) };
+        /// Pages' content read on this thread.
+        pub(super) static PAGES_READ: Cell<usize> = const { Cell::new(0) };
+    }
 
     /// A page drawing `Fm`, a form drawing itself without resources of its own, and `Fm2`,
     /// with its own, drawing itself through them.
@@ -742,6 +910,226 @@ mod tests {
             assert!(s.is_some());
             assert!(Rc::ptr_eq(r, &listed[0].1));
         }
+    }
+
+    /// Two pages whose resources print alike (lopdf's `Debug`): the first's forms are `Fm` and
+    /// one named `A h 0 R/B`, the second's `Fm`, `A` (`h`) and `B`. Both draw `Fm`, a form
+    /// without resources drawing `/A`, so only from the second page does it draw `h`. Returns
+    /// `h`.
+    fn printing_alike() -> (Pdf, ObjectId) {
+        let mut p = Pdf::new();
+        let mut form = |content: &[u8]| {
+            let d = dictionary! { "Type" => "XObject", "Subtype" => "Form" };
+            p.doc.add_object(Stream::new(d, content.to_vec()))
+        };
+        let (fm, h, v) = (form(b"/A Do"), form(b"0 0 9 9 re f"), form(b""));
+        let first = dictionary! { "Fm" => fm, format!("A {} 0 R/B", h.0) => v };
+        let second = dictionary! { "Fm" => fm, "A" => h, "B" => v };
+        for (i, forms) in [first, second].into_iter().enumerate() {
+            p.insert_blank(i, 300.0, 200.0).unwrap();
+            let content = Stream::new(Dictionary::new(), b"/Fm Do".to_vec());
+            let content = p.doc.add_object(content);
+            let page = p.page_ids()[i];
+            let d = p.doc.get_dictionary_mut(page).unwrap();
+            d.set("Contents", content);
+            d.set("Resources", dictionary! { "XObject" => forms });
+        }
+        (p, h)
+    }
+
+    /// Resources that print alike are told apart: the form without resources is followed with
+    /// each page's, so both walks reach `h` from the second page.
+    #[test]
+    fn resources_that_print_alike_are_told_apart() {
+        let (p, h) = printing_alike();
+        let reach = p.reach(&mut work(), &mut Decoded::new()).unwrap();
+        let listed = p.reach_listed(&mut work()).unwrap();
+        let reached = (
+            reach.drawn.contains(&h),
+            listed.iter().any(|(s, _)| *s == Some(h)),
+        );
+        assert_eq!(reached, (true, true));
+    }
+
+    /// A page whose resources list `n` forms without resources of their own, all drawn, and a
+    /// string `/Junk` of `junk` bytes.
+    fn many_forms(n: usize, junk: usize) -> Pdf {
+        let mut p = Pdf::new();
+        p.insert_blank(0, 300.0, 200.0).unwrap();
+        let mut forms = Dictionary::new();
+        let mut content = String::new();
+        for i in 0..n {
+            let d = dictionary! { "Type" => "XObject", "Subtype" => "Form" };
+            let form = p.doc.add_object(Stream::new(d, b"0 0 9 9 re f".to_vec()));
+            forms.set(format!("Fm{i}"), form);
+            content += &format!("/Fm{i} Do ");
+        }
+        let content = p
+            .doc
+            .add_object(Stream::new(Dictionary::new(), content.into_bytes()));
+        let page = p.page_ids()[0];
+        let d = p.doc.get_dictionary_mut(page).unwrap();
+        d.set("Contents", content);
+        d.set(
+            "Resources",
+            dictionary! { "XObject" => forms, "Junk" => Object::string_literal(vec![b'x'; junk]) },
+        );
+        p
+    }
+
+    /// The steps walking `p` takes, with `listed` as [`Pdf::reach_listed`].
+    fn walked(p: &Pdf, listed: bool) -> u64 {
+        let mut w = work();
+        match listed {
+            true => drop(p.reach_listed(&mut w).unwrap()),
+            false => drop(p.reach(&mut w, &mut Decoded::new()).unwrap()),
+        }
+        w.taken()
+    }
+
+    /// Resources are told apart once, as they are read, however often the drawings without
+    /// their own are reached with them, in both walks; and that is charged a step per KiB of
+    /// them, which a long string makes many. For each walk: how much more often they are told
+    /// apart for 2,000 forms than for one, and the steps 16 KiB more of them take.
+    #[test]
+    fn resources_are_told_apart_once_and_charged_what_it_takes() {
+        let got = [false, true].map(|listed| {
+            let told = |n| {
+                let p = many_forms(n, 1);
+                TOLD.set(0);
+                walked(&p, listed);
+                TOLD.get()
+            };
+            let more = walked(&many_forms(1, 16 << 10), listed) - walked(&many_forms(1, 1), listed);
+            (told(2_000) - told(1), more)
+        });
+        assert_eq!(got, [(0, 16), (0, 16)]);
+    }
+
+    /// A page drawing `n` forms that draw nothing, all with the same resources of their own
+    /// as the page's: an object listing every form, through an `/XObject` dictionary of its
+    /// own.
+    fn sharing_resources(n: usize) -> Pdf {
+        let mut p = Pdf::new();
+        p.insert_blank(0, 300.0, 200.0).unwrap();
+        let (res, list) = (p.doc.new_object_id(), p.doc.new_object_id());
+        let mut forms = Dictionary::new();
+        let mut content = String::new();
+        for i in 0..n {
+            let d = dictionary! { "Type" => "XObject", "Subtype" => "Form", "Resources" => res };
+            let form = p.doc.add_object(Stream::new(d, b"0 0 9 9 re f".to_vec()));
+            forms.set(format!("Fm{i}"), form);
+            content += &format!("/Fm{i} Do ");
+        }
+        p.doc.objects.insert(list, forms.into());
+        p.doc
+            .objects
+            .insert(res, dictionary! { "XObject" => list }.into());
+        let content = p
+            .doc
+            .add_object(Stream::new(Dictionary::new(), content.into_bytes()));
+        let page = p.page_ids()[0];
+        let d = p.doc.get_dictionary_mut(page).unwrap();
+        d.set("Contents", content);
+        d.set("Resources", res);
+        p
+    }
+
+    /// Resources that drawings share are read once, and what they list is looked into where
+    /// it is, not copied for each drawing. For each walk: how many more times resources are
+    /// read, and dictionary entries copied, for 2,000 forms sharing them than for one.
+    #[test]
+    fn resources_shared_by_drawings_are_read_once_and_not_copied() {
+        let got = [false, true].map(|listed| {
+            let count = |n| {
+                let p = sharing_resources(n);
+                TOLD.set(0);
+                crate::overlay::COPIED.set(0);
+                walked(&p, listed);
+                (TOLD.get(), crate::overlay::COPIED.get())
+            };
+            let (many, one) = (count(2_000), count(1));
+            (many.0 - one.0, many.1 - one.1)
+        });
+        assert_eq!(got, [(0, 0), (0, 0)]);
+    }
+
+    /// A page marking content with properties its resources list, `/P`, and with properties
+    /// written in the content, each with alternative text of `n` bytes.
+    fn marked(n: usize) -> Pdf {
+        let mut p = Pdf::new();
+        p.insert_blank(0, 300.0, 200.0).unwrap();
+        let text = "x".repeat(n);
+        let content = format!("/Span /P BDC EMC /Span << /ActualText ({text}) >> BDC EMC");
+        let content = p
+            .doc
+            .add_object(Stream::new(Dictionary::new(), content.into_bytes()));
+        let alt = dictionary! { "ActualText" => Object::string_literal(text) };
+        let page = p.page_ids()[0];
+        let d = p.doc.get_dictionary_mut(page).unwrap();
+        d.set("Contents", content);
+        d.set(
+            "Resources",
+            dictionary! { "Properties" => dictionary! { "P" => alt } },
+        );
+        p
+    }
+
+    /// What a walk keeps of marked content is charged a step per KiB: the properties written
+    /// in the resources, and the alternative text read from them and from the content. For
+    /// each walk, the steps 16 KiB more of each take; the listed walk doesn't read content.
+    #[test]
+    fn marked_content_kept_is_charged_what_it_takes() {
+        let got = [false, true]
+            .map(|listed| walked(&marked(16 << 10), listed) - walked(&marked(1), listed));
+        assert_eq!(got, [64, 48]);
+    }
+
+    /// `n` pages drawing the same content: a stream each page's `/Contents` names, with `how`
+    /// 0; an array of its own listing the stream, with 1; that array written in each page,
+    /// with 2.
+    fn sharing_content(n: usize, how: usize) -> Pdf {
+        let mut p = Pdf::new();
+        p.insert_blank(0, 300.0, 200.0).unwrap();
+        let page = p.page_ids()[0];
+        let content = p
+            .doc
+            .add_object(Stream::new(Dictionary::new(), b"0 0 9 9 re f".to_vec()));
+        let list = p.doc.add_object(vec![content.into()]);
+        let contents: Object = match how {
+            0 => content.into(),
+            1 => list.into(),
+            _ => vec![content.into()].into(),
+        };
+        let d = p.doc.get_dictionary_mut(page).unwrap();
+        d.set("Contents", contents);
+        let d = d.clone();
+        let tree = d.get(b"Parent").and_then(Object::as_reference).unwrap();
+        let kids: Vec<Object> = std::iter::once(page.into())
+            .chain((1..n).map(|_| p.doc.add_object(d.clone()).into()))
+            .collect();
+        let t = p.doc.get_dictionary_mut(tree).unwrap();
+        t.set("Kids", kids);
+        t.set("Count", n as i64);
+        p
+    }
+
+    /// Pages sharing their content read it once a walk, whether they name its stream, an
+    /// array listing it, or write that array themselves: for each, how many more times
+    /// content is read for 2,000 pages than for one.
+    #[test]
+    fn content_pages_share_is_read_once_a_walk() {
+        let got = [0, 1, 2].map(|how| {
+            let read = |n| {
+                let p = sharing_content(n, how);
+                assert_eq!(p.page_ids().len(), n);
+                PAGES_READ.set(0);
+                walked(&p, false);
+                PAGES_READ.get()
+            };
+            read(2_000) - read(1)
+        });
+        assert_eq!(got, [0, 0, 0]);
     }
 
     #[test]

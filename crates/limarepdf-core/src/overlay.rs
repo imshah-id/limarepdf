@@ -263,10 +263,13 @@ impl Pdf {
     }
 
     pub(crate) fn resolved_dict(&self, o: Option<&Object>) -> Dictionary {
-        o.and_then(|o| self.doc.dereference(o).ok())
+        let d = (o.and_then(|o| self.doc.dereference(o).ok()))
             .and_then(|(_, o)| o.as_dict().ok())
             .cloned()
-            .unwrap_or_default()
+            .unwrap_or_default();
+        #[cfg(test)]
+        COPIED.set(COPIED.get() + d.len());
+        d
     }
 
     /// Wrap the page's existing content in q/Q, so that it leaves the graphics state as
@@ -473,6 +476,12 @@ pub(crate) fn utc_now() -> [i64; 6] {
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = if m <= 2 { y + 1 } else { y };
     [y, m, d, t / 3600, t % 3600 / 60, t % 60]
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Dictionary entries [`Pdf::resolved_dict`] copied on this thread.
+    pub(crate) static COPIED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]

@@ -178,7 +178,8 @@ impl Pdf {
         }
         let catalog = out.add_object(catalog);
         out.trailer.set("Root", catalog);
-        // Those without a look of their own get LimarePDF's, as the app's pages draw them.
+        // Those without a look of their own get LimarePDF's, as the app's pages draw them,
+        // as far as the budget goes.
         let undrawn: Vec<ObjectId> = (annots.iter().map(|(id, _)| *id))
             .filter(|id| missing.contains(id))
             .collect();
@@ -189,7 +190,7 @@ impl Pdf {
                 doc: out,
                 ..Pdf::new()
             };
-            alone.draw_annotations(&undrawn);
+            alone.draw_shown(&undrawn);
             alone.doc
         };
         crate::unfillable::leave_out(&mut out);

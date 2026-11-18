@@ -248,36 +248,34 @@ impl Pdf {
     pub(crate) fn orphan_widgets(&self, nodes: &[(ObjectId, bool)]) -> Result<Vec<Vec<ObjectId>>> {
         let listed: std::collections::HashSet<ObjectId> = nodes.iter().map(|n| n.0).collect();
         let mut out = Vec::new();
-        for page in self.page_ids() {
-            for a in self.all_annot_refs(page) {
-                let Ok(d) = self.doc.get_dictionary(a) else {
-                    continue;
-                };
-                let widget = d.get(b"Subtype").and_then(|o| o.as_name()).ok() == Some(b"Widget");
-                if !widget || listed.contains(&a) {
-                    continue;
-                }
-                let ft = self.inherited(a, b"FT");
-                if ft.as_ref().and_then(|o| o.as_name().ok()) == Some(b"Sig") {
-                    continue;
-                }
-                let mut chain = vec![a];
-                while let Some(p) = chain.last().and_then(|&c| {
-                    let d = self.doc.get_dictionary(c).ok()?;
-                    d.get(b"Parent").ok()?.as_reference().ok()
-                }) {
-                    if chain.contains(&p) {
-                        break;
-                    }
-                    // The widget and its parents, the top one at most MAX_DEPTH above the
-                    // widget's own field, as for a listed field (PB-05).
-                    if chain.len() > MAX_DEPTH + 1 {
-                        bail!("the form's fields are nested more than {MAX_DEPTH} deep");
-                    }
-                    chain.push(p);
-                }
-                out.push(chain);
+        for (_, a) in self.listed_annots(&self.page_ids()) {
+            let Ok(d) = self.doc.get_dictionary(a) else {
+                continue;
+            };
+            let widget = d.get(b"Subtype").and_then(|o| o.as_name()).ok() == Some(b"Widget");
+            if !widget || listed.contains(&a) {
+                continue;
             }
+            let ft = self.inherited(a, b"FT");
+            if ft.as_ref().and_then(|o| self.name_value(o)) == Some(b"Sig") {
+                continue;
+            }
+            let mut chain = vec![a];
+            while let Some(p) = chain.last().and_then(|&c| {
+                let d = self.doc.get_dictionary(c).ok()?;
+                d.get(b"Parent").ok()?.as_reference().ok()
+            }) {
+                if chain.contains(&p) {
+                    break;
+                }
+                // The widget and its parents, the top one at most MAX_DEPTH above the
+                // widget's own field, as for a listed field (PB-05).
+                if chain.len() > MAX_DEPTH + 1 {
+                    bail!("the form's fields are nested more than {MAX_DEPTH} deep");
+                }
+                chain.push(p);
+            }
+            out.push(chain);
         }
         Ok(out)
     }
@@ -290,13 +288,14 @@ impl Pdf {
             .inherited(id, b"Ff")
             .and_then(|o| self.int_value(&o))
             .unwrap_or(0);
-        match self.inherited(id, b"FT").as_ref().map(|o| o.as_name()) {
-            Some(Ok(b"Btn")) if ff & (1 << 16) == 0 => {
+        let ft = self.inherited(id, b"FT");
+        match ft.as_ref().and_then(|o| self.name_value(o)) {
+            Some(b"Btn") if ff & (1 << 16) == 0 => {
                 if let Ok(d) = self.doc.get_dictionary_mut(id) {
                     d.set("AS", "Off");
                 }
             }
-            Some(Ok(b"Tx" | b"Ch")) => undrawn.push(id),
+            Some(b"Tx" | b"Ch") => undrawn.push(id),
             _ => {}
         }
     }

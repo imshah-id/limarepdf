@@ -206,8 +206,19 @@ impl Pdf {
         if q.is_empty() {
             return Ok(Vec::new());
         }
-        let page = PageText::read(self, self.page_id_at(page_index)?)?;
-        Ok(find_on(page_index, &page, None, false, &q, 0)
+        self.text_matches_of(page_index, self.page_id_at(page_index)?, &q)
+    }
+
+    /// [`Pdf::find_text_matches`] of `q` (not empty) on page `page_index`, the object
+    /// `page`: for a loop over pages, which finds them once.
+    pub(crate) fn text_matches_of(
+        &self,
+        page_index: usize,
+        page: ObjectId,
+        q: &Query,
+    ) -> Result<Vec<Vec<[f32; 4]>>> {
+        let page = PageText::read(self, page)?;
+        Ok(find_on(page_index, &page, None, false, q, 0)
             .into_iter()
             .map(|f| f.hit.boxes.into_iter().map(|(_, b)| b).collect::<Vec<_>>())
             .filter(|b| !b.is_empty())

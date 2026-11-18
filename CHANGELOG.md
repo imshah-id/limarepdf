@@ -71,9 +71,16 @@
 - The Comments view's search box says "Search", which fits in it. Before, "Search comments" was cut off. A screen
   reader still calls it Search comments.
 - The redaction notice and the Redact tool's pane count marks: "2 marks for redaction (outlined in red) aren't
-  applied yet". A mark over several lines is one. Before, they counted areas, so one mark over three lines was
-  "3 areas". Fill and sign's notice says "3 items you put down" for a signature, a date and a tick. Before, it said
-  "3 signatures and other items" whatever they were.
+  applied yet". A mark over several lines is one, and so is a mark several pages share, as the Comments view lists
+  it. The questions before saving and before applying the marks count them the same way. Before, they counted
+  areas, so one mark over three lines was "3 areas", and a shared mark counted once for each page. Fill and sign's
+  notice says "3 items you put down" for a signature, a date and a tick. Before, it said "3 signatures and other
+  items" whatever they were.
+- Redaction marks another app wrote into a page's list of comments, rather than as objects of their own as PDF
+  asks, are counted with the others: the redaction notice and the questions before saving and before applying
+  count them. Before, they weren't counted. With only such marks in a file, **Apply redactions** was greyed and
+  saving didn't ask, though `limarepdf-cli redact --apply` applied them; alongside other marks, the questions
+  counted fewer marks than were then applied.
 - The inspector's edge takes a drag from a press on its line, or just onto the pages, as from the panel's side.
   Before, the pages' scroll bar lay over that part of it, so such a press went to the pages.
 - While you type in a form field, the inspector stays headed **Document**, or the selected pages, as what it shows
@@ -507,9 +514,18 @@
   there; changed, it is saved with the box around it. Redacting where it is drawn removes it, as redacting over its
   box does. Before, it was framed at its box, and redaction kept it, with its comment, unless the marks also
   covered its box; other readers drew it over the black.
+- On long documents, finding a word to redact, redacting many pages, Apply redactions, Remove hidden information,
+  listing and flattening a form's fields, Recognise text, Optimise scanned pages, signing, removing many links from
+  a page, and reading the words that paragraph editing joins hyphens by take time in step with the number of
+  pages. Before, each found every page by counting through the document's pages again, so the time grew with the
+  square of the page count: on 10,000 pages, finding a word to redact (`limarepdf-cli redact --text`) took 14.5
+  seconds; now 0.16.
 
 ### Changed
 
+- The Linux builds, the `.deb` and the `.rpm` need glibc 2.43 or later (Ubuntu 26.04, Fedora 44 and later), as
+  they are now built on Ubuntu 26.04; before, 2.39. On an older system, Debian 13 and Ubuntu 24.04 among them,
+  the package repository keeps the version installed now, and newer ones have to be built from source.
 - Building LimarePDF needs the latest stable Rust (`rustup update stable`); older versions aren't supported. The
   package no longer names a minimum Rust version.
 - Redaction, Reduce file size and Save all images follow drawings inside drawings as deep as reading a page's text

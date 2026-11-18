@@ -3,8 +3,9 @@
 //! kept per comment as drafts, with app.rs's helpers.
 
 use super::*;
+use crate::editor::TOO_LARGE;
 use egui::accesskit::{Node, Role, Toggled, TreeUpdate};
-use limarepdf_core::{Annot, AnnotKind};
+use limarepdf_core::{budget_seam, Annot, AnnotKind};
 
 fn test_ctx() -> egui::Context {
     let ctx = egui::Context::default();
@@ -697,6 +698,36 @@ fn the_filter_shows_comments_by_type_author_and_page() {
     assert_eq!(count(&tree).as_deref(), Some("3 of 5 comments"));
 }
 
+/// A comment two pages list, the second sharing the first's `/Annots`, is listed once, on
+/// the first, and This page shows it on either: on the second as one that page lists, which
+/// Next goes to from nothing selected there.
+#[test]
+fn this_page_shows_a_comment_an_earlier_page_also_lists() {
+    let ctx = test_ctx();
+    let ty = Typist::new(&ctx);
+    let mut pdf = blank(2);
+    let one = note(&mut pdf, 0, 100.0, "Walrus one", "Tester");
+    let ids = pdf.page_ids();
+    let page = pdf.doc.get_dictionary(ids[0]).unwrap();
+    let list = page.get(b"Annots").unwrap();
+    let list = pdf.doc.dereference(list).unwrap().1.clone();
+    let list = pdf.doc.add_object(list);
+    for page in ids {
+        let page = pdf.doc.get_dictionary_mut(page).unwrap();
+        page.set("Annots", list);
+    }
+    let mut app = comments_tab(&ty, pdf);
+    let tree = calm(&mut app, &ty);
+    assert_eq!(listed(&tree), ["Walrus one"], "listed once");
+    app.tabs[0].go_to(1);
+    open_filter(&mut app, &ty);
+    let tree = tick(&mut app, &ty, "This page", Role::RadioButton);
+    assert_eq!(listed(&tree), ["Walrus one"], "This page");
+    close_filter(&mut app, &ty);
+    let said = run(&mut app, &ty, Act::NextComment);
+    assert_eq!((said, chosen(&app)), (None, Some(one)), "Next from nothing");
+}
+
 /// PB-41: the search box's hint is whole at the side panel's width, beside Filter: it is
 /// "Search" alone, as the box is in the Comments view; a screen reader still hears "Search
 /// comments".
@@ -1107,6 +1138,69 @@ fn deleted_comments_take_their_cards_away() {
         ["Walrus one", "Walrus two"],
         "its card stayed"
     );
+}
+
+/// A page with the notes "Walrus one" and "Walrus two", and one step short of what reading
+/// both takes: listed within it, the second is unread ([`Annot::unread`]). The second's id.
+fn past_reading() -> (Pdf, (u32, u16), u64) {
+    let mut pdf = blank(1);
+    note(&mut pdf, 0, 100.0, "Walrus one", "Tester");
+    let two = note(&mut pdf, 0, 300.0, "Walrus two", "Tester");
+    let (_, taken) = budget_seam::with_limit(u64::MAX, || pdf.annotations());
+    let short = taken[1] - 1;
+    let (listed, _) = budget_seam::with_limit(short, || pdf.annotations());
+    let unread: Vec<bool> = listed.iter().map(|a| a.unread).collect();
+    assert_eq!((unread, listed[1].id), (vec![false, true], two));
+    (pdf, two, short)
+}
+
+/// 5a.3c (Q1): a comment listed past the budget for reading the annotations says it is too
+/// large to show, on its card and in the inspector, which offers nothing to change it with.
+#[test]
+fn a_comment_too_large_to_show_says_so_and_cant_be_changed() {
+    let ctx = test_ctx();
+    let ty = Typist::new(&ctx);
+    let (pdf, two, short) = past_reading();
+    budget_seam::with_limit(short, || {
+        let mut app = comments_tab(&ty, pdf);
+        let tree = calm(&mut app, &ty);
+        assert_eq!(listed(&tree), ["Walrus one", TOO_LARGE]);
+        let tree = click_card(&mut app, &ty, TOO_LARGE);
+        assert_eq!(chosen(&app), Some(two));
+        let says = inspector_says(&tree);
+        let note = format!("{TOO_LARGE}: can't be changed.");
+        let changes = ["Colour", "Opacity", "Comment"].map(|n| says.iter().any(|s| s == n));
+        let delete = says.iter().any(|s| s == "Delete");
+        let seen = (says.contains(&note), changes, delete);
+        assert_eq!(seen, (true, [false; 3], true), "{says:?}");
+    });
+}
+
+/// 5a.3c: a comment listed past the budget for reading the annotations is deleted, on the
+/// page and from its card's menu, reading no other.
+#[test]
+fn a_comment_too_large_to_show_is_deleted() {
+    let ctx = test_ctx();
+    let ty = Typist::new(&ctx);
+    let (pdf, two, short) = past_reading();
+    budget_seam::with_limit(short, || {
+        let mut app = comments_tab(&ty, pdf);
+        // On the page, selected there.
+        app.tabs[0].ed.selection = Selection::Annot { page: 0, id: two };
+        calm(&mut app, &ty);
+        app.act(&ctx, Act::DeleteSelection);
+        calm(&mut app, &ty);
+        assert_eq!(comments(&app), ["Walrus one"], "not deleted on the page");
+        app.act(&ctx, Act::Undo);
+        let tree = calm(&mut app, &ty);
+        // From its card's menu.
+        let c = card(&tree, TOO_LARGE).expect("its card");
+        let tree = right_click(&mut app, &ty, c.spot());
+        let p = nearest(&tree, "Delete", c.spot()).expect("no Delete in its menu");
+        let tree = tap(&mut app, &ty, p);
+        assert_eq!(comments(&app), ["Walrus one"], "not deleted");
+        assert_eq!(listed(&tree), ["Walrus one"], "its card stayed");
+    });
 }
 
 // ------------------------------------------------ drafts (Q1)

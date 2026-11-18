@@ -471,7 +471,7 @@ fn three_pages() -> Pdf {
 fn every_picture_is_named_by_page_and_number_once() {
     let p = three_pages();
     assert_eq!(
-        p.picture_names("report"),
+        p.picture_names("report").unwrap(),
         [
             "report-page-001-image-1.jpg",
             "report-page-002-image-1.png",
@@ -479,7 +479,7 @@ fn every_picture_is_named_by_page_and_number_once() {
             "report-page-003-image-2.jpg",
         ]
     );
-    assert!(pages(2).picture_names("empty").is_empty());
+    assert!(pages(2).picture_names("empty").unwrap().is_empty());
 }
 
 #[test]
@@ -492,7 +492,7 @@ fn every_picture_is_saved_to_a_folder() {
     let names: Vec<String> = (done.written.iter())
         .map(|f| f.file_name().unwrap().to_string_lossy().into_owned())
         .collect();
-    assert_eq!(names, p.picture_names("report"));
+    assert_eq!(names, p.picture_names("report").unwrap());
     // The logo and the photo as they are; the drawing's picture with its own pixels.
     assert_eq!(std::fs::read(&done.written[0]).unwrap(), jpeg(30, 20));
     assert_eq!(std::fs::read(&done.written[2]).unwrap(), jpeg(80, 40));

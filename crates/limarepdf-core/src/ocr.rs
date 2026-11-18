@@ -15,6 +15,7 @@ use image::GrayImage;
 use ocrs::{ImageSource, OcrEngine, OcrEngineParams, TextItem};
 use rayon::prelude::*;
 use rten_imageproc::{RectF, RotatedRect};
+use std::collections::HashMap;
 use std::fmt::Write;
 
 /// Resolution pages are rendered at for recognition.
@@ -139,13 +140,14 @@ impl Pdf {
     /// twice adds nothing. Run [`Pdf::optimize_scans`] first if wanted: it does not
     /// straighten pages that have text.
     pub fn ocr_pages(&mut self, pages: &[usize], ocr: &Ocr) -> Result<Vec<(usize, OcrResult)>> {
-        if let Some(&bad) = pages.iter().find(|&&p| p >= self.page_count()) {
+        let ids = self.page_ids();
+        if let Some(&bad) = pages.iter().find(|&&p| p >= ids.len()) {
             bail!("no page {}", bad + 1);
         }
         let mut todo = Vec::new();
         let mut out: Vec<(usize, OcrResult)> = Vec::new();
         for &p in pages {
-            match self.parse_page(p) {
+            match self.parse_page_of(ids[p]) {
                 Ok(parsed) if parsed.shows_text() => {
                     out.push((p, OcrResult::Skipped("the page already has text".into())))
                 }
@@ -183,7 +185,7 @@ impl Pdf {
                 Err(why) => OcrResult::Skipped(why),
                 Ok((lines, _)) if lines.is_empty() => OcrResult::Skipped("no text found".into()),
                 Ok((lines, scale)) => {
-                    let page = self.page_id_at(p)?;
+                    let page = ids[p];
                     let font = *font.get_or_insert_with(|| self.make_font());
                     let font_nm = self.add_resource(page, "Font", FONT_PREFIX, font.into())?;
                     let layer = self.text_layer(page, &lines, scale, &font_nm);
@@ -196,7 +198,11 @@ impl Pdf {
             };
             out.push((p, result));
         }
-        out.sort_by_key(|(p, _)| pages.iter().position(|q| q == p));
+        // In the order asked, a page asked twice where it was first.
+        let first: HashMap<usize, usize> = (pages.iter().enumerate().rev())
+            .map(|(i, &p)| (p, i))
+            .collect();
+        out.sort_by_key(|(p, _)| first.get(p).copied());
         Ok(out)
     }
 

@@ -11,8 +11,10 @@
 //! Text, fonts, form fields, comments and the pages' content are never changed; only the
 //! pictures' objects and, for a new one, the names in a page's resources.
 
+use crate::budget::{self, Work};
 use crate::imgs::Space;
 use crate::matrix::{self as mx, M};
+use crate::objects::STEPS;
 use crate::redact_img::{self, Codec, Samples};
 use crate::{Pdf, Result};
 use image::imageops::FilterType;
@@ -220,6 +222,14 @@ struct Res {
     home: ObjectId,
 }
 
+/// Where a page's walk is: the drawings being walked, outermost first, and the page's
+/// budget, a step for each operator and each drawing followed, and for each kilobyte of
+/// content read.
+struct Inside {
+    forms: Vec<ObjectId>,
+    work: Work,
+}
+
 impl Pdf {
     /// Reduce the pictures drawn on `pages` (0-based) as `opts` says. One change to the
     /// document; nothing else on the pages changes.
@@ -239,7 +249,7 @@ impl Pdf {
         }
         // Every page is walked: a picture also drawn on a page not chosen keeps its original
         // there.
-        let walk = self.walk_pages();
+        let walk = self.walk_pages()?;
         for (page, n) in &walk.inline {
             if chosen.contains(page) {
                 *report.kept.entry(KeptWhy::Inline).or_default() += n;
@@ -428,8 +438,10 @@ impl Pdf {
         })
     }
 
-    /// Every picture every page draws, in their content and the drawings it uses.
-    pub(crate) fn walk_pages(&self) -> Walk {
+    /// Every picture every page draws, in their content and the drawings it uses. Refused
+    /// ([`crate::TooComplex`]) when a page's drawings draw each other too often to follow
+    /// within its budget.
+    pub(crate) fn walk_pages(&self) -> Result<Walk> {
         let mut walk = Walk::default();
         for (i, page) in self.page_ids().into_iter().enumerate() {
             let Ok(data) = self
@@ -439,10 +451,14 @@ impl Pdf {
                 continue;
             };
             let res = self.resources_of(page, self.inherited(page, b"Resources").as_ref());
-            let mut forms = Vec::new();
-            self.walk(i, &data, res.as_ref(), mx::ID, &mut forms, &mut walk);
+            let mut inside = Inside {
+                forms: Vec::new(),
+                work: Work::new("finding the pictures", budget::limit(STEPS)),
+            };
+            inside.work.take(data.len() as u64 / 1024)?;
+            self.walk(i, &data, res.as_ref(), mx::ID, &mut inside, &mut walk)?;
         }
-        walk
+        Ok(walk)
     }
 
     /// Resources given by `o` (a dictionary or a reference to one) of the page or drawing
@@ -491,22 +507,22 @@ impl Pdf {
     }
 
     /// Record every picture `data` draws (with resources `res`, from transform `ctm`) in
-    /// `walk`, following drawings it uses (as deep as [`crate::MAX_FORM_NESTING`]); `forms`
-    /// are the drawings being walked.
+    /// `walk`, following drawings it uses (as deep as [`crate::MAX_FORM_NESTING`]), within
+    /// the page's budget.
     fn walk(
         &self,
         page: usize,
         data: &[u8],
         res: Option<&Res>,
         ctm: M,
-        forms: &mut Vec<ObjectId>,
+        inside: &mut Inside,
         walk: &mut Walk,
-    ) {
+    ) -> Result<()> {
         let Ok((data, inline)) = crate::inline::extract(data) else {
-            return;
+            return Ok(());
         };
         let Ok(content) = Content::decode(&data) else {
-            return;
+            return Ok(());
         };
         let deref = |o: &Object| -> Option<Dictionary> {
             Some(self.doc.dereference(o).ok()?.1.as_dict().ok()?.clone())
@@ -517,6 +533,7 @@ impl Pdf {
             .unwrap_or_default();
         let (mut ctm, mut stack) = (ctm, Vec::new());
         for op in &content.operations {
+            inside.work.take(1)?;
             match op.operator.as_str() {
                 "q" => stack.push(ctm),
                 "Q" => ctm = stack.pop().unwrap_or(ctm),
@@ -556,15 +573,17 @@ impl Pdf {
                                 picture: Drawn::Object(*id),
                             });
                         }
-                        Ok(b"Form") if forms.len() >= crate::MAX_FORM_NESTING => {
+                        Ok(b"Form") if inside.forms.len() >= crate::MAX_FORM_NESTING => {
                             let own = self.resources_of(*id, s.dict.get(b"Resources").ok());
                             self.unfollowed(own.as_ref().unwrap_or(res), walk);
                         }
-                        Ok(b"Form") if !forms.contains(id) => {
+                        Ok(b"Form") if !inside.forms.contains(id) => {
+                            inside.work.take(1)?;
                             let Ok(inner) = s.get_plain_content_with_limit(crate::MAX_CONTENT)
                             else {
                                 continue;
                             };
+                            inside.work.take(inner.len() as u64 / 1024)?;
                             let fm = s
                                 .dict
                                 .get(b"Matrix")
@@ -575,9 +594,16 @@ impl Pdf {
                             // with.
                             let own = self.resources_of(*id, s.dict.get(b"Resources").ok());
                             let inner_res = own.as_ref().unwrap_or(res);
-                            forms.push(*id);
-                            self.walk(page, &inner, Some(inner_res), mx::mul(fm, ctm), forms, walk);
-                            forms.pop();
+                            inside.forms.push(*id);
+                            self.walk(
+                                page,
+                                &inner,
+                                Some(inner_res),
+                                mx::mul(fm, ctm),
+                                inside,
+                                walk,
+                            )?;
+                            inside.forms.pop();
                         }
                         _ => {}
                     }
@@ -596,6 +622,7 @@ impl Pdf {
                 _ => {}
             }
         }
+        Ok(())
     }
 }
 

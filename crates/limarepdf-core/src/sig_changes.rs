@@ -16,6 +16,8 @@
 //! recognise. Links between structures (a bookmark pointing to a page, a tag pointing to an
 //! annotation) don't make the target part of the linking structure.
 
+use crate::budget;
+use crate::forms;
 use crate::sig_verify::{is_white, FieldLock, Lexer, Permissions, Tok, Versions};
 use crate::Pdf;
 use lopdf::xref::XrefEntry;
@@ -26,7 +28,7 @@ use std::fmt;
 // ---------------------------------------------------------------- report types
 
 /// Something that changed after a signature.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Change {
     pub kind: ChangeKind,
     /// The page it is on (zero-based), where it has one.
@@ -90,7 +92,7 @@ pub enum ChangeKind {
 }
 
 /// Why a change isn't allowed.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Refusal {
     /// Never allowed after signing.
     Never,
@@ -172,10 +174,13 @@ pub(crate) struct Signed<'a> {
 
 /// The changes after each signature in `sigs`, judged against the certification
 /// `certified` (the strictest level any certification in the document claims) and each
-/// signature's own locks. `versions` opens the signed versions.
+/// signature's own locks. `versions` opens the signed versions. `listed` are the fields
+/// whose signatures the report lists: a field signed after signing is allowed as signing
+/// only when it's one of them, as nothing else checks its signature.
 pub(crate) fn analyse(
     versions: &mut Versions,
     sigs: &[Signed],
+    listed: &HashSet<ObjectId>,
     certified: Option<Permissions>,
 ) -> Vec<Vec<Change>> {
     let bytes = versions.bytes;
@@ -183,7 +188,8 @@ pub(crate) fn analyse(
     let mut cache: HashMap<(usize, usize), Vec<Seen>> = HashMap::new();
     sigs.iter()
         .map(|s| {
-            let seen = changes_after(versions, bytes, s.end, &ends, &mut cache);
+            let seen = changes_after(versions, bytes, s.end, &ends, listed, &mut cache);
+            let mut once: HashSet<Change> = HashSet::new();
             let mut out: Vec<Change> = Vec::new();
             for x in seen {
                 let c = Change {
@@ -191,7 +197,7 @@ pub(crate) fn analyse(
                     kind: x.kind,
                     page: x.page,
                 };
-                if !out.contains(&c) {
+                if once.insert(c.clone()) {
                     out.push(c);
                 }
             }
@@ -202,7 +208,7 @@ pub(crate) fn analyse(
 }
 
 /// What a change needs to be allowed.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum Need {
     Never,
     /// Always allowed: validation data, metadata.
@@ -283,12 +289,13 @@ fn changes_after(
     bytes: &[u8],
     end: usize,
     sig_ends: &[usize],
+    listed: &HashSet<ObjectId>,
     cache: &mut HashMap<(usize, usize), Vec<Seen>>,
 ) -> Vec<Seen> {
     if bytes[end..].iter().all(|&c| is_white(c)) {
         return Vec::new();
     }
-    let mut out = changes_between(versions, bytes, end, sig_ends, cache);
+    let mut out = changes_between(versions, bytes, end, sig_ends, listed, cache);
     // What LimarePDF shows of the document must be what other apps show, whatever changed.
     if let Some(why) = versions.peek(bytes.len()).and_then(|p| p.differs.as_ref()) {
         if !out.iter().any(|s| s.need == Need::Never) {
@@ -311,6 +318,7 @@ fn changes_between(
     bytes: &[u8],
     end: usize,
     sig_ends: &[usize],
+    listed: &HashSet<ObjectId>,
     cache: &mut HashMap<(usize, usize), Vec<Seen>>,
 ) -> Vec<Seen> {
     let malformed = |why: String| vec![never(ChangeKind::Malformed(why), None)];
@@ -318,6 +326,21 @@ fn changes_between(
         Ok(s) => s,
         Err(why) => return malformed(why),
     };
+    // A revision ends at `at` when only white space lies between, either way round: a
+    // signature may end at "%%EOF", before the end of line a revision's end takes in. That
+    // is at most 2 bytes (`revision_end`), so a run of white space after `at` isn't looked
+    // through once for each revision ending after it.
+    let ends_at = |s: &Section, at: usize| {
+        if s.end > at + 2 {
+            return false;
+        }
+        let (lo, hi) = (s.end.min(at), s.end.max(at));
+        let white = bytes[lo..hi].iter().take_while(|&&c| is_white(c)).count();
+        #[cfg(test)]
+        tests::SCANNED.set(tests::SCANNED.get() + (white + 1).min(hi - lo));
+        white == hi - lo
+    };
+    let ends_by = |s: &Section, at: usize| s.end <= at || ends_at(s, at);
     // The versions to compare: this one, each later signed version that is one of the
     // revisions read, and the whole file.
     let mut anchors = vec![end];
@@ -325,11 +348,7 @@ fn changes_between(
         .iter()
         .copied()
         .filter(|&e| e > end && e < bytes.len())
-        .filter(|&e| {
-            sections
-                .iter()
-                .any(|s| s.end <= e && bytes[s.end..e].iter().all(|&c| is_white(c)))
-        })
+        .filter(|&e| sections.iter().any(|s| ends_at(s, e)))
         .collect();
     later.sort_unstable();
     later.dedup();
@@ -342,7 +361,7 @@ fn changes_between(
         // Newest first, as read.
         let between: Vec<&Section> = sections
             .iter()
-            .filter(|s| s.offset >= a && s.end <= b)
+            .filter(|s| s.offset >= a && ends_by(s, b))
             .collect();
         if between.is_empty() {
             continue;
@@ -353,9 +372,9 @@ fn changes_between(
         }
         let before: Vec<&Section> = sections
             .iter()
-            .filter(|s| s.offset >= end && s.end <= a)
+            .filter(|s| s.offset >= end && ends_by(s, a))
             .collect();
-        let found = compare_versions(versions, end, a, b, &before, &between);
+        let found = compare_versions(versions, end, a, b, &before, &between, listed);
         let stop = found
             .iter()
             .any(|s| matches!(s.kind, ChangeKind::Malformed(_)));
@@ -1164,6 +1183,23 @@ impl Version<'_> {
         self.resolve(o)?.as_array().ok()
     }
 
+    /// The object holding the array `o` refers to (as [`Version::resolve`] follows it);
+    /// `None` for an array written in place, or for anything else.
+    fn array_holder<'b>(&'b self, mut o: &'b Object) -> Option<ObjectId> {
+        let mut at = None;
+        for _ in 0..8 {
+            match o {
+                Object::Reference(id) => {
+                    at = Some(*id);
+                    o = self.get(*id)?;
+                }
+                Object::Array(_) => return at,
+                _ => return None,
+            }
+        }
+        None
+    }
+
     fn name<'b>(&'b self, d: &'b Dictionary, key: &[u8]) -> Option<&'b [u8]> {
         self.resolve(d.get(key).ok()?)?.as_name().ok()
     }
@@ -1184,7 +1220,7 @@ impl Version<'_> {
 
 /// Compares the version ending at `a` with the one ending at `b`. `before` are the
 /// sections between the signature's own version (ending at `sig_end`) and `a`; `between`
-/// those between `a` and `b`; both newest first.
+/// those between `a` and `b`; both newest first. `listed` as for [`analyse`].
 fn compare_versions(
     versions: &mut Versions,
     sig_end: usize,
@@ -1192,6 +1228,7 @@ fn compare_versions(
     b: usize,
     before: &[&Section],
     between: &[&Section],
+    listed: &HashSet<ObjectId>,
 ) -> Vec<Seen> {
     let malformed = |why: String| vec![never(ChangeKind::Malformed(why), None)];
     let bytes = versions.bytes;
@@ -1215,6 +1252,16 @@ fn compare_versions(
             .map(|(n, _)| *n)
             .collect()
     };
+    // Object 0 heads the list of free objects, so no revision may list it in use, even when
+    // a later one frees it again: lopdf keeps the object an entry's bytes name, so one
+    // pointing at the signed bytes of another object brings back that old copy.
+    let zero_in_use = between
+        .iter()
+        .flat_map(|s| &s.entries)
+        .any(|&(num, e)| num == 0 && e != Entry::Free);
+    if zero_in_use {
+        return malformed("LimarePDF can't read object 0 reliably".into());
+    }
     let newest = effective(between);
     // Frees before `a`, unless `between` reuses the number.
     let old_freed = freed(&effective(before));
@@ -1287,10 +1334,12 @@ fn compare_versions(
             return malformed(format!("LimarePDF can't read object {num} reliably"));
         }
     }
-    // Everything else reads as before, except objects held in a rewritten object stream.
+    // Everything else reads as before, except objects held in a rewritten object stream, and
+    // object 0, which lopdf lists as free after reading a table but not a stream (an object
+    // 0 it reads is still compared below).
     let nums: BTreeSet<u32> = old_table.keys().chain(new_table.keys()).copied().collect();
     for num in nums {
-        if newest.contains_key(&num) {
+        if num == 0 || newest.contains_key(&num) {
             continue;
         }
         let (o, n) = (old_table.get(&num), new_table.get(&num));
@@ -1333,7 +1382,9 @@ fn compare_versions(
         new: &new,
         or: &old_roles,
         nr: &new_roles,
+        listed,
         out: Vec::new(),
+        pushed: HashSet::new(),
     };
     j.trailer();
     j.pages();
@@ -1385,6 +1436,8 @@ fn same_entry(a: &XrefEntry, b: &XrefEntry) -> bool {
 /// Objects equal in value: how a string is written (literal or hex) and where a stream
 /// sits in the file don't count. Acrobat rewrites strings in its own way when saving.
 fn same_object(a: &Object, b: &Object) -> bool {
+    #[cfg(test)]
+    tests::COMPARED.set(tests::COMPARED.get() + 1);
     same_at(a, b, 0)
 }
 
@@ -1481,6 +1534,12 @@ enum Kind {
 struct FieldInfo {
     name: String,
     parent: Option<ObjectId>,
+    /// The top of its field tree.
+    root: ObjectId,
+    /// The field it is part of: itself when titled, else its parent's (a widget kid's field).
+    field: ObjectId,
+    /// It has a kind, by its own or an inherited `/FT` ([`crate::forms::of_a_kind`]).
+    typed: bool,
     sig: bool,
     /// For a signature field: it holds a signature.
     signed: bool,
@@ -1490,10 +1549,26 @@ struct FieldInfo {
     visible: bool,
 }
 
-/// The most nodes walked in the page tree or the form, and the most steps assigning
-/// roles; beyond that the document is refused as too complex to check.
+impl FieldInfo {
+    /// Its name, copied for a change found.
+    fn copied_name(&self) -> String {
+        #[cfg(test)]
+        tests::NAMES_COPIED.set(tests::NAMES_COPIED.get() + 1);
+        self.name.clone()
+    }
+}
+
+/// The most nodes walked in the page tree or the form, and the most steps walking them (a
+/// kid listed, or 64 bytes of a field's name), assigning roles or comparing a version's
+/// annotation lists with the next's (and showing their changes on each page); beyond that
+/// the document is refused as too complex to check.
 const MAX_NODES: usize = 500_000;
 const MAX_STEPS: usize = 4_000_000;
+
+/// [`MAX_STEPS`], or a test's limit ([`budget::limit`]).
+fn max_steps() -> usize {
+    budget::limit(MAX_STEPS as u64) as usize
+}
 
 /// Keys that link to an annotation or field elsewhere without containing it.
 const LINK_KEYS: [&[u8]; 12] = [
@@ -1507,11 +1582,16 @@ struct Roles {
     pages: Vec<ObjectId>,
     page_nodes: HashSet<ObjectId>,
     page_index: HashMap<ObjectId, usize>,
-    /// Each leaf page's `/Annots` entries.
-    page_annots: HashMap<ObjectId, Vec<Object>>,
+    /// Each `/Annots` list once (one several pages share is kept once), and each leaf
+    /// page's list in it.
+    annot_lists: Vec<Vec<Object>>,
+    page_annots: HashMap<ObjectId, usize>,
     /// Indirect annotations and the page listing them.
     annots: HashMap<ObjectId, usize>,
     fields: BTreeMap<ObjectId, FieldInfo>,
+    /// Each listing of a field by another than the one it's named by: the field and the field
+    /// listing it, or none for `/Fields`.
+    again: BTreeSet<(ObjectId, Option<ObjectId>)>,
 }
 
 impl Roles {
@@ -1535,20 +1615,28 @@ impl Roles {
             pages: Vec::new(),
             page_nodes: HashSet::new(),
             page_index: HashMap::new(),
+            annot_lists: Vec::new(),
             page_annots: HashMap::new(),
             annots: HashMap::new(),
             fields: BTreeMap::new(),
+            again: BTreeSet::new(),
         };
 
+        // Each kid the page tree or the form lists is a step, so a list many nodes share costs
+        // its length each time, and so is each 64 bytes of a field's name; nesting is not
+        // limited.
+        let limit = max_steps();
+        let mut steps = 0;
+
         // The page tree.
-        let mut stack: Vec<(ObjectId, usize)> = cat
+        let mut stack: Vec<ObjectId> = cat
             .get(b"Pages")
             .ok()
             .and_then(|o| o.as_reference().ok())
-            .map(|id| vec![(id, 0)])
+            .map(|id| vec![id])
             .unwrap_or_default();
-        while let Some((id, depth)) = stack.pop() {
-            if depth > 64 || !r.page_nodes.insert(id) {
+        while let Some(id) = stack.pop() {
+            if !r.page_nodes.insert(id) {
                 continue;
             }
             if r.page_nodes.len() > MAX_NODES {
@@ -1560,9 +1648,13 @@ impl Roles {
             let kids = d.get(b"Kids").ok().and_then(|k| v.array(k));
             match kids {
                 Some(kids) if v.name(d, b"Type") != Some(b"Page") => {
+                    steps += kids.len();
+                    if steps > limit {
+                        return Err(too_complex());
+                    }
                     for k in kids.iter().rev() {
                         if let Ok(k) = k.as_reference() {
-                            stack.push((k, depth + 1));
+                            stack.push(k);
                         }
                     }
                 }
@@ -1572,19 +1664,23 @@ impl Roles {
                 }
             }
         }
+        // Each list once, at the first page that has it: one written into the page is the
+        // page's own.
+        let mut lists: HashMap<ObjectId, usize> = HashMap::new();
         for (i, &page) in r.pages.iter().enumerate() {
-            let entries = v
-                .dict_of(page)
-                .and_then(|d| d.get(b"Annots").ok())
-                .and_then(|a| v.array(a))
-                .cloned()
-                .unwrap_or_default();
-            for e in &entries {
-                if let Ok(id) = e.as_reference() {
-                    r.annots.entry(id).or_insert(i);
+            let annots = v.dict_of(page).and_then(|d| d.get(b"Annots").ok());
+            let key = annots.and_then(|a| v.array_holder(a)).unwrap_or(page);
+            let at = *lists.entry(key).or_insert_with(|| {
+                let entries = annots.and_then(|a| v.array(a)).cloned().unwrap_or_default();
+                for e in &entries {
+                    if let Ok(id) = e.as_reference() {
+                        r.annots.entry(id).or_insert(i);
+                    }
                 }
-            }
-            r.page_annots.insert(page, entries);
+                r.annot_lists.push(entries);
+                r.annot_lists.len() - 1
+            });
+            r.page_annots.insert(page, at);
         }
 
         // The form's fields.
@@ -1594,34 +1690,59 @@ impl Roles {
             .and_then(|o| v.array(o))
             .cloned()
             .unwrap_or_default();
-        // (field, parent, depth); a parent is recorded before its kids.
-        let mut stack: Vec<(ObjectId, Option<ObjectId>, usize)> = roots
+        // (field, parent); a parent is recorded before its kids. A node is named and typed
+        // through the first node listing it, unless that gave it no kind: then through the
+        // first with a kind listing it after, as the form's reading ([`Pdf::form_nodes`])
+        // does, it and its kids recorded again, each at most once more.
+        let mut stack: Vec<(ObjectId, Option<ObjectId>)> = roots
             .iter()
             .rev()
             .filter_map(|o| o.as_reference().ok())
-            .map(|id| (id, None, 0))
+            .map(|id| (id, None))
             .collect();
-        while let Some((id, parent, depth)) = stack.pop() {
-            if depth > 32 || r.fields.contains_key(&id) {
-                continue;
-            }
-            if r.fields.len() > MAX_NODES {
-                return Err(too_complex());
-            }
+        // Whether a list of kids, which fields may share, holds a widget that shows.
+        let mut shown = HashMap::new();
+        while let Some((id, parent)) = stack.pop() {
             let Some(d) = v.dict_of(id) else {
                 continue;
             };
             let up = parent.and_then(|p| r.fields.get(&p));
+            let ft = v.name(d, b"FT");
+            let typed = match ft {
+                Some(_) => forms::of_a_kind(ft),
+                None => up.is_some_and(|p| p.typed),
+            };
+            if let Some(f) = r.fields.get(&id) {
+                let renamed = typed && !f.typed;
+                if f.parent != parent {
+                    r.again
+                        .insert((id, if renamed { f.parent } else { parent }));
+                }
+                if !renamed {
+                    continue;
+                }
+            } else if r.fields.len() > MAX_NODES {
+                return Err(too_complex());
+            }
             let partial = d.get(b"T").ok().and_then(|t| v.pdf.text_value(t));
+            let field = match (&partial, up) {
+                (None, Some(p)) => p.field,
+                _ => id,
+            };
             let name = match (partial, up) {
                 (Some(t), Some(p)) if !p.name.is_empty() => format!("{}.{t}", p.name),
                 (Some(t), _) => t,
                 (None, p) => p.map(|p| p.name.clone()).unwrap_or_default(),
             };
-            let sig = match v.name(d, b"FT") {
+            steps += name.len() / 64;
+            if steps > limit {
+                return Err(too_complex());
+            }
+            let sig = match ft {
                 Some(ft) => ft == b"Sig",
                 None => up.is_some_and(|p| p.sig),
             };
+            let root = up.map_or(id, |p| p.root);
             let value = d.get(b"V").ok().and_then(|o| v.dict(o));
             let timestamp = value.is_some_and(|s| {
                 v.name(s, b"Type") == Some(b"DocTimeStamp")
@@ -1632,16 +1753,23 @@ impl Roles {
                 FieldInfo {
                     name,
                     parent,
+                    root,
+                    field,
+                    typed,
                     sig,
                     signed: sig && value.is_some(),
                     timestamp: sig && timestamp,
-                    visible: widget_visible(v, d),
+                    visible: widget_visible(v, d, &mut shown),
                 },
             );
             if let Some(kids) = d.get(b"Kids").ok().and_then(|k| v.array(k)) {
+                steps += kids.len();
+                if steps > limit {
+                    return Err(too_complex());
+                }
                 for k in kids.iter().rev() {
                     if let Ok(k) = k.as_reference() {
-                        stack.push((k, Some(id), depth + 1));
+                        stack.push((k, Some(id)));
                     }
                 }
             }
@@ -1654,6 +1782,9 @@ impl Roles {
             seen: HashSet::new(),
             todo: Vec::new(),
             steps: 0,
+            lists: HashMap::new(),
+            found: HashMap::new(),
+            done: HashSet::new(),
         };
         w.push(catalog, Kind::Catalog, catalog);
         for (key, kind) in [(&b"Info"[..], Kind::Info), (b"Encrypt", Kind::Encrypt)] {
@@ -1698,15 +1829,21 @@ impl Roles {
 }
 
 /// Whether a field's widget (the field itself, or any of its kids) shows on the page: a
-/// rectangle with an area, not hidden.
-fn widget_visible(v: &Version, d: &Dictionary) -> bool {
+/// rectangle with an area, not hidden. `shown` keeps the answer for each list of kids looked
+/// through, which fields may share; it holds for `v` only.
+fn widget_visible(v: &Version, d: &Dictionary, shown: &mut HashMap<ObjectId, bool>) -> bool {
     let one = |d: &Dictionary| {
-        let rect: Option<Vec<f32>> = d.get(b"Rect").ok().and_then(|r| v.array(r)).and_then(|a| {
+        let rect = d.get(b"Rect").ok().and_then(|r| v.array(r));
+        let rect: Option<Vec<f32>> = rect.filter(|a| a.len() == 4).and_then(|a| {
             a.iter()
-                .map(|x| match v.resolve(x)? {
-                    Object::Integer(i) => Some(*i as f32),
-                    Object::Real(f) => Some(*f),
-                    _ => None,
+                .map(|x| {
+                    #[cfg(test)]
+                    tests::RECT_READ.set(tests::RECT_READ.get() + 1);
+                    match v.resolve(x)? {
+                        Object::Integer(i) => Some(*i as f32),
+                        Object::Real(f) => Some(*f),
+                        _ => None,
+                    }
                 })
                 .collect()
         });
@@ -1720,11 +1857,20 @@ fn widget_visible(v: &Version, d: &Dictionary) -> bool {
         // Hidden (2) or NoView (32).
         area && flags & (2 | 32) == 0
     };
-    one(d)
-        || d.get(b"Kids")
-            .ok()
-            .and_then(|k| v.array(k))
+    if one(d) {
+        return true;
+    }
+    let Ok(kids) = d.get(b"Kids") else {
+        return false;
+    };
+    let any = || {
+        v.array(kids)
             .is_some_and(|kids| kids.iter().filter_map(|k| v.dict(k)).any(one))
+    };
+    match v.array_holder(kids) {
+        Some(list) => *shown.entry(list).or_insert_with(any),
+        None => any(),
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1775,6 +1921,14 @@ struct Walker<'v, 'r> {
     seen: HashSet<(ObjectId, Kind, ObjectId)>,
     todo: Vec<(ObjectId, Kind, ObjectId)>,
     steps: usize,
+    /// The annotations written inside each `/Annots` array held in an object, as
+    /// [`Walker::written_in`] found them.
+    lists: HashMap<ObjectId, (Vec<(usize, Kind)>, usize)>,
+    /// The references in each object walked as a kind, and the kinds they get, as
+    /// [`Walker::refs`] found them.
+    found: HashMap<(ObjectId, Kind), Vec<(ObjectId, Kind)>>,
+    /// The objects whose entries were given their parts, by kind.
+    done: HashSet<(ObjectId, Kind)>,
 }
 
 impl Walker<'_, '_> {
@@ -1786,9 +1940,10 @@ impl Walker<'_, '_> {
     }
 
     fn run(&mut self) -> Result<(), String> {
+        let limit = max_steps();
         while let Some((id, kind, owner)) = self.todo.pop() {
             self.steps += 1;
-            if self.steps > MAX_STEPS {
+            if self.steps > limit {
                 return Err("the document is too complex to check".into());
             }
             let v = self.v;
@@ -1800,6 +1955,21 @@ impl Walker<'_, '_> {
                 Object::Stream(s) => Some(&s.dict),
                 _ => None,
             };
+            // These give an object's entries their parts with the object as owner, so
+            // another owner reaching it as the same kind adds nothing.
+            let owns = matches!(
+                kind,
+                Kind::PageNode
+                    | Kind::Comment
+                    | Kind::OtherAnnot
+                    | Kind::Field
+                    | Kind::SigField
+                    | Kind::AcroForm
+                    | Kind::Names
+            );
+            if owns && dict.is_some() && !self.done.insert((id, kind)) {
+                continue;
+            }
             match (kind, dict) {
                 (Kind::Catalog, Some(d)) => {
                     for (k, val) in d.iter() {
@@ -1836,16 +2006,17 @@ impl Walker<'_, '_> {
                                 if let Ok(r) = val.as_reference() {
                                     self.push(r, Kind::AnnotsArray, id);
                                 }
-                                // Annotations written inside the array; the others are
-                                // pushed as annotations already.
-                                for e in v.array(val).into_iter().flatten() {
-                                    if let Object::Dictionary(_) = e {
-                                        let nk = match annot_class(v, Some(e)) {
-                                            AnnotClass::Comment => Kind::CommentPart,
-                                            _ => Kind::OtherAnnotPart,
-                                        };
-                                        self.walk(e, nk, id, Some(k.as_slice()));
-                                    }
+                                // Annotations written inside the array, a step for each
+                                // object in them; the others are pushed as annotations
+                                // already.
+                                let list = v.array(val).map(Vec::as_slice).unwrap_or_default();
+                                let (inside, size) = self.written_in(list, v.array_holder(val));
+                                self.steps += size;
+                                if self.steps > limit {
+                                    return Err("the document is too complex to check".into());
+                                }
+                                for (i, nk) in inside {
+                                    self.walk(&list[i], nk, id, Some(k.as_slice()));
                                 }
                             }
                             _ => self.walk_entry(val, Kind::PageContent, id, k),
@@ -1860,7 +2031,19 @@ impl Walker<'_, '_> {
                     };
                     for (k, val) in d.iter() {
                         match k.as_slice() {
-                            b"P" | b"Parent" | b"IRT" => {}
+                            b"P" | b"IRT" => {}
+                            // A parent recorded nowhere names a widget for readers following
+                            // `/Parent`, and gives it a type, value and actions.
+                            b"Parent" => {
+                                let up = val.as_reference().ok().filter(|r| {
+                                    !self.r.fields.contains_key(r)
+                                        && !self.r.annots.contains_key(r)
+                                        && v.dict_of(*r).is_some()
+                                });
+                                if let Some(r) = up {
+                                    self.push(r, part, id);
+                                }
+                            }
                             b"Popup" => {
                                 if let Ok(r) = val.as_reference() {
                                     if !self.r.fields.contains_key(&r) {
@@ -1880,7 +2063,19 @@ impl Walker<'_, '_> {
                     };
                     for (k, val) in d.iter() {
                         match k.as_slice() {
-                            b"Parent" | b"P" => {}
+                            b"P" => {}
+                            // Readers following `/Parent` name the field, and take its type,
+                            // value and actions, from what it names: one other than the field
+                            // listing it makes the field all a change to it, and walked so, a
+                            // parent recorded nowhere (and its own) part of it.
+                            b"Parent" => {
+                                let up =
+                                    val.as_reference().ok().filter(|r| v.dict_of(*r).is_some());
+                                let listing = self.r.fields.get(&id).and_then(|f| f.parent);
+                                if up.is_some_and(|r| Some(r) != listing) {
+                                    self.push(id, Kind::FieldMeta, id);
+                                }
+                            }
                             b"Kids" => {
                                 if let Ok(r) = val.as_reference() {
                                     self.push(r, Kind::FieldsArray, id);
@@ -1914,10 +2109,66 @@ impl Walker<'_, '_> {
                     Kind::WidgetAnnot | Kind::PagesArray | Kind::AnnotsArray | Kind::FieldsArray,
                     _,
                 ) => {}
-                _ => self.walk(obj, kind, owner, None),
+                // An object reached from many owners is walked once a kind, a step; what it
+                // refers to is pushed again for each further owner, a step, or a step for
+                // each reference in it that owner reached already, if more.
+                _ => {
+                    let (found, again_for) = match self.found.remove(&(id, kind)) {
+                        Some(found) => (found, true),
+                        None => {
+                            let mut found = Vec::new();
+                            self.refs(obj, kind, None, &mut found);
+                            (found, false)
+                        }
+                    };
+                    let pushed = self.todo.len();
+                    for &(r, kind) in &found {
+                        self.push(r, kind, owner);
+                    }
+                    let again = found.len() - (self.todo.len() - pushed);
+                    self.found.insert((id, kind), found);
+                    if again_for {
+                        self.steps += again.saturating_sub(1);
+                        if self.steps > limit {
+                            return Err("the document is too complex to check".into());
+                        }
+                    }
+                }
             }
         }
         Ok(())
+    }
+
+    /// The annotations written inside the `/Annots` array `list` (their positions and
+    /// kinds), and the objects in them ([`nodes`]). A list held in an object (`holder`),
+    /// which pages may share, is looked through once.
+    fn written_in(
+        &mut self,
+        list: &[Object],
+        holder: Option<ObjectId>,
+    ) -> (Vec<(usize, Kind)>, usize) {
+        if let Some(known) = holder.and_then(|h| self.lists.get(&h)) {
+            #[cfg(test)]
+            tests::LOOKED.set(tests::LOOKED.get() + known.0.len());
+            return known.clone();
+        }
+        let mut found = (Vec::new(), 0);
+        for (i, e) in list.iter().enumerate() {
+            #[cfg(test)]
+            tests::LOOKED.set(tests::LOOKED.get() + 1);
+            if let Object::Dictionary(_) = e {
+                let kind = match annot_class(self.v, Some(e)) {
+                    AnnotClass::Comment => Kind::CommentPart,
+                    _ => Kind::OtherAnnotPart,
+                };
+                found.0.push((i, kind));
+                found.1 += nodes(e);
+            }
+        }
+        if let Some(h) = holder {
+            self.lists.insert(h, found.clone());
+        }
+        found
     }
 
     /// The name trees: comment icon appearances, and the rest (destinations, scripts,
@@ -1938,8 +2189,21 @@ impl Walker<'_, '_> {
         self.walk(val, child_kind(kind, key), owner, Some(key));
     }
 
-    /// The references in `val` (a value of `kind`, under dictionary key `key`).
+    /// The references in `val` (a value of `kind`, under dictionary key `key`), pushed for
+    /// `owner`.
     fn walk(&mut self, val: &Object, kind: Kind, owner: ObjectId, key: Option<&[u8]>) {
+        let mut found = Vec::new();
+        self.refs(val, kind, key, &mut found);
+        for (r, kind) in found {
+            self.push(r, kind, owner);
+        }
+    }
+
+    /// The references in `val` (a value of `kind`, under dictionary key `key`) and the
+    /// kinds they get, added to `out`.
+    fn refs(&self, val: &Object, kind: Kind, key: Option<&[u8]>, out: &mut Vec<(ObjectId, Kind)>) {
+        #[cfg(test)]
+        tests::WALKED.set(tests::WALKED.get() + 1);
         match val {
             Object::Reference(r) => {
                 let r = *r;
@@ -1962,25 +2226,35 @@ impl Walker<'_, '_> {
                 } else {
                     kind
                 };
-                self.push(r, kind, owner);
+                out.push((r, kind));
             }
             Object::Array(a) => {
                 for e in a {
-                    self.walk(e, kind, owner, key);
+                    self.refs(e, kind, key, out);
                 }
             }
             Object::Dictionary(d) => {
                 for (k, v) in d.iter() {
-                    self.walk_entry(v, kind, owner, k);
+                    self.refs(v, child_kind(kind, k), Some(k), out);
                 }
             }
             Object::Stream(s) => {
                 for (k, v) in s.dict.iter() {
-                    self.walk_entry(v, kind, owner, k);
+                    self.refs(v, child_kind(kind, k), Some(k), out);
                 }
             }
             _ => {}
         }
+    }
+}
+
+/// The objects written in place in `o`, `o` included: those [`Walker::refs`] goes through.
+fn nodes(o: &Object) -> usize {
+    1 + match o {
+        Object::Array(a) => a.iter().map(nodes).sum(),
+        Object::Dictionary(d) => d.iter().map(|(_, v)| nodes(v)).sum(),
+        Object::Stream(s) => s.dict.iter().map(|(_, v)| nodes(v)).sum(),
+        _ => 0,
     }
 }
 
@@ -1999,7 +2273,21 @@ struct Judge<'a> {
     new: &'a Version<'a>,
     or: &'a Roles,
     nr: &'a Roles,
+    /// The fields whose signatures the report lists.
+    listed: &'a HashSet<ObjectId>,
     out: Vec<Seen>,
+    /// The fields' changes pushed (field, kind of change, page), each once.
+    pushed: HashSet<(ObjectId, FieldChange, Option<usize>)>,
+}
+
+/// A kind of change to a field, pushed once a page for each field: its name may be long, and
+/// many of its keys or parts may change.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum FieldChange {
+    Changed,
+    Filled,
+    MadeReadOnly,
+    SignatureChanged,
 }
 
 /// Field dictionary entries filling in may change: the value, its appearance, the
@@ -2008,9 +2296,32 @@ const FILL_KEYS: [&[u8]; 6] = [b"V", b"AP", b"AS", b"RV", b"I", b"M"];
 /// Signature field entries signing may change.
 const SIGN_KEYS: [&[u8]; 4] = [b"V", b"AP", b"AS", b"M"];
 
-impl Judge<'_> {
+/// Whether the field node `id` holds a signature in `roles`, itself or, for a widget kid,
+/// the field it is part of (signing sets the field's `/V` and locks and draws its widgets).
+fn signed_field(roles: &Roles, id: ObjectId) -> bool {
+    let signed = |id: &ObjectId| roles.fields.get(id).is_some_and(|f| f.signed);
+    signed(&id) || roles.fields.get(&id).is_some_and(|f| signed(&f.field))
+}
+
+impl<'a> Judge<'a> {
     fn push(&mut self, s: Seen) {
         self.out.push(s);
+    }
+
+    /// Field `owner`'s `change` on `page`, pushed once: its name is copied only then.
+    fn push_field(&mut self, owner: ObjectId, change: FieldChange, page: Option<usize>) {
+        if !self.pushed.insert((owner, change, page)) {
+            return;
+        }
+        let name = self.field_name(owner);
+        let fill = |kind| seen(kind, page, Need::Fill(Some(name.clone())));
+        let s = match change {
+            FieldChange::Changed => never(ChangeKind::FieldChanged(name), page),
+            FieldChange::SignatureChanged => never(ChangeKind::SignatureChanged(name), page),
+            FieldChange::Filled => fill(ChangeKind::FieldFilled(name.clone())),
+            FieldChange::MadeReadOnly => fill(ChangeKind::FieldMadeReadOnly(name.clone())),
+        };
+        self.push(s);
     }
 
     /// The keys whose values differ between two dictionaries.
@@ -2052,90 +2363,187 @@ impl Judge<'_> {
         }
     }
 
-    /// Annotations added to, removed from or reordered on each page.
+    /// Annotations added to, removed from or reordered on each page. Each pair of lists
+    /// (before and after) is compared once, however many pages have it, and its changes
+    /// cost a step for each page they show on, within [`MAX_STEPS`]; past that the document
+    /// is too complex to check, and no list's changes are reported.
     fn annotations(&mut self) {
-        let (old, new) = (self.old, self.new);
-        for (i, page) in self.nr.pages.iter().enumerate() {
-            let Some(before) = self.or.page_annots.get(page) else {
+        let (or, nr) = (self.or, self.nr);
+        let limit = max_steps();
+        let mut steps = 0;
+        let mut compared: HashMap<(usize, usize), Vec<Seen>> = HashMap::new();
+        // Each page with its pair.
+        let mut pages: Vec<(usize, (usize, usize))> = Vec::new();
+        let mut within = true;
+        for (i, page) in nr.pages.iter().enumerate() {
+            let Some(&before) = or.page_annots.get(page) else {
                 continue;
             };
-            let after = &self.nr.page_annots[page];
-            let page = Some(i);
-            let has = |list: &[Object], e: &Object| list.iter().any(|x| same_object(x, e));
-            for e in before.iter().filter(|e| !has(after, e)) {
-                match annot_class(old, Some(e)) {
-                    AnnotClass::Comment => {
-                        self.push(seen(ChangeKind::CommentRemoved, page, Need::Comment))
-                    }
-                    AnnotClass::Widget => {
-                        let id = e.as_reference().ok();
-                        let field = id.and_then(|id| self.or.fields.get(&id));
-                        let kept = id.is_some_and(|id| self.nr.fields.contains_key(&id));
-                        match field {
-                            // Taken off the page but still a field.
-                            Some(f) if kept && f.signed => {
-                                self.push(never(ChangeKind::SignatureChanged(f.name.clone()), page))
-                            }
-                            Some(f) if kept => {
-                                self.push(never(ChangeKind::FieldChanged(f.name.clone()), page))
-                            }
-                            // A field removed is reported with the fields.
-                            Some(_) => {}
-                            None => self.push(never(ChangeKind::AnnotationChanged, page)),
-                        }
-                    }
-                    AnnotClass::Other => self.push(never(ChangeKind::AnnotationChanged, page)),
-                }
+            let pair = (before, nr.page_annots[page]);
+            if let std::collections::hash_map::Entry::Vacant(e) = compared.entry(pair) {
+                let (b, a) = (&or.annot_lists[pair.0], &nr.annot_lists[pair.1]);
+                let Some(found) = self.list_changes(b, a, &mut steps, limit) else {
+                    within = false;
+                    break;
+                };
+                e.insert(found);
             }
-            for e in after.iter().filter(|e| !has(before, e)) {
-                match annot_class(new, Some(e)) {
-                    AnnotClass::Comment => {
-                        let d = new.dict(e);
-                        if d.is_some_and(|d| d.has(b"A") || d.has(b"AA")) {
-                            self.push(never(ChangeKind::Actions, page));
-                        } else {
-                            self.push(seen(ChangeKind::CommentAdded, page, Need::Comment));
-                        }
-                    }
-                    AnnotClass::Widget => {
-                        let id = e.as_reference().ok();
-                        match id.and_then(|id| self.nr.fields.get(&id).map(|f| (id, f))) {
-                            // A widget of a field added in this step: reported with the
-                            // fields. A widget added to a field from before isn't allowed.
-                            Some((id, f)) => {
-                                let root = self.field_root(id);
-                                if self.or.fields.contains_key(&root) {
-                                    self.push(never(
-                                        ChangeKind::FieldChanged(f.name.clone()),
-                                        page,
-                                    ));
-                                }
-                            }
-                            None => self.push(never(ChangeKind::AnnotationChanged, page)),
-                        }
-                    }
-                    AnnotClass::Other => self.push(never(ChangeKind::AnnotationChanged, page)),
-                }
+            steps += compared[&pair].len();
+            if steps > limit {
+                within = false;
+                break;
             }
-            // Entries kept must keep their order (it decides what covers what).
-            let kept_before: Vec<&Object> = before.iter().filter(|e| has(after, e)).collect();
-            let kept_after: Vec<&Object> = after.iter().filter(|e| has(before, e)).collect();
-            let same_order = kept_before.len() == kept_after.len()
-                && kept_before
-                    .iter()
-                    .zip(&kept_after)
-                    .all(|(x, y)| same_object(x, y));
-            if !same_order {
-                if kept_after
-                    .iter()
-                    .all(|e| annot_class(new, Some(e)) == AnnotClass::Comment)
-                {
-                    self.push(seen(ChangeKind::CommentChanged, page, Need::Comment));
-                } else {
-                    self.push(never(ChangeKind::AnnotationChanged, page));
-                }
+            pages.push((i, pair));
+        }
+        if !within {
+            let why = "the document is too complex to check".to_string();
+            self.push(never(ChangeKind::Malformed(why), None));
+            return;
+        }
+        for (i, pair) in pages {
+            for s in &compared[&pair] {
+                self.push(Seen {
+                    page: Some(i),
+                    ..s.clone()
+                });
             }
         }
+    }
+
+    /// What changed between a page's annotations `before` and `after`, each change once and
+    /// without the page; `None` past `limit` steps. Each entry costs a step; one referred to
+    /// is looked for by its reference, and one written in place (which the format doesn't
+    /// allow) is compared with those in place in the other list, a step each.
+    fn list_changes(
+        &self,
+        before: &[Object],
+        after: &[Object],
+        steps: &mut usize,
+        limit: usize,
+    ) -> Option<Vec<Seen>> {
+        let (old, new) = (self.old, self.new);
+        *steps += before.len() + after.len();
+        if *steps > limit {
+            return None;
+        }
+        // For each entry of `list`, whether `other` has it too.
+        let in_other = |list: &[Object], other: &[Object], steps: &mut usize| {
+            let refs: HashSet<ObjectId> = (other.iter())
+                .filter_map(|e| e.as_reference().ok())
+                .collect();
+            let in_place: Vec<&Object> = (other.iter())
+                .filter(|e| e.as_reference().is_err())
+                .collect();
+            list.iter()
+                .map(|e| match e {
+                    Object::Reference(id) => Some(refs.contains(id)),
+                    e => {
+                        for x in &in_place {
+                            *steps += 1;
+                            if *steps > limit {
+                                return None;
+                            }
+                            if same_object(x, e) {
+                                return Some(true);
+                            }
+                        }
+                        Some(false)
+                    }
+                })
+                .collect::<Option<Vec<bool>>>()
+        };
+        let in_after = in_other(before, after, steps)?;
+        let in_before = in_other(after, before, steps)?;
+        // An entry referring again to what one before it did changes nothing more: judged
+        // once, a field's name isn't copied for each.
+        let (mut gone, mut new_ids) = (HashSet::new(), HashSet::new());
+        let removed = (before.iter().zip(&in_after))
+            .filter_map(|(e, &k)| (!k).then_some(e))
+            .filter(|e| e.as_reference().ok().is_none_or(|id| gone.insert(id)));
+        let added = (after.iter().zip(&in_before))
+            .filter_map(|(e, &k)| (!k).then_some(e))
+            .filter(|e| e.as_reference().ok().is_none_or(|id| new_ids.insert(id)));
+
+        let mut out: Vec<Seen> = Vec::new();
+        let mut once: HashSet<(ChangeKind, Need)> = HashSet::new();
+        let mut push = |s: Seen| {
+            if once.insert((s.kind.clone(), s.need.clone())) {
+                out.push(s);
+            }
+        };
+        for e in removed {
+            match annot_class(old, Some(e)) {
+                AnnotClass::Comment => push(seen(ChangeKind::CommentRemoved, None, Need::Comment)),
+                AnnotClass::Widget => {
+                    let id = e.as_reference().ok();
+                    let field = id.and_then(|id| self.or.fields.get(&id));
+                    let kept = id.is_some_and(|id| self.nr.fields.contains_key(&id));
+                    match field {
+                        // Taken off the page but still a field.
+                        Some(f) if kept && f.signed => {
+                            push(never(ChangeKind::SignatureChanged(f.copied_name()), None))
+                        }
+                        Some(f) if kept => {
+                            push(never(ChangeKind::FieldChanged(f.copied_name()), None))
+                        }
+                        // A field removed is reported with the fields.
+                        Some(_) => {}
+                        None => push(never(ChangeKind::AnnotationChanged, None)),
+                    }
+                }
+                AnnotClass::Other => push(never(ChangeKind::AnnotationChanged, None)),
+            }
+        }
+        for e in added {
+            match annot_class(new, Some(e)) {
+                AnnotClass::Comment => {
+                    let d = new.dict(e);
+                    if d.is_some_and(|d| d.has(b"A") || d.has(b"AA")) {
+                        push(never(ChangeKind::Actions, None));
+                    } else {
+                        push(seen(ChangeKind::CommentAdded, None, Need::Comment));
+                    }
+                }
+                AnnotClass::Widget => {
+                    let id = e.as_reference().ok();
+                    match id.and_then(|id| self.nr.fields.get(&id).map(|f| (id, f))) {
+                        // A widget of a field added in this step: reported with the
+                        // fields. A widget added to a field from before isn't allowed.
+                        Some((id, f)) => {
+                            let root = self.field_root(id);
+                            if self.or.fields.contains_key(&root) {
+                                push(never(ChangeKind::FieldChanged(f.copied_name()), None));
+                            }
+                        }
+                        None => push(never(ChangeKind::AnnotationChanged, None)),
+                    }
+                }
+                AnnotClass::Other => push(never(ChangeKind::AnnotationChanged, None)),
+            }
+        }
+        // Entries kept must keep their order (it decides what covers what).
+        let kept_before: Vec<&Object> = (before.iter().zip(&in_after))
+            .filter_map(|(e, &k)| k.then_some(e))
+            .collect();
+        let kept_after: Vec<&Object> = (after.iter().zip(&in_before))
+            .filter_map(|(e, &k)| k.then_some(e))
+            .collect();
+        let same_order = kept_before.len() == kept_after.len()
+            && kept_before
+                .iter()
+                .zip(&kept_after)
+                .all(|(x, y)| same_object(x, y));
+        if !same_order {
+            if kept_after
+                .iter()
+                .all(|e| annot_class(new, Some(e)) == AnnotClass::Comment)
+            {
+                push(seen(ChangeKind::CommentChanged, None, Need::Comment));
+            } else {
+                push(never(ChangeKind::AnnotationChanged, None));
+            }
+        }
+        Some(out)
     }
 
     /// Whether a field's flags only gained read-only: the newer dictionary's own `/Ff` is
@@ -2160,14 +2568,8 @@ impl Judge<'_> {
     }
 
     /// The top of the field tree `id` is in, in the newer version.
-    fn field_root(&self, mut id: ObjectId) -> ObjectId {
-        for _ in 0..64 {
-            match self.nr.fields.get(&id).and_then(|f| f.parent) {
-                Some(p) => id = p,
-                None => break,
-            }
-        }
-        id
+    fn field_root(&self, id: ObjectId) -> ObjectId {
+        self.nr.fields.get(&id).map_or(id, |f| f.root)
     }
 
     /// Whether the newer version's field or widget `id` has an action (`/A` or `/AA`, not null).
@@ -2178,6 +2580,31 @@ impl Judge<'_> {
                 .and_then(|o| self.new.resolve(o))
                 .is_some_and(|o| !matches!(o, Object::Null))
         })
+    }
+
+    /// The newer version's fields. [`Self::fields`] reads them only through this, so the
+    /// tests can count how many it looks at.
+    fn new_fields(&self) -> impl Iterator<Item = (&'a ObjectId, &'a FieldInfo)> + 'a {
+        let nr: &'a Roles = self.nr;
+        nr.fields.iter().inspect(|_| {
+            #[cfg(test)]
+            tests::FIELDS_LOOKED.set(tests::FIELDS_LOOKED.get() + 1);
+        })
+    }
+
+    /// Field `id`, signed in this step (`new_visible` as for [`sign_seen`]): signing only when
+    /// the report lists its signature, as nothing else checks it, and the signature's
+    /// dictionary is new in this step: an earlier signature put in it signs nothing here.
+    fn signing(&self, id: ObjectId, f: &FieldInfo, new_visible: Option<bool>) -> Seen {
+        let earlier = match self.new.dict_of(id).and_then(|d| d.get(b"V").ok()) {
+            Some(Object::Reference(v)) => self.old.get(*v).is_some(),
+            _ => false,
+        };
+        if self.listed.contains(&id) && !earlier {
+            return sign_seen(f, new_visible);
+        }
+        let what = format!("a signature in field \"{}\" it can't check", f.name);
+        never(ChangeKind::Unrecognised(what), None)
     }
 
     /// Fields added, removed or signed.
@@ -2192,38 +2619,88 @@ impl Judge<'_> {
                 self.push(never(kind, None));
             }
         }
-        for (id, f) in &self.nr.fields {
+        // Listed by another field than the one it's named by, or no longer: only that one is
+        // compared below, but a reader going by another would see the field there.
+        let (or, nr) = (self.or, self.nr);
+        let kept = |p: &ObjectId| or.fields.contains_key(p) && nr.fields.contains_key(p);
+        // Each field added outside its tree once, however many list it.
+        let mut outside = HashSet::new();
+        for (id, by) in or.again.symmetric_difference(&nr.again) {
+            match (or.fields.get(id), nr.fields.get(id), by.filter(kept)) {
+                (Some(o), Some(_), _) => {
+                    let change = if o.signed {
+                        FieldChange::SignatureChanged
+                    } else {
+                        FieldChange::Changed
+                    };
+                    self.push_field(*id, change, None);
+                }
+                // Added in this step, and listed by a field kept too: that one changed.
+                (None, Some(_), Some(p)) => self.push_field(p, FieldChange::Changed, None),
+                // Or by `/Fields` or another field added: a field added outside its tree.
+                (None, Some(f), None) if outside.insert(*id) => {
+                    self.push(never(ChangeKind::FieldAdded(f.copied_name()), None));
+                }
+                // Removed: refused as that above; or such a field listed again.
+                _ => {}
+            }
+        }
+        // The nodes of each field tree added in this step, in number order.
+        let mut added: HashMap<ObjectId, Vec<(&ObjectId, &FieldInfo)>> = HashMap::new();
+        for (id, f) in self.new_fields() {
+            if !self.or.fields.contains_key(&f.root) {
+                added.entry(f.root).or_default().push((id, f));
+            }
+        }
+        for (id, f) in self.new_fields() {
             match self.or.fields.get(id) {
                 Some(o) => {
                     if o.signed && (!f.signed || o.name != f.name) {
-                        self.push(never(ChangeKind::SignatureChanged(o.name.clone()), None));
-                    } else if o.sig && f.sig && !o.signed && f.signed {
-                        self.push(sign_seen(f, None));
+                        self.push_field(*id, FieldChange::SignatureChanged, None);
+                    } else if o.parent != f.parent || o.name != f.name {
+                        // Moved, or renamed by a change to a field above it: a lock naming it
+                        // would no longer, or what it takes from those above it would change.
+                        self.push_field(*id, FieldChange::Changed, None);
+                    } else if o.sig != f.sig {
+                        // Made part of a signature field, or no longer, by a list of kids or
+                        // fields changing: its signing would go unjudged, or its changes be
+                        // judged as filling in another field.
+                        self.push_field(*id, FieldChange::Changed, None);
+                    } else if !o.signed && f.signed {
+                        self.push(self.signing(*id, f, None));
                     }
                 }
                 None => match f.parent {
                     // Part of a field added in this step.
                     Some(p) if !self.or.fields.contains_key(&p) => {}
-                    Some(p) => {
-                        let name = self.nr.fields[&p].name.clone();
-                        self.push(never(ChangeKind::FieldChanged(name), None));
-                    }
+                    Some(p) => self.push_field(p, FieldChange::Changed, None),
                     None if f.sig => {
                         // The whole new field: whether anything in it is signed, shows or acts.
-                        let tree: Vec<(&ObjectId, &FieldInfo)> = self
-                            .nr
-                            .fields
-                            .iter()
-                            .filter(|(i, _)| self.field_root(**i) == *id)
-                            .collect();
+                        let tree = added.get(id).map(Vec::as_slice).unwrap_or_default();
+                        let nr = self.nr;
+                        let sig = |p: Option<ObjectId>| {
+                            p.and_then(|p| nr.fields.get(&p)).is_some_and(|p| p.sig)
+                        };
+                        for (_, n) in tree.iter().filter(|(_, n)| !n.sig && sig(n.parent)) {
+                            // A field of another kind added inside it: never allowed, as when
+                            // added on its own.
+                            self.push(never(ChangeKind::FieldAdded(n.name.clone()), None));
+                        }
                         let visible = tree.iter().any(|(_, f)| f.visible);
                         if let Some((i, _)) = tree.iter().find(|(i, _)| self.acts(**i)) {
                             let page = self.nr.annots.get(*i).copied();
                             self.push(never(ChangeKind::Actions, page));
                         }
-                        match tree.iter().find(|(_, f)| f.signed) {
-                            Some((_, s)) => self.push(sign_seen(s, Some(visible))),
-                            None => self.push(seen(
+                        // Signed in this step: one signed before and moved into it is judged
+                        // by its parent changing, not taken for this field's signing.
+                        let old = |i: &ObjectId| self.or.fields.contains_key(i);
+                        let mut signed = false;
+                        for (i, s) in tree.iter().filter(|(i, f)| f.signed && !old(i)) {
+                            self.push(self.signing(**i, s, Some(visible)));
+                            signed = true;
+                        }
+                        if !signed {
+                            self.push(seen(
                                 ChangeKind::SignatureFieldAdded(f.name.clone()),
                                 None,
                                 Need::Sign {
@@ -2231,7 +2708,7 @@ impl Judge<'_> {
                                     new_visible: Some(visible),
                                     timestamp: false,
                                 },
-                            )),
+                            ));
                         }
                     }
                     None => self.push(never(ChangeKind::FieldAdded(f.name.clone()), None)),
@@ -2284,12 +2761,13 @@ impl Judge<'_> {
         }
     }
 
+    /// Field `owner`'s name before this step (what a lock names), or its new name if it's new.
     fn field_name(&self, owner: ObjectId) -> String {
-        self.nr
+        self.or
             .fields
             .get(&owner)
-            .or_else(|| self.or.fields.get(&owner))
-            .map(|f| f.name.clone())
+            .or_else(|| self.nr.fields.get(&owner))
+            .map(FieldInfo::copied_name)
             .unwrap_or_default()
     }
 
@@ -2363,7 +2841,6 @@ impl Judge<'_> {
                 self.push(never(ChangeKind::AnnotationChanged, page))
             }
             Kind::Field => {
-                let name = self.field_name(owner);
                 let keys = match dicts {
                     Some((a, b)) => Self::differing(a, b),
                     None => vec![b"Type".to_vec()],
@@ -2374,66 +2851,53 @@ impl Judge<'_> {
                         filled = true;
                     } else if k == b"Ff" && dicts.is_some_and(|(a, b)| self.only_read_only(a, b)) {
                         // Signing a field that locks others makes them read-only (Acrobat).
-                        self.push(seen(
-                            ChangeKind::FieldMadeReadOnly(name.clone()),
-                            page,
-                            Need::Fill(Some(name.clone())),
-                        ));
+                        self.push_field(owner, FieldChange::MadeReadOnly, page);
                     } else if k != b"Kids" {
-                        self.push(never(ChangeKind::FieldChanged(name.clone()), page));
+                        self.push_field(owner, FieldChange::Changed, page);
                     }
                 }
                 if filled {
-                    self.push(fill_seen(&name, page));
+                    self.push_field(owner, FieldChange::Filled, page);
                 }
             }
-            Kind::FieldPart => {
-                let name = self.field_name(owner);
-                self.push(fill_seen(&name, page));
-            }
+            Kind::FieldPart => self.push_field(owner, FieldChange::Filled, page),
             Kind::SigField => {
-                let name = self.field_name(owner);
-                let was_signed = self.or.fields.get(&owner).is_some_and(|f| f.signed);
+                let was_signed = signed_field(self.or, owner);
                 let keys = match dicts {
                     Some((a, b)) => Self::differing(a, b),
                     None => vec![b"Type".to_vec()],
                 };
-                let is_signed = self.nr.fields.get(&owner).is_some_and(|f| f.signed);
+                let is_signed = signed_field(self.nr, owner);
                 for k in keys {
                     if was_signed {
-                        self.push(never(ChangeKind::SignatureChanged(name.clone()), page));
+                        self.push_field(owner, FieldChange::SignatureChanged, page);
                     } else if k == b"F"
                         && is_signed
                         && dicts.is_some_and(|(a, b)| only_locked(a, b))
                     {
                         // Acrobat locks the widget it signs.
                     } else if !SIGN_KEYS.contains(&k.as_slice()) && k != b"Kids" {
-                        self.push(never(ChangeKind::FieldChanged(name.clone()), page));
+                        self.push_field(owner, FieldChange::Changed, page);
                     } else if !is_signed {
                         // Changed, but not signed.
-                        self.push(never(ChangeKind::FieldChanged(name.clone()), page));
+                        self.push_field(owner, FieldChange::Changed, page);
                     }
                 }
             }
             Kind::SigFieldPart => {
-                let name = self.field_name(owner);
-                let was_signed = self.or.fields.get(&owner).is_some_and(|f| f.signed);
-                let is_signed = self.nr.fields.get(&owner).is_some_and(|f| f.signed);
+                let was_signed = signed_field(self.or, owner);
+                let is_signed = signed_field(self.nr, owner);
                 if was_signed {
-                    self.push(never(ChangeKind::SignatureChanged(name), page));
+                    self.push_field(owner, FieldChange::SignatureChanged, page);
                 } else if !is_signed {
-                    self.push(never(ChangeKind::FieldChanged(name), page));
+                    self.push_field(owner, FieldChange::Changed, page);
                 }
                 // Otherwise part of signing the field, reported with the fields.
             }
             Kind::SigDict | Kind::SigPart => {
-                let name = self.field_name(owner);
-                self.push(never(ChangeKind::SignatureChanged(name), page));
+                self.push_field(owner, FieldChange::SignatureChanged, page)
             }
-            Kind::FieldMeta => {
-                let name = self.field_name(owner);
-                self.push(never(ChangeKind::FieldChanged(name), page));
-            }
+            Kind::FieldMeta => self.push_field(owner, FieldChange::Changed, page),
             Kind::Action => self.push(never(ChangeKind::Actions, page)),
             Kind::Perms => match dicts {
                 Some((a, b)) => self.perms(a, b),
@@ -2580,14 +3044,6 @@ fn only_locked(a: &Dictionary, b: &Dictionary) -> bool {
     }
 }
 
-fn fill_seen(name: &str, page: Option<usize>) -> Seen {
-    seen(
-        ChangeKind::FieldFilled(name.to_string()),
-        page,
-        Need::Fill(Some(name.to_string())),
-    )
-}
-
 /// A field signed (`new_visible` set when the field was added in the same step).
 fn sign_seen(f: &FieldInfo, new_visible: Option<bool>) -> Seen {
     let kind = if f.timestamp {
@@ -2604,4 +3060,1142 @@ fn sign_seen(f: &FieldInfo, new_visible: Option<bool>) -> Seen {
             timestamp: f.timestamp,
         },
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::budget::budget_seam;
+    use crate::forms::FieldKind;
+    use crate::incremental::append_revision;
+    use lopdf::dictionary;
+    use std::cell::Cell;
+
+    thread_local! {
+        /// Objects compared (`same_object`) on this thread.
+        pub(super) static COMPARED: Cell<usize> = const { Cell::new(0) };
+        /// `/Annots` entries role assignment looked at on this thread.
+        pub(super) static LOOKED: Cell<usize> = const { Cell::new(0) };
+        /// Objects role assignment walked through on this thread.
+        pub(super) static WALKED: Cell<usize> = const { Cell::new(0) };
+        /// Numbers of widgets' `/Rect` read on this thread.
+        pub(super) static RECT_READ: Cell<usize> = const { Cell::new(0) };
+        /// Fields of the newer version `Judge::fields` looked at, on this thread.
+        pub(super) static FIELDS_LOOKED: Cell<usize> = const { Cell::new(0) };
+        /// Field names copied for changes found (`FieldInfo::copied_name`), on this thread.
+        pub(super) static NAMES_COPIED: Cell<usize> = const { Cell::new(0) };
+        /// Bytes looked at telling whether a revision ends at a version's end, on this thread.
+        pub(super) static SCANNED: Cell<usize> = const { Cell::new(0) };
+    }
+
+    fn square(n: usize) -> Dictionary {
+        dictionary! {
+            "NM" => Object::string_literal(format!("square {n}")),
+            "Type" => "Annot",
+            "Subtype" => "Square",
+            "Rect" => vec![10.into(), 10.into(), 20.into(), 20.into()],
+        }
+    }
+
+    /// Changes found: (kind, page, allowed).
+    type Found = Vec<(ChangeKind, Option<usize>, bool)>;
+
+    /// `pages` pages sharing one `/Annots` array of `n` entries made by `entry`, then a
+    /// revision adding one more: the changes after the first version, the objects compared
+    /// finding them, and the entries role assignment looked at.
+    fn shared_list_grown(
+        pages: usize,
+        n: usize,
+        entry: impl Fn(&mut Document, usize) -> Object,
+    ) -> (Found, usize, usize) {
+        let (signed, p) = shared_list(pages, n, entry);
+        COMPARED.set(0);
+        LOOKED.set(0);
+        let found = changes_since(&signed, &p);
+        (found, COMPARED.get(), LOOKED.get())
+    }
+
+    /// `pages` pages sharing one `/Annots` array of `n` entries made by `entry`, saved (to be
+    /// signed), and a revision of it adding one more.
+    fn shared_list(
+        pages: usize,
+        n: usize,
+        entry: impl Fn(&mut Document, usize) -> Object,
+    ) -> (Vec<u8>, Pdf) {
+        let mut p = Pdf::new();
+        for i in 0..pages {
+            p.insert_blank(i, 300.0, 200.0).unwrap();
+        }
+        let list: Vec<Object> = (0..n).map(|i| entry(&mut p.doc, i)).collect();
+        let list = p.doc.add_object(list);
+        for page in p.page_ids() {
+            p.doc.get_dictionary_mut(page).unwrap().set("Annots", list);
+        }
+        let signed = p.snapshot().unwrap();
+        let mut p = Pdf::from_bytes(&signed, None).unwrap();
+        let added = entry(&mut p.doc, n);
+        (p.doc.get_object_mut(list).and_then(Object::as_array_mut))
+            .unwrap()
+            .push(added);
+        (signed, p)
+    }
+
+    /// The fields whose signatures `verify_signatures` lists in `p`: signature fields with a
+    /// value.
+    fn listed(p: &Pdf) -> HashSet<ObjectId> {
+        let value = |id| p.doc.get_dictionary(id).ok().and_then(|d| d.get(b"V").ok());
+        (p.form_nodes().into_iter())
+            .filter(|(f, n)| {
+                f.kind == FieldKind::Signature
+                    && value(n.id).is_some_and(|v| !matches!(v, Object::Null))
+            })
+            .map(|(_, n)| n.id)
+            .collect()
+    }
+
+    /// The changes after `signed` that `p`, a revision of it, makes.
+    fn changes_since(signed: &[u8], p: &Pdf) -> Found {
+        changes_certified(signed, p, None)
+    }
+
+    /// The changes after `signed` that `p`, a revision of it, makes, when `signed` is
+    /// certified with `certified`.
+    fn changes_certified(signed: &[u8], p: &Pdf, certified: Option<Permissions>) -> Found {
+        let bytes = append_revision(signed, &p.doc).unwrap().bytes;
+        let whole = Pdf::from_bytes(&bytes, None).unwrap();
+        let mut versions = Versions::new(&bytes, None, &whole);
+        let sig = Signed {
+            end: signed.len(),
+            locks: None,
+        };
+        let found = analyse(&mut versions, &[sig], &listed(&whole), certified);
+        found[0]
+            .iter()
+            .map(|c| (c.kind.clone(), c.page, c.allowed()))
+            .collect()
+    }
+
+    /// Two pages sharing a list of 2,000 annotations, one more added after signing: the list
+    /// is compared with the one before once, by reference, and the change shows on each page.
+    #[test]
+    fn signature_changes_compare_each_annots_list_once() {
+        let refer = |d: &mut Document, i| d.add_object(square(i)).into();
+        let (found, compared, _) = shared_list_grown(2, 2_000, refer);
+        let added = |page| (ChangeKind::CommentAdded, Some(page), true);
+        assert_eq!(found, [added(0), added(1)]);
+        assert!(compared <= 5_000, "{compared} objects compared");
+    }
+
+    /// Annotations written into the list directly (which the format doesn't allow) are
+    /// compared among themselves within a step count, past which the document is too complex
+    /// to check.
+    #[test]
+    fn direct_annotations_past_the_step_count_are_too_complex_to_check() {
+        let (found, _, _) = shared_list_grown(2, 3_000, |_, i| square(i).into());
+        let why = "the document is too complex to check".to_string();
+        assert_eq!(found, [(ChangeKind::Malformed(why), None, false)]);
+    }
+
+    /// A thousand pages sharing a list of 1,000 annotations, one more added after signing:
+    /// assigning roles looks through the list once a version, not once a page, and the
+    /// change shows on each page.
+    #[test]
+    fn roles_look_through_a_list_pages_share_once() {
+        let refer = |d: &mut Document, i| d.add_object(square(i)).into();
+        let (found, _, looked) = shared_list_grown(1_000, 1_000, refer);
+        let added: Vec<_> = (0..1_000)
+            .map(|page| (ChangeKind::CommentAdded, Some(page), true))
+            .collect();
+        assert_eq!(found, added);
+        assert!(looked <= 5_000, "{looked} entries looked at");
+    }
+
+    /// A hundred pages sharing a list of 100 annotations written into it directly, one more
+    /// added after signing: each page's roles walk them again, at a step for each of their
+    /// objects, so at 50,000 steps the document is too complex to check.
+    #[test]
+    fn annotations_in_a_shared_list_cost_steps_on_each_page() {
+        let direct = |_: &mut Document, i| square(i).into();
+        let (found, _, _) = shared_list_grown(100, 100, direct);
+        let added: Vec<_> = (0..100)
+            .map(|page| (ChangeKind::CommentAdded, Some(page), true))
+            .collect();
+        assert_eq!(found, added);
+        let (signed, p) = shared_list(100, 100, direct);
+        let (found, _) = budget_seam::with_limit(50_000, || changes_since(&signed, &p));
+        let why = "the document is too complex to check".to_string();
+        assert_eq!(found, [(ChangeKind::Malformed(why), None, false)]);
+    }
+
+    /// 100 pages sharing a list of 100 fields' widgets, emptied after signing with the fields
+    /// kept: each field changed shows on each page, 10,000 changes. Each costs a step, so
+    /// with 5,000 steps the document is too complex to check.
+    #[test]
+    fn annotation_changes_on_each_page_count_against_the_steps() {
+        let mut p = Pdf::new();
+        for i in 0..100 {
+            p.insert_blank(i, 300.0, 200.0).unwrap();
+        }
+        let widgets: Vec<Object> = (0..100)
+            .map(|i| {
+                let w = dictionary! {
+                    "Type" => "Annot",
+                    "Subtype" => "Widget",
+                    "FT" => "Tx",
+                    "T" => Object::string_literal(format!("f{i}")),
+                    "Rect" => vec![10.into(), 10.into(), 20.into(), 20.into()],
+                };
+                p.doc.add_object(w).into()
+            })
+            .collect();
+        let list = p.doc.add_object(widgets.clone());
+        for page in p.page_ids() {
+            p.doc.get_dictionary_mut(page).unwrap().set("Annots", list);
+        }
+        let form = p.doc.add_object(dictionary! { "Fields" => widgets });
+        p.doc.catalog_mut().unwrap().set("AcroForm", form);
+        let signed = p.snapshot().unwrap();
+        let mut p = Pdf::from_bytes(&signed, None).unwrap();
+        p.doc.objects.insert(list, Object::Array(Vec::new()));
+
+        let found = changes_since(&signed, &p);
+        let first = (ChangeKind::FieldChanged("f0".into()), Some(0), false);
+        assert_eq!((found.len(), &found[0]), (10_000, &first));
+        let (found, _) = budget_seam::with_limit(5_000, || changes_since(&signed, &p));
+        let why = "the document is too complex to check".to_string();
+        let refused = (ChangeKind::Malformed(why), None, false);
+        assert_eq!((found.len(), &found[0]), (1, &refused));
+    }
+
+    /// `pages` pages sharing the resources `shared` makes, saved (to be signed), and a
+    /// revision of it changing the dictionary `shared` names after them.
+    fn shared_resources(
+        pages: usize,
+        shared: impl Fn(&mut Document) -> (ObjectId, ObjectId),
+    ) -> (Vec<u8>, Pdf) {
+        let mut p = Pdf::new();
+        for i in 0..pages {
+            p.insert_blank(i, 300.0, 200.0).unwrap();
+        }
+        let (res, changed) = shared(&mut p.doc);
+        for page in p.page_ids() {
+            p.doc
+                .get_dictionary_mut(page)
+                .unwrap()
+                .set("Resources", res);
+        }
+        let signed = p.snapshot().unwrap();
+        let mut p = Pdf::from_bytes(&signed, None).unwrap();
+        (p.doc.get_dictionary_mut(changed).unwrap()).set("Changed", true);
+        (signed, p)
+    }
+
+    /// A thousand pages sharing resources that hold a list of 1,000 numbers, changed after
+    /// signing: the change shows on each page, and assigning roles walks the list once a
+    /// version, not once a page.
+    #[test]
+    fn roles_walk_what_pages_share_once() {
+        let shared = |d: &mut Document| {
+            let junk: Vec<Object> = (0..1_000i64).map(Object::from).collect();
+            let res = d.add_object(dictionary! { "Junk" => junk });
+            (res, res)
+        };
+        let (signed, p) = shared_resources(1_000, shared);
+        WALKED.set(0);
+        let found = changes_since(&signed, &p);
+        let walked = WALKED.get();
+        let changed: Found = (0..1_000)
+            .map(|page| (ChangeKind::PageContent, Some(page), false))
+            .collect();
+        assert_eq!(found, changed);
+        assert!(walked <= 50_000, "{walked} objects walked");
+    }
+
+    /// A hundred pages sharing resources of 100 objects that each refer to the same 100
+    /// others, one of those changed after signing: each page reaches each of the 100 again
+    /// through each of the 100, a step each time, so at 100,000 steps the document is too
+    /// complex to check.
+    #[test]
+    fn references_reached_again_cost_steps() {
+        let shared = |d: &mut Document| {
+            let ends: Vec<ObjectId> = (0..100i64)
+                .map(|j| d.add_object(dictionary! { "N" => j }))
+                .collect();
+            let list: Vec<Object> = ends.iter().map(|&end| end.into()).collect();
+            let mut res = Dictionary::new();
+            for i in 0..100 {
+                let middle = d.add_object(dictionary! { "Junk" => list.clone() });
+                res.set(format!("R{i}"), middle);
+            }
+            (d.add_object(res), ends[0])
+        };
+        let (signed, p) = shared_resources(100, shared);
+        let found = changes_since(&signed, &p);
+        let changed: Found = (0..100)
+            .map(|page| (ChangeKind::PageContent, Some(page), false))
+            .collect();
+        assert_eq!(found, changed);
+        let (found, _) = budget_seam::with_limit(100_000, || changes_since(&signed, &p));
+        let why = "the document is too complex to check".to_string();
+        assert_eq!(found, [(ChangeKind::Malformed(why), None, false)]);
+    }
+
+    /// The last object assigning roles reaches, reached from the form first, refers 5,000
+    /// times to one the catalog reached already: a step each, so at 2,000 steps the document
+    /// is too complex to check.
+    #[test]
+    fn references_reached_again_last_cost_steps() {
+        let mut p = Pdf::new();
+        p.insert_blank(0, 300.0, 200.0).unwrap();
+        let x = p.doc.new_object_id();
+        let y = p.doc.add_object(vec![Object::from(x); 5_000]);
+        p.doc.objects.insert(x, dictionary! { "Y" => y }.into());
+        let form = p.doc.add_object(dictionary! { "XFA" => x });
+        let root = p.doc.trailer.get(b"Root").and_then(Object::as_reference);
+        let catalog = p.doc.get_dictionary_mut(root.unwrap()).unwrap();
+        catalog.set("Foo", x);
+        catalog.set("AcroForm", form);
+        let signed = p.snapshot().unwrap();
+        let mut p = Pdf::from_bytes(&signed, None).unwrap();
+        (p.doc.get_dictionary_mut(x).unwrap()).set("Changed", true);
+        let found = changes_since(&signed, &p);
+        assert!(
+            !found
+                .iter()
+                .any(|f| matches!(f.0, ChangeKind::Malformed(_))),
+            "{found:?}"
+        );
+        let (found, _) = budget_seam::with_limit(2_000, || changes_since(&signed, &p));
+        let why = "the document is too complex to check".to_string();
+        assert_eq!(found, [(ChangeKind::Malformed(why), None, false)]);
+    }
+
+    /// A structure element holding 5,000 marked pieces of a page, which the structure tree's
+    /// parent tree lists once for each, changed after signing: the catalog reaches it the
+    /// first time only, so the list is a step, and the check comes out the same within 1,000.
+    #[test]
+    fn a_parent_tree_listing_an_element_again_costs_a_step() {
+        let mut p = Pdf::new();
+        p.insert_blank(0, 300.0, 200.0).unwrap();
+        let page = p.page_ids()[0];
+        let tree = p.doc.new_object_id();
+        let marks: Vec<Object> = (0..5_000i64).map(Object::from).collect();
+        let element = p.doc.add_object(dictionary! {
+            "S" => "P",
+            "P" => tree,
+            "Pg" => page,
+            "K" => marks,
+        });
+        let parents = p.doc.add_object(vec![Object::from(element); 5_000]);
+        let nums = dictionary! { "Nums" => vec![Object::from(0i64), parents.into()] };
+        let root = dictionary! { "K" => element, "ParentTree" => nums };
+        p.doc.objects.insert(tree, root.into());
+        let catalog = p.doc.trailer.get(b"Root").and_then(Object::as_reference);
+        (p.doc.get_dictionary_mut(catalog.unwrap()).unwrap()).set("StructTreeRoot", tree);
+        let signed = p.snapshot().unwrap();
+        let mut p = Pdf::from_bytes(&signed, None).unwrap();
+        (p.doc.get_dictionary_mut(element).unwrap()).set("Changed", true);
+        let found = changes_since(&signed, &p);
+        assert!(
+            !found
+                .iter()
+                .any(|f| matches!(f.0, ChangeKind::Malformed(_))),
+            "{found:?}"
+        );
+        let (limited, _) = budget_seam::with_limit(1_000, || changes_since(&signed, &p));
+        assert_eq!(limited, found);
+    }
+
+    /// A page listing 1,000 annotations that are each an array holding the same dictionary of
+    /// 1,000 numbers, changed after signing: assigning roles walks the dictionary once a
+    /// version, not once for each array reaching it.
+    #[test]
+    fn parts_reached_through_many_arrays_are_walked_once() {
+        let mut p = Pdf::new();
+        p.insert_blank(0, 300.0, 200.0).unwrap();
+        let junk: Vec<Object> = (0..1_000i64).map(Object::from).collect();
+        let shared = p.doc.add_object(dictionary! { "Junk" => junk });
+        let list: Vec<Object> = (0..1_000)
+            .map(|_| p.doc.add_object(vec![Object::from(shared)]).into())
+            .collect();
+        let page = p.page_ids()[0];
+        p.doc.get_dictionary_mut(page).unwrap().set("Annots", list);
+        let signed = p.snapshot().unwrap();
+        let mut p = Pdf::from_bytes(&signed, None).unwrap();
+        (p.doc.get_dictionary_mut(shared).unwrap()).set("Changed", true);
+        WALKED.set(0);
+        let found = changes_since(&signed, &p);
+        let walked = WALKED.get();
+        assert_eq!(found, [(ChangeKind::AnnotationChanged, Some(0), false)]);
+        assert!(walked <= 50_000, "{walked} objects walked");
+    }
+
+    /// Three hundred pages on one article thread, a bead each: each page reaches every bead
+    /// through the thread's links, a step each, and reaching a bead's neighbour again adds
+    /// nothing to that, so the check comes out the same within 150,000 steps.
+    #[test]
+    fn a_thread_through_every_page_costs_a_step_a_bead() {
+        let mut p = Pdf::new();
+        for i in 0..300 {
+            p.insert_blank(i, 300.0, 200.0).unwrap();
+        }
+        let pages = p.page_ids();
+        let d = &mut p.doc;
+        let beads: Vec<ObjectId> = pages.iter().map(|_| d.new_object_id()).collect();
+        let thread = d.add_object(dictionary! { "F" => beads[0] });
+        for (i, (&bead, &page)) in beads.iter().zip(&pages).enumerate() {
+            let mut b = dictionary! {
+                "P" => page,
+                "N" => beads[(i + 1) % beads.len()],
+                "V" => beads[(i + beads.len() - 1) % beads.len()],
+            };
+            if i == 0 {
+                b.set("T", thread);
+            }
+            d.objects.insert(bead, b.into());
+            (d.get_dictionary_mut(page).unwrap()).set("B", vec![Object::from(bead)]);
+        }
+        let root = d.trailer.get(b"Root").and_then(Object::as_reference);
+        (d.get_dictionary_mut(root.unwrap()).unwrap()).set("Threads", vec![thread.into()]);
+        let signed = p.snapshot().unwrap();
+        let mut p = Pdf::from_bytes(&signed, None).unwrap();
+        (p.doc.get_dictionary_mut(thread).unwrap()).set("Changed", true);
+        let found = changes_since(&signed, &p);
+        assert!(
+            !found
+                .iter()
+                .any(|f| matches!(f.0, ChangeKind::Malformed(_))),
+            "{found:?}"
+        );
+        let (limited, _) = budget_seam::with_limit(150_000, || changes_since(&signed, &p));
+        assert_eq!(limited, found);
+    }
+
+    /// A one-page document whose page tree `shape` reshapes (given the document, the tree's
+    /// root and the page), saved (to be signed), and a revision of it drawing on the page.
+    fn page_drawn_on(shape: impl FnOnce(&mut Document, ObjectId, ObjectId)) -> (Vec<u8>, Pdf) {
+        let mut p = Pdf::new();
+        p.insert_blank(0, 300.0, 200.0).unwrap();
+        let page = p.page_ids()[0];
+        let root = p.doc.catalog().unwrap().get(b"Pages");
+        let root = root.and_then(Object::as_reference).unwrap();
+        shape(&mut p.doc, root, page);
+        let signed = p.snapshot().unwrap();
+        let mut p = Pdf::from_bytes(&signed, None).unwrap();
+        let contents = p.doc.get_dictionary(page).unwrap().get(b"Contents");
+        let contents = contents.and_then(Object::as_reference).unwrap();
+        let drawn = Stream::new(Dictionary::new(), b"0 0 m 10 10 l S".to_vec());
+        p.doc.objects.insert(contents, drawn.into());
+        (signed, p)
+    }
+
+    /// `n` page-tree nodes, each the only kid of the next, the first holding `kids`: the
+    /// last of them.
+    fn chain(d: &mut Document, n: usize, mut kids: Vec<Object>) -> ObjectId {
+        let mut top = None;
+        for _ in 0..n {
+            let id = d.add_object(dictionary! { "Type" => "Pages", "Kids" => kids });
+            kids = vec![id.into()];
+            top = Some(id);
+        }
+        top.unwrap()
+    }
+
+    /// A page 70 levels down its page tree, and one 2 levels down that a chain 64 levels deep
+    /// reaches first, drawn on after signing: the drawing is found as on a plain document.
+    #[test]
+    fn pages_deep_in_the_tree_are_checked() {
+        let (signed, p) = page_drawn_on(|_, _, _| {});
+        let plain = changes_since(&signed, &p);
+        assert!(!plain.is_empty());
+        let (signed, p) = page_drawn_on(|d, root, page| {
+            let top = chain(d, 69, vec![page.into()]);
+            (d.get_dictionary_mut(root).unwrap()).set("Kids", vec![Object::from(top)]);
+        });
+        assert_eq!(changes_since(&signed, &p), plain);
+        let (signed, p) = page_drawn_on(|d, root, page| {
+            let near = chain(d, 1, vec![page.into()]);
+            let top = chain(d, 63, vec![near.into()]);
+            let kids = vec![Object::from(top), near.into()];
+            (d.get_dictionary_mut(root).unwrap()).set("Kids", kids);
+        });
+        assert_eq!(changes_since(&signed, &p), plain);
+    }
+
+    /// A thousand page-tree nodes each listing the same 1,001 kids, a page and themselves, the
+    /// page drawn on after signing: each kid listed is a step, about a million, so the drawing
+    /// is found as on a plain document, and at 100,000 steps the document is too complex to
+    /// check.
+    #[test]
+    fn page_tree_kids_cost_a_step_each() {
+        let (signed, p) = page_drawn_on(|_, _, _| {});
+        let plain = changes_since(&signed, &p);
+        let (signed, p) = page_drawn_on(|d, root, page| {
+            let list = d.new_object_id();
+            let mut kids = vec![Object::from(page)];
+            for _ in 0..1_000 {
+                let node = d.add_object(dictionary! { "Type" => "Pages", "Kids" => list });
+                kids.push(node.into());
+            }
+            d.objects.insert(list, kids.into());
+            (d.get_dictionary_mut(root).unwrap()).set("Kids", list);
+        });
+        assert_eq!(changes_since(&signed, &p), plain);
+        let (found, _) = budget_seam::with_limit(100_000, || changes_since(&signed, &p));
+        let why = "the document is too complex to check".to_string();
+        assert_eq!(found, [(ChangeKind::Malformed(why), None, false)]);
+    }
+
+    /// A one-page document with a form whose fields `make` makes, giving the form's list and
+    /// a field, saved (to be signed), and a revision of it filling in that field.
+    fn form_filled(make: impl FnOnce(&mut Document) -> (Vec<Object>, ObjectId)) -> (Vec<u8>, Pdf) {
+        let mut p = Pdf::new();
+        p.insert_blank(0, 300.0, 200.0).unwrap();
+        let (fields, filled) = make(&mut p.doc);
+        let form = p.doc.add_object(dictionary! { "Fields" => fields });
+        p.doc.catalog_mut().unwrap().set("AcroForm", form);
+        let signed = p.snapshot().unwrap();
+        let mut p = Pdf::from_bytes(&signed, None).unwrap();
+        (p.doc.get_dictionary_mut(filled).unwrap()).set("V", Object::string_literal("x"));
+        (signed, p)
+    }
+
+    /// A field 40 levels down the form, filled after signing: it's found as a field named
+    /// with all 40 names is when it's the form's only one.
+    #[test]
+    fn fields_deep_in_the_form_are_checked() {
+        let names: Vec<String> = (0..40).map(|i| format!("f{i}")).collect();
+        let (signed, p) = form_filled(|d| {
+            let named = Object::string_literal(names.join("."));
+            let f = d.add_object(dictionary! { "FT" => "Tx", "T" => named });
+            (vec![f.into()], f)
+        });
+        let plain = changes_since(&signed, &p);
+        assert!(!plain.is_empty());
+        let (signed, p) = form_filled(|d| {
+            let last = Object::string_literal(names[39].as_str());
+            let last = d.add_object(dictionary! { "FT" => "Tx", "T" => last });
+            let mut top = last;
+            for name in names[..39].iter().rev() {
+                let kids = vec![Object::from(top)];
+                let name = Object::string_literal(name.as_str());
+                top = d.add_object(dictionary! { "T" => name, "Kids" => kids });
+            }
+            (vec![top.into()], last)
+        });
+        assert_eq!(changes_since(&signed, &p), plain);
+    }
+
+    /// Fields named with 64 KB each, whose 1,000 other entries or 1,000 parts change after
+    /// signing: a text field's entries and parts; an unsigned signature field's entries, parts
+    /// and seed value parts; a signed one's entries and its signature's parts. Each field's
+    /// change is found once, its name copied once, not once a key or a part (1,000 times each
+    /// before, 64 MB a field and twice that with what it needs).
+    #[test]
+    fn a_fields_change_is_found_once_however_many_keys_or_parts_change() {
+        fn keyed(mut d: Dictionary) -> Dictionary {
+            for i in 0..1_000 {
+                d.set(format!("K{i}"), 0);
+            }
+            d
+        }
+        fn parts(doc: &mut lopdf::Document, all: &mut Vec<ObjectId>) -> Object {
+            let list: Vec<Object> = (0..1_000)
+                .map(|_| {
+                    let r = doc.add_object(dictionary! { "N" => 0 });
+                    all.push(r);
+                    r.into()
+                })
+                .collect();
+            list.into()
+        }
+        let name = |c: char| c.to_string().repeat(65_536);
+        let t = |c: char| Object::string_literal(name(c));
+        let mut p = Pdf::new();
+        p.insert_blank(0, 300.0, 200.0).unwrap();
+        let (doc, mut all) = (&mut p.doc, Vec::new());
+        let text_parts = parts(doc, &mut all);
+        let sig_parts = parts(doc, &mut all);
+        let seed_parts = parts(doc, &mut all);
+        let value = doc.add_object(dictionary! { "Type" => "Sig" });
+        let value_parts = parts(doc, &mut all);
+        let value_parts = doc.add_object(dictionary! { "Type" => "Sig", "X" => value_parts });
+        let ids: Vec<ObjectId> = [
+            keyed(dictionary! { "FT" => "Tx", "T" => t('a') }),
+            dictionary! { "FT" => "Tx", "T" => t('b'), "X" => text_parts },
+            keyed(dictionary! { "FT" => "Sig", "T" => t('c') }),
+            dictionary! { "FT" => "Sig", "T" => t('d'), "X" => sig_parts },
+            dictionary! { "FT" => "Sig", "T" => t('e'), "SV" => seed_parts },
+            keyed(dictionary! { "FT" => "Sig", "T" => t('f'), "V" => value }),
+            dictionary! { "FT" => "Sig", "T" => t('g'), "V" => value_parts },
+        ]
+        .into_iter()
+        .map(|f| doc.add_object(f))
+        .collect();
+        let fields: Vec<Object> = ids.iter().map(|&f| f.into()).collect();
+        let form = doc.add_object(dictionary! { "Fields" => fields });
+        doc.catalog_mut().unwrap().set("AcroForm", form);
+        let signed = p.snapshot().unwrap();
+        let mut p = Pdf::from_bytes(&signed, None).unwrap();
+        for f in [ids[0], ids[2], ids[5]] {
+            let d = p.doc.get_dictionary_mut(f).unwrap();
+            for i in 0..1_000 {
+                d.set(format!("K{i}"), 1);
+            }
+        }
+        for &r in &all {
+            p.doc.get_dictionary_mut(r).unwrap().set("N", 1);
+        }
+        let bytes = append_revision(&signed, &p.doc).unwrap().bytes;
+        let whole = Pdf::from_bytes(&bytes, None).unwrap();
+        let mut versions = Versions::new(&bytes, None, &whole);
+        let end = signed.len();
+        let (listed, mut cache) = (listed(&whole), HashMap::new());
+        NAMES_COPIED.set(0);
+        let raw = changes_after(&mut versions, &bytes, end, &[end], &listed, &mut cache);
+        let copied = NAMES_COPIED.get();
+        let count = |kind: ChangeKind| raw.iter().filter(|s| s.kind == kind).count();
+        let found = [
+            count(ChangeKind::FieldChanged(name('a'))),
+            count(ChangeKind::FieldFilled(name('b'))),
+            count(ChangeKind::FieldChanged(name('c'))),
+            count(ChangeKind::FieldChanged(name('d'))),
+            count(ChangeKind::FieldChanged(name('e'))),
+            count(ChangeKind::SignatureChanged(name('f'))),
+            count(ChangeKind::SignatureChanged(name('g'))),
+        ];
+        assert_eq!(found, [1; 7]);
+        assert_eq!(copied, 7, "names copied");
+    }
+
+    /// A page listing a text field's and a signed signature field's widgets 1,000 times each,
+    /// fields named with 64 KB, taken off it after signing with the fields kept, and another
+    /// text field's widget from before put on it 1,000 times. Each change is found once, its
+    /// name copied once, not once an entry (1,000 times each before, 64 MB a field).
+    #[test]
+    fn a_widget_listed_again_and_again_is_judged_once() {
+        let name = |c: char| c.to_string().repeat(65_536);
+        let widget = |c: char| {
+            dictionary! {
+                "Type" => "Annot", "Subtype" => "Widget", "T" => Object::string_literal(name(c)),
+                "Rect" => vec![10.into(), 10.into(), 20.into(), 20.into()],
+            }
+        };
+        let mut p = Pdf::new();
+        p.insert_blank(0, 300.0, 200.0).unwrap();
+        let doc = &mut p.doc;
+        let value = doc.add_object(dictionary! { "Type" => "Sig" });
+        let (mut a, mut b, mut c) = (widget('a'), widget('b'), widget('c'));
+        a.set("FT", "Tx");
+        b.extend(&dictionary! { "FT" => "Sig", "V" => value });
+        c.set("FT", "Tx");
+        let [a, b, c] = [a, b, c].map(|w| doc.add_object(w));
+        let fields: Vec<Object> = [a, b, c].iter().map(|&f| f.into()).collect();
+        let form = doc.add_object(dictionary! { "Fields" => fields });
+        doc.catalog_mut().unwrap().set("AcroForm", form);
+        let times = |w: ObjectId| vec![Object::from(w); 1_000];
+        let list = doc.add_object([times(a), times(b)].concat());
+        let page = p.page_ids()[0];
+        p.doc.get_dictionary_mut(page).unwrap().set("Annots", list);
+        let signed = p.snapshot().unwrap();
+        let mut p = Pdf::from_bytes(&signed, None).unwrap();
+        p.doc.objects.insert(list, Object::Array(times(c)));
+
+        NAMES_COPIED.set(0);
+        let found = changes_since(&signed, &p);
+        let copied = NAMES_COPIED.get();
+        // Each change, its name cut to its first letter and length.
+        let brief = |found: &[(ChangeKind, Option<usize>, bool)]| -> Vec<String> {
+            let cut = |n: &String| format!("{}.. {}", &n[..n.len().min(1)], n.len());
+            let brief = |k: &ChangeKind| match k {
+                ChangeKind::FieldChanged(n) => format!("FieldChanged({})", cut(n)),
+                ChangeKind::SignatureChanged(n) => format!("SignatureChanged({})", cut(n)),
+                k => format!("{k:?}").chars().take(80).collect(),
+            };
+            (found.iter())
+                .map(|(k, page, ok)| format!("{}, {page:?}, {ok}", brief(k)))
+                .collect()
+        };
+        let refused = |kind| (kind, Some(0), false);
+        let want = [
+            refused(ChangeKind::FieldChanged(name('a'))),
+            refused(ChangeKind::FieldChanged(name('c'))),
+            refused(ChangeKind::SignatureChanged(name('b'))),
+        ];
+        assert_eq!(brief(&found), brief(&want));
+        assert_eq!(found, want);
+        assert_eq!(copied, 3, "names copied");
+    }
+
+    /// A field named with 64 KB, added after signing with 1,000 fields listing it: it is
+    /// found added once, its name copied once, not once for each field listing it but the
+    /// first (999 times before, 64 MB).
+    #[test]
+    fn a_field_added_listed_by_many_is_found_once() {
+        let mut p = Pdf::new();
+        p.insert_blank(0, 300.0, 200.0).unwrap();
+        let form = p
+            .doc
+            .add_object(dictionary! { "Fields" => Vec::<Object>::new() });
+        p.doc.catalog_mut().unwrap().set("AcroForm", form);
+        let signed = p.snapshot().unwrap();
+        let mut p = Pdf::from_bytes(&signed, None).unwrap();
+        let doc = &mut p.doc;
+        let name = Object::string_literal("a".repeat(65_536));
+        let field = doc.add_object(dictionary! { "FT" => "Tx", "T" => name });
+        let fields: Vec<Object> = (0..1_000)
+            .map(|i| {
+                let t = Object::string_literal(format!("{i}"));
+                doc.add_object(dictionary! { "T" => t, "Kids" => vec![field.into()] })
+                    .into()
+            })
+            .collect();
+        doc.get_dictionary_mut(form).unwrap().set("Fields", fields);
+        let bytes = append_revision(&signed, &p.doc).unwrap().bytes;
+        let whole = Pdf::from_bytes(&bytes, None).unwrap();
+        let mut versions = Versions::new(&bytes, None, &whole);
+        let end = signed.len();
+        let (listed, mut cache) = (listed(&whole), HashMap::new());
+        NAMES_COPIED.set(0);
+        let raw = changes_after(&mut versions, &bytes, end, &[end], &listed, &mut cache);
+        let copied = NAMES_COPIED.get();
+        let long = |s: &&Seen| matches!(&s.kind, ChangeKind::FieldAdded(n) if n.len() > 1_000);
+        assert_eq!(raw.iter().filter(long).count(), 1);
+        assert_eq!(copied, 1, "names copied");
+    }
+
+    /// A thousand fields each listing the same 1,000 kids, themselves, with no area on the
+    /// page: whether a field shows is worked out from the list once, not for each field, and
+    /// each kid listed is a step, so at 100,000 steps the document is too complex to check.
+    #[test]
+    fn form_kids_cost_a_step_each() {
+        let (signed, p) = form_filled(|d| {
+            let list = d.new_object_id();
+            let fields: Vec<Object> = (0..1_000)
+                .map(|i| {
+                    let f = dictionary! {
+                        "T" => Object::string_literal(format!("{i}")),
+                        "Rect" => vec![Object::from(0); 4],
+                        "Kids" => list,
+                    };
+                    d.add_object(f).into()
+                })
+                .collect();
+            d.objects.insert(list, fields.clone().into());
+            let first = fields[0].as_reference().unwrap();
+            (vec![first.into()], first)
+        });
+        RECT_READ.set(0);
+        let found = changes_since(&signed, &p);
+        let read = RECT_READ.get();
+        assert!(
+            !found
+                .iter()
+                .any(|f| matches!(f.0, ChangeKind::Malformed(_))),
+            "{found:?}"
+        );
+        assert!(read <= 50_000, "{read} numbers read");
+        let (found, _) = budget_seam::with_limit(100_000, || changes_since(&signed, &p));
+        let why = "the document is too complex to check".to_string();
+        assert_eq!(found, [(ChangeKind::Malformed(why), None, false)]);
+    }
+
+    /// A field whose rectangle lists 10,000 numbers instead of 4: it has no area, found
+    /// without reading them.
+    #[test]
+    fn a_rectangle_of_too_many_numbers_is_not_read() {
+        let (signed, p) = form_filled(|d| {
+            let rect: Vec<Object> = (0..10_000i64).map(Object::from).collect();
+            let named = Object::string_literal("f");
+            let f = d.add_object(dictionary! { "FT" => "Tx", "T" => named, "Rect" => rect });
+            (vec![f.into()], f)
+        });
+        RECT_READ.set(0);
+        let found = changes_since(&signed, &p);
+        assert_eq!(found, [(ChangeKind::FieldFilled("f".into()), None, true)]);
+        assert_eq!(RECT_READ.get(), 0);
+    }
+
+    /// A field named with 6,400 bytes over 1,000 kids: each kid's name holds it again, a step
+    /// for each 64 bytes, so at 50,000 steps the document is too complex to check.
+    #[test]
+    fn long_field_names_cost_steps() {
+        let (signed, p) = form_filled(|d| {
+            let kids: Vec<Object> = (0..1_000)
+                .map(|i| {
+                    let named = Object::string_literal(format!("{i}"));
+                    let kid = d.add_object(dictionary! { "FT" => "Tx", "T" => named });
+                    kid.into()
+                })
+                .collect();
+            let named = Object::string_literal("x".repeat(6_400));
+            let first = kids[0].as_reference().unwrap();
+            let root = d.add_object(dictionary! { "T" => named, "Kids" => kids });
+            (vec![root.into()], first)
+        });
+        let found = changes_since(&signed, &p);
+        assert!(
+            !found
+                .iter()
+                .any(|f| matches!(f.0, ChangeKind::Malformed(_))),
+            "{found:?}"
+        );
+        let (found, _) = budget_seam::with_limit(50_000, || changes_since(&signed, &p));
+        let why = "the document is too complex to check".to_string();
+        assert_eq!(found, [(ChangeKind::Malformed(why), None, false)]);
+    }
+
+    /// A form whose fields loop: F1 lists F2 and G, F2 lists Y, and Y lists F1's list again.
+    /// Role assignment and the form's reading both name G through Y, F1.F2.Y.G, so a lock on
+    /// F1.F2 reaches it.
+    #[test]
+    fn a_field_reached_again_through_a_loop_keeps_its_name() {
+        let mut p = Pdf::new();
+        p.insert_blank(0, 300.0, 200.0).unwrap();
+        let d = &mut p.doc;
+        let list = d.new_object_id();
+        let g = d.add_object(dictionary! { "FT" => "Tx", "T" => Object::string_literal("G") });
+        let y = d.add_object(dictionary! { "T" => Object::string_literal("Y"), "Kids" => list });
+        let y = vec![Object::from(y)];
+        let f2 = d.add_object(dictionary! { "T" => Object::string_literal("F2"), "Kids" => y });
+        let kids = vec![Object::from(f2), g.into()];
+        d.objects.insert(list, kids.into());
+        let f1 = d.add_object(dictionary! { "T" => Object::string_literal("F1"), "Kids" => list });
+        let form = d.add_object(dictionary! { "Fields" => vec![Object::from(f1)] });
+        d.catalog_mut().unwrap().set("AcroForm", form);
+        let v = Version {
+            pdf: &p,
+            freed: HashSet::new(),
+        };
+        let roles = Roles::build(&v).unwrap();
+        assert_eq!(roles.fields[&g].name, "F1.F2.Y.G");
+        let read = p.form_nodes().into_iter().find(|(_, n)| n.id == g);
+        assert_eq!(read.map(|(f, _)| f.name).as_deref(), Some("F1.F2.Y.G"));
+    }
+
+    /// Each field the form's reading finds is named and typed alike by role assignment.
+    #[track_caller]
+    fn roles_read_the_form_as_it_is_shown(p: &Pdf) {
+        let v = Version {
+            pdf: p,
+            freed: HashSet::new(),
+        };
+        let roles = Roles::build(&v).unwrap();
+        let read = p.form_nodes();
+        assert!(!read.is_empty());
+        for (f, n) in read {
+            let r = &roles.fields[&n.id];
+            let sig = matches!(f.kind, FieldKind::Signature);
+            assert_eq!((r.name.as_str(), r.sig), (f.name.as_str(), sig));
+        }
+    }
+
+    /// Field `K` of no kind of its own, below `chain` untitled nodes, listed through them by
+    /// nodes `X1` and `X2` of no kind and by field `T` of kind `ft`, `T` first or last: role
+    /// assignment names and types it as the form's reading does, through `T`. Before, it took
+    /// `K` as named by the first node listing it, `X1.K`, of no kind, where the form showed
+    /// `T.K`.
+    #[test]
+    fn a_field_a_node_of_no_kind_lists_first_is_named_through_one_with_a_kind() {
+        for (ft, t_first, chain) in [
+            ("Sig", false, 0),
+            ("Sig", true, 0),
+            ("Tx", false, 0),
+            ("Sig", false, 3),
+            ("Ch", false, 3),
+        ] {
+            let mut p = Pdf::new();
+            p.insert_blank(0, 300.0, 200.0).unwrap();
+            let d = &mut p.doc;
+            let rect = vec![Object::from(20), 20.into(), 120.into(), 40.into()];
+            let mut top =
+                d.add_object(dictionary! { "T" => Object::string_literal("K"), "Rect" => rect });
+            for _ in 0..chain {
+                top = d.add_object(dictionary! { "Kids" => vec![Object::from(top)] });
+            }
+            let node = |d: &mut Document, t: &str, ft: Option<&str>| {
+                let mut n = dictionary! { "T" => Object::string_literal(t), "Kids" => vec![Object::from(top)] };
+                if let Some(ft) = ft {
+                    n.set("FT", Object::Name(ft.into()));
+                }
+                Object::from(d.add_object(n))
+            };
+            let mut fields = vec![node(d, "X1", None), node(d, "X2", None)];
+            let t = node(d, "T", Some(ft));
+            if t_first {
+                fields.insert(0, t);
+            } else {
+                fields.push(t);
+            }
+            let form = d.add_object(dictionary! { "Fields" => fields });
+            d.catalog_mut().unwrap().set("AcroForm", form);
+            assert_eq!(p.form_nodes()[0].0.name, "T.K");
+            roles_read_the_form_as_it_is_shown(&p);
+        }
+    }
+
+    /// A field whose `/FT` is a reference to its kind, alone or listing with a node of no kind
+    /// listed before it the same field `K`: the form's reading gives it its kind, as role
+    /// assignment does. Before, it took the field as of no kind.
+    #[test]
+    fn a_kind_given_through_a_reference_is_read_alike() {
+        for shared in [false, true] {
+            let mut p = Pdf::new();
+            p.insert_blank(0, 300.0, 200.0).unwrap();
+            let d = &mut p.doc;
+            let rect = vec![Object::from(20), 20.into(), 120.into(), 40.into()];
+            let sig = d.add_object(Object::Name(b"Sig".to_vec()));
+            let k =
+                d.add_object(dictionary! { "T" => Object::string_literal("K"), "Rect" => rect });
+            let t = d.add_object(dictionary! {
+                "T" => Object::string_literal("T"),
+                "FT" => sig,
+                "Kids" => vec![Object::from(k)],
+            });
+            let mut fields = vec![Object::from(t)];
+            if shared {
+                let x =
+                    dictionary! { "T" => Object::string_literal("X"), "Kids" => vec![k.into()] };
+                fields.insert(0, d.add_object(x).into());
+            }
+            let form = d.add_object(dictionary! { "Fields" => fields });
+            d.catalog_mut().unwrap().set("AcroForm", form);
+            let read = p.form_nodes();
+            assert_eq!(read[0].0.name, "T.K");
+            assert!(matches!(read[0].0.kind, FieldKind::Signature));
+            roles_read_the_form_as_it_is_shown(&p);
+        }
+    }
+
+    /// 49 nodes of no kind, then a text field, listing the same 50 kid fields of no kind of
+    /// their own (forms' `nodes_of_no_kind_sharing_kid_fields_walk_them_once`): each kid is
+    /// the text field's, for role assignment as for the form's reading.
+    #[test]
+    fn kid_fields_nodes_of_no_kind_share_are_named_through_the_field() {
+        let n = 50;
+        let mut p = Pdf::new();
+        p.insert_blank(0, 300.0, 200.0).unwrap();
+        let d = &mut p.doc;
+        let name = |i: usize| Object::string_literal(format!("f{i}"));
+        let kids: Vec<Object> = (0..n)
+            .map(|i| d.add_object(dictionary! { "T" => name(n + i) }).into())
+            .collect();
+        let list = d.add_object(kids);
+        let fields: Vec<Object> = (0..n)
+            .map(|i| {
+                let mut f = dictionary! { "T" => name(i), "Kids" => list };
+                if i == n - 1 {
+                    f.set("FT", "Tx");
+                }
+                d.add_object(f).into()
+            })
+            .collect();
+        let form = d.add_object(dictionary! { "Fields" => fields });
+        d.catalog_mut().unwrap().set("AcroForm", form);
+        assert_eq!(p.form_nodes().len(), n);
+        roles_read_the_form_as_it_is_shown(&p);
+    }
+
+    /// Fields A and B listing the same kids, a widget that shows, and C listing a widget with
+    /// no area: A and B show, C doesn't, though B's kid is A's and its answer is the list's.
+    #[test]
+    fn fields_sharing_a_list_of_kids_show_as_it_does() {
+        let mut p = Pdf::new();
+        p.insert_blank(0, 300.0, 200.0).unwrap();
+        let d = &mut p.doc;
+        let rect = |n: i64| vec![Object::from(20), 20.into(), n.into(), n.into()];
+        let w = d.add_object(dictionary! { "Subtype" => "Widget", "Rect" => rect(120) });
+        let list = d.add_object(vec![Object::from(w)]);
+        let z = d.add_object(dictionary! { "Subtype" => "Widget", "Rect" => rect(20) });
+        let none = d.add_object(vec![Object::from(z)]);
+        let field = |d: &mut Document, t: &str, kids: ObjectId| {
+            let t = Object::string_literal(t);
+            d.add_object(dictionary! { "FT" => "Sig", "T" => t, "Kids" => kids })
+        };
+        let a = field(d, "A", list);
+        let b = field(d, "B", list);
+        let c = field(d, "C", none);
+        let fields = vec![Object::from(a), b.into(), c.into()];
+        let form = d.add_object(dictionary! { "Fields" => fields });
+        d.catalog_mut().unwrap().set("AcroForm", form);
+        let v = Version {
+            pdf: &p,
+            freed: HashSet::new(),
+        };
+        let roles = Roles::build(&v).unwrap();
+        let shows = [a, b, c].map(|id| roles.fields[&id].visible);
+        assert_eq!(shows, [true, true, false]);
+    }
+
+    /// A signed one-page document with an empty form, and a revision adding signature field S
+    /// with `depth` nodes below it, the last listing a widget on the page that acts if `act`.
+    fn signature_field_added(depth: usize, act: bool) -> (Vec<u8>, Pdf) {
+        let mut p = Pdf::new();
+        p.insert_blank(0, 300.0, 200.0).unwrap();
+        let page = p.page_ids()[0];
+        let empty: Vec<Object> = Vec::new();
+        let form = p.doc.add_object(dictionary! { "Fields" => empty });
+        p.doc.catalog_mut().unwrap().set("AcroForm", form);
+        let signed = p.snapshot().unwrap();
+        let mut p = Pdf::from_bytes(&signed, None).unwrap();
+        let d = &mut p.doc;
+        let rect = vec![Object::from(10), 10.into(), 110.into(), 60.into()];
+        let mut w = dictionary! { "Subtype" => "Widget", "Rect" => rect, "P" => page };
+        if act {
+            let js = Object::string_literal("app.alert(1)");
+            w.set("A", dictionary! { "S" => "JavaScript", "JS" => js });
+        }
+        let mut top = d.add_object(w);
+        (d.get_dictionary_mut(page).unwrap()).set("Annots", vec![Object::from(top)]);
+        for _ in 0..depth {
+            top = d.add_object(dictionary! { "Kids" => vec![Object::from(top)] });
+        }
+        let s = Object::string_literal("S");
+        let kids = vec![Object::from(top)];
+        let s = d.add_object(dictionary! { "FT" => "Sig", "T" => s, "Kids" => kids });
+        (d.get_dictionary_mut(form).unwrap()).set("Fields", vec![Object::from(s)]);
+        (signed, p)
+    }
+
+    /// A signed one-page document with an empty form, and a revision adding signature field S
+    /// with a kid for each of `depths`, that many nodes above field `X{i}` holding a document
+    /// timestamp.
+    fn timestamp_field_added(depths: &[usize]) -> (Vec<u8>, Pdf) {
+        let mut p = Pdf::new();
+        p.insert_blank(0, 300.0, 200.0).unwrap();
+        let empty: Vec<Object> = Vec::new();
+        let form = p.doc.add_object(dictionary! { "Fields" => empty });
+        p.doc.catalog_mut().unwrap().set("AcroForm", form);
+        let signed = p.snapshot().unwrap();
+        let mut p = Pdf::from_bytes(&signed, None).unwrap();
+        let d = &mut p.doc;
+        let mut kids = Vec::new();
+        for (i, &depth) in depths.iter().enumerate() {
+            let stamp = dictionary! { "Type" => "DocTimeStamp", "SubFilter" => "ETSI.RFC3161" };
+            let x = Object::string_literal(format!("X{i}"));
+            let mut top = d.add_object(dictionary! { "T" => x, "V" => stamp });
+            for _ in 0..depth {
+                top = d.add_object(dictionary! { "Kids" => vec![Object::from(top)] });
+            }
+            kids.push(Object::from(top));
+        }
+        let s = Object::string_literal("S");
+        let s = d.add_object(dictionary! { "FT" => "Sig", "T" => s, "Kids" => kids });
+        (d.get_dictionary_mut(form).unwrap()).set("Fields", vec![Object::from(s)]);
+        (signed, p)
+    }
+
+    /// A signature field added after a certification allowing no changes, a document
+    /// timestamp in a field below it: allowed when the report lists that timestamp; 40 levels
+    /// down, past what it lists, nothing would check it, so it's refused, also beside one the
+    /// report lists (which was all that was judged).
+    #[test]
+    fn a_new_signature_the_report_doesnt_list_is_refused() {
+        let certified = Some(Permissions::NoChanges);
+        let (signed, p) = timestamp_field_added(&[0]);
+        let stamped = (ChangeKind::DocumentTimestamp("S.X0".into()), None, true);
+        let found = changes_certified(&signed, &p, certified);
+        assert_eq!(found, std::slice::from_ref(&stamped));
+        let (signed, p) = timestamp_field_added(&[40]);
+        let found = changes_certified(&signed, &p, certified);
+        assert!(!found.is_empty() && found.iter().all(|f| !f.2), "{found:?}");
+        let (signed, p) = timestamp_field_added(&[0, 40]);
+        let found = changes_certified(&signed, &p, certified);
+        let refused = found.iter().any(|f| !f.2);
+        assert!(found.contains(&stamped) && refused, "{found:?}");
+    }
+
+    /// A signature field added after signing with its widget 70 levels down is judged as one
+    /// with the widget right under it: its action is refused, and so, when the document is
+    /// certified for filling in forms, is its showing on the page.
+    #[test]
+    fn a_new_signature_fields_deep_widget_is_judged() {
+        for act in [true, false] {
+            let certified = (!act).then_some(Permissions::FormFilling);
+            let (signed, p) = signature_field_added(0, act);
+            let plain = changes_certified(&signed, &p, certified);
+            assert!(plain.iter().any(|f| !f.2), "{plain:?}");
+            let (signed, p) = signature_field_added(70, act);
+            assert_eq!(changes_certified(&signed, &p, certified), plain);
+        }
+    }
+
+    /// 2,000 signature fields added after signing: judging them looks at each field a couple
+    /// of times (4,000 looks), not at every field for each one (4,000,000).
+    #[test]
+    fn new_signature_fields_are_looked_at_a_couple_of_times_each() {
+        let mut p = Pdf::new();
+        p.insert_blank(0, 300.0, 200.0).unwrap();
+        let empty: Vec<Object> = Vec::new();
+        let form = p.doc.add_object(dictionary! { "Fields" => empty });
+        p.doc.catalog_mut().unwrap().set("AcroForm", form);
+        let signed = p.snapshot().unwrap();
+        let mut p = Pdf::from_bytes(&signed, None).unwrap();
+        let fields: Vec<Object> = (0..2_000)
+            .map(|i| {
+                let t = Object::string_literal(format!("s{i}"));
+                let field = p.doc.add_object(dictionary! { "FT" => "Sig", "T" => t });
+                field.into()
+            })
+            .collect();
+        (p.doc.get_dictionary_mut(form).unwrap()).set("Fields", fields);
+        FIELDS_LOOKED.set(0);
+        let found = changes_since(&signed, &p);
+        assert_eq!(found.len(), 2_000);
+        let looked = FIELDS_LOOKED.get();
+        assert!(looked <= 10_000, "{looked} fields looked at");
+    }
+
+    /// A revision after signing, a later signature ending in the 64 KB of spaces after it, and
+    /// 500 empty revisions after the spaces: telling which revisions end at each version's
+    /// end looks at each byte a few times, not at the spaces once a revision (96 MB before),
+    /// and the changes found are those without the spaces and empty revisions.
+    #[test]
+    fn white_space_after_a_signature_end_is_looked_at_once() {
+        let mut p = Pdf::new();
+        p.insert_blank(0, 300.0, 200.0).unwrap();
+        let signed = p.snapshot().unwrap();
+        let mut p = Pdf::from_bytes(&signed, None).unwrap();
+        let page = p.page_ids()[0];
+        p.doc.get_dictionary_mut(page).unwrap().set("Rotate", 90);
+        let plain = append_revision(&signed, &p.doc).unwrap().bytes;
+        let mut bytes = plain.clone();
+        let later = bytes.len() + 1;
+        bytes.resize(bytes.len() + 65_536, b' ');
+        let trailer = Pdf::from_bytes(&plain, None).unwrap().doc.trailer;
+        let (num, gen) = trailer.get(b"Root").unwrap().as_reference().unwrap();
+        let size = trailer.get(b"Size").unwrap().as_i64().unwrap();
+        let mut prev = last_startxref(&plain).unwrap();
+        // Each a cross-reference stream listing only itself, as the revision before.
+        for n in size..size + 500 {
+            let at = bytes.len();
+            let dict = format!(
+                "<< /Type /XRef /Size {} /Root {num} {gen} R /Prev {prev} /W [1 4 2] \
+                 /Index [{n} 1] /Length 7 >>",
+                n + 1
+            );
+            let head = format!("{n} 0 obj\n{dict}\nstream\n");
+            bytes.extend_from_slice(head.as_bytes());
+            bytes.push(1);
+            bytes.extend_from_slice(&(at as u32).to_be_bytes());
+            bytes.extend_from_slice(&[0, 0]);
+            let tail = format!("\nendstream\nendobj\nstartxref\n{at}\n%%EOF\n");
+            bytes.extend_from_slice(tail.as_bytes());
+            prev = at;
+        }
+        let end = signed.len();
+        let changes = |bytes: &[u8], sig_ends: &[usize]| {
+            let whole = Pdf::from_bytes(bytes, None).unwrap();
+            let mut versions = Versions::new(bytes, None, &whole);
+            let (listed, mut cache) = (listed(&whole), HashMap::new());
+            SCANNED.set(0);
+            let found = changes_after(&mut versions, bytes, end, sig_ends, &listed, &mut cache);
+            let found: Vec<_> = found.into_iter().map(|s| (s.kind, s.need)).collect();
+            (found, SCANNED.get())
+        };
+        let (found, scanned) = changes(&bytes, &[end, later]);
+        assert!(scanned <= 4 * bytes.len(), "{scanned} bytes looked at");
+        assert!(!found.is_empty());
+        assert_eq!(found, changes(&plain, &[end]).0);
+    }
 }

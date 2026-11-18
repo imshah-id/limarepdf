@@ -4,6 +4,7 @@
 
 use limarepdf_core::render;
 use limarepdf_core::{Cipher, Encryption, Pdf, Restrictions};
+use lopdf::{dictionary, Document, Object, ObjectId};
 
 /// A page's content: a black box over most of a 200 × 100 page.
 const CONTENT: &str = "0 g 20 20 160 60 re f";
@@ -425,6 +426,176 @@ fn a_page_whose_number_another_object_takes() {
     let (mut b, at) = body(&o);
     table(&mut b, &at, "/Root 1 0 R /Info 5 0 R");
     page_list_mended(&b);
+}
+
+// Nodes of a page list sharing one list of kids, as no well-made file has, that has pages
+// written directly in it: each node has pages of its own, as before the list was shared.
+
+/// `doc` saved, with a catalog whose page list is `root`.
+fn saved(mut doc: Document, root: ObjectId) -> Vec<u8> {
+    let catalog = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => root });
+    doc.trailer.set("Root", catalog);
+    let mut b = Vec::new();
+    doc.save_to(&mut b).unwrap();
+    b
+}
+
+/// A page written directly in a list of kids, holding `extra` too.
+fn written_page(extra: Option<(&str, Object)>) -> Object {
+    let mut page = dictionary! { "Type" => "Page" };
+    if let Some((key, value)) = extra {
+        page.set(key, value);
+    }
+    page.into()
+}
+
+fn media_box(width: i64) -> Object {
+    vec![0.into(), 0.into(), width.into(), 100.into()].into()
+}
+
+/// The pages of `pdf`, and how many of them are different objects.
+fn pages(pdf: &Pdf) -> (usize, usize) {
+    let mut ids = pdf.page_ids();
+    let all = ids.len();
+    ids.sort();
+    ids.dedup();
+    (all, ids.len())
+}
+
+/// A file whose root lists `k` nodes, each listing one list object holding a page written
+/// in it with `extra`.
+fn nodes_sharing_a_page(k: usize, extra: Option<(&str, Object)>) -> Vec<u8> {
+    let mut doc = Document::with_version("1.7");
+    let list = doc.add_object(vec![written_page(extra)]);
+    let nodes: Vec<Object> = (0..k)
+        .map(|_| {
+            let node =
+                dictionary! { "Type" => "Pages", "Kids" => list, "MediaBox" => media_box(200) };
+            doc.add_object(node).into()
+        })
+        .collect();
+    let root = doc.add_object(dictionary! { "Type" => "Pages", "Kids" => nodes });
+    saved(doc, root)
+}
+
+#[test]
+fn nodes_sharing_a_list_with_a_page_written_in_it_each_have_their_page() {
+    // The nodes took one copy of the page between them, and lopdf reads no more of a page
+    // list than the file has objects: 103 of the 200 pages opened, all one page.
+    let k = 200;
+    let pdf = Pdf::from_bytes(&nodes_sharing_a_page(k, None), None).unwrap();
+    assert!(pdf.repaired());
+    assert_eq!(pages(&pdf), (k, k));
+}
+
+#[test]
+fn nodes_sharing_a_list_with_pages_written_in_it_each_give_their_pages_their_size() {
+    // Two nodes, 100 and 300 wide, list one list object holding two pages written in it.
+    // The nodes took one copy of the pages between them: two pages, each twice.
+    let mut doc = Document::with_version("1.7");
+    let list = doc.add_object(vec![written_page(None), written_page(None)]);
+    let nodes: Vec<Object> = [100, 300]
+        .map(|width| {
+            let node =
+                dictionary! { "Type" => "Pages", "Kids" => list, "MediaBox" => media_box(width) };
+            doc.add_object(node).into()
+        })
+        .into();
+    let root = doc.add_object(dictionary! { "Type" => "Pages", "Kids" => nodes });
+    let pdf = Pdf::from_bytes(&saved(doc, root), None).unwrap();
+    assert_eq!(pages(&pdf), (4, 4));
+    let widths: Vec<f32> = (0..4).map(|i| pdf.page_size(i).unwrap().0).collect();
+    assert_eq!(widths, [100.0, 100.0, 300.0, 300.0]);
+}
+
+#[test]
+fn nodes_each_listing_every_node_and_a_page_written_in_it() {
+    // Every node lists one list object holding every node and a page written in it, and
+    // the root is the first node. lopdf goes down the first node 256 deep before it reads
+    // the page, more of the list than it reads when the nodes took one copy of the page
+    // between them: the file was refused.
+    let n = 300;
+    let mut doc = Document::with_version("1.7");
+    let list = doc.new_object_id();
+    let nodes: Vec<Object> = (0..n)
+        .map(|_| {
+            doc.add_object(dictionary! { "Type" => "Pages", "Kids" => list })
+                .into()
+        })
+        .collect();
+    let mut kids = nodes.clone();
+    kids.push(written_page(Some(("MediaBox", media_box(300)))));
+    doc.objects.insert(list, Object::Array(kids));
+    let root = nodes[0].as_reference().unwrap();
+    let pdf = Pdf::from_bytes(&saved(doc, root), None).unwrap();
+    assert_eq!(pages(&pdf), (1, 1));
+    assert_eq!(pdf.page_size(0).unwrap(), (300.0, 100.0));
+}
+
+#[test]
+fn nodes_sharing_a_list_too_large_to_copy_for_each_are_refused() {
+    // The page written in the list holds 4 MiB of text: a copy for each of 4 nodes is
+    // taken, but one for each of 20 is more than LimarePDF takes to mend a file.
+    let text = || Some(("Text", Object::string_literal(vec![b'a'; 4 << 20])));
+    let pdf = Pdf::from_bytes(&nodes_sharing_a_page(4, text()), None).unwrap();
+    assert_eq!(pages(&pdf), (4, 4));
+    let e = Pdf::from_bytes(&nodes_sharing_a_page(20, text()), None)
+        .err()
+        .expect("it opens");
+    assert!(format!("{e:#}").contains("too complex"), "{e:#}");
+}
+
+/// A page list node listing `kids`.
+fn node(doc: &mut Document, kids: Object) -> ObjectId {
+    doc.add_object(dictionary! { "Type" => "Pages", "Kids" => kids })
+}
+
+/// The top of a chain of `len` nodes, each listing the next, the last listing `kids`.
+fn chain(doc: &mut Document, len: usize, kids: Object) -> ObjectId {
+    (1..len).fold(node(doc, kids), |below, _| {
+        node(doc, vec![below.into()].into())
+    })
+}
+
+#[test]
+fn a_node_first_reached_far_down_is_mended_from_nearer_the_top() {
+    // Node Y, with a node written in its list holding a page written in its own, is two
+    // below the root through K, and 64 below at the end of a chain. A list K is in, that a
+    // node beside the chain lists again, was walked once, so the chain reached Y first, too
+    // deep to mend the page below it: the file was refused as having no pages.
+    let mut doc = Document::with_version("1.7");
+    let page = written_page(Some(("MediaBox", media_box(200))));
+    let written = dictionary! { "Type" => "Pages", "Kids" => vec![page] };
+    let y = node(&mut doc, vec![written.into()].into());
+    let k = node(&mut doc, vec![y.into()].into());
+    let c1 = chain(&mut doc, 61, vec![y.into()].into());
+    let list = doc.new_object_id();
+    let again = node(&mut doc, list.into());
+    let z = node(&mut doc, vec![c1.into(), again.into()].into());
+    doc.objects
+        .insert(list, Object::Array(vec![k.into(), z.into()]));
+    let shared = node(&mut doc, list.into());
+    let root = node(&mut doc, vec![shared.into()].into());
+    let pdf = Pdf::from_bytes(&saved(doc, root), None).unwrap();
+    assert_eq!(pages(&pdf).1, 1);
+    assert_eq!(pdf.page_size(0).unwrap(), (200.0, 100.0));
+}
+
+#[test]
+fn a_shared_list_first_reached_far_down_is_mended_from_nearer_the_top() {
+    // A list holding a node with a page written in its list is listed at the end of a chain
+    // 64 deep, too deep to mend the page, and by a node one below the root: that node
+    // mends it.
+    let mut doc = Document::with_version("1.7");
+    let page = written_page(Some(("MediaBox", media_box(200))));
+    let n = node(&mut doc, vec![page].into());
+    let list = doc.add_object(vec![n.into()]);
+    let deep = chain(&mut doc, 64, list.into());
+    let near = node(&mut doc, list.into());
+    let root = node(&mut doc, vec![near.into(), deep.into()].into());
+    let pdf = Pdf::from_bytes(&saved(doc, root), None).unwrap();
+    assert_eq!(pages(&pdf), (2, 1));
+    assert_eq!(pdf.page_size(0).unwrap(), (200.0, 100.0));
 }
 
 #[test]

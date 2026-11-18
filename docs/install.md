@@ -17,8 +17,8 @@ Pick your system:
 
 - **Windows:** Windows 10 or 11, 64-bit (x64).
 - **macOS:** macOS 11 (Big Sur) or later, on Apple Silicon or Intel.
-- **Linux:** 64-bit (x86_64) with glibc 2.39 or later, as in Ubuntu 24.04, Debian 13, Fedora 40, current Arch
-  Linux and later; a working Vulkan or OpenGL graphics driver; and an X11 or Wayland desktop session. On older
+- **Linux:** 64-bit (x86_64) with glibc 2.43 or later, as in Ubuntu 26.04, Fedora 44, current Arch Linux and
+  openSUSE Tumbleweed, and later (Debian 13 has an older glibc); a working Vulkan or OpenGL graphics driver; and an X11 or Wayland desktop session. On older
   systems, you can [build LimarePDF from source](#build-from-source). If you'd like packages for an older system,
   [say so](troubleshooting.md#reporting-a-problem): they could be made if enough people need them.
 - **Printing:** CUPS on Linux and macOS (macOS includes it).
@@ -83,8 +83,8 @@ Fedora: `sudo dnf config-manager addrepo --from-repofile=https://smaug42.github.
 `sudo dnf install limarepdf`. openSUSE: `sudo zypper addrepo https://smaug42.github.io/limarepdf/rpm/limarepdf.repo`, then
 `sudo zypper install limarepdf`.
 
-Each release also has a `.deb` (Debian 13, Ubuntu 24.04 and later) and an `.rpm` (Fedora 40 and later, openSUSE
-Tumbleweed) to download and install by hand. Like the archives, they need glibc 2.39 or later; on older
+Each release also has a `.deb` (Ubuntu 26.04 and later) and an `.rpm` (Fedora 44 and later, openSUSE
+Tumbleweed) to download and install by hand. Like the archives, they need glibc 2.43 or later; on older
 systems, [build from source](#build-from-source). They install `limarepdf` and `limarepdf-cli` in `/usr/bin`, with
 the menu entry, the icon, the licences and a README that links to this guide online, and pull in the libraries the
 app needs.

@@ -238,16 +238,13 @@ impl Pdf {
         reach: Reach,
     ) -> Vec<String> {
         let ids = self.page_ids();
-        let mut drawn = HashSet::new();
-        for page in pages.iter().filter_map(|&i| ids.get(i)) {
-            for id in self.all_annot_refs(*page) {
-                if let Ok(d) = self.doc.get_dictionary(id) {
-                    if matches!(which(self, d), Flat::Draw) {
-                        drawn.insert(id);
-                    }
-                }
-            }
-        }
+        let on: Vec<ObjectId> = pages.iter().filter_map(|&i| ids.get(i).copied()).collect();
+        let drawn: HashSet<ObjectId> = (self.listed_annots(&on).into_iter())
+            .map(|(_, id)| id)
+            .filter(|&id| {
+                (self.doc.get_dictionary(id)).is_ok_and(|d| matches!(which(self, d), Flat::Draw))
+            })
+            .collect();
         let mut out = Vec::new();
         for (field, node) in self.field_nodes(reach).0 {
             let lost = node.widgets.iter().any(|w| {

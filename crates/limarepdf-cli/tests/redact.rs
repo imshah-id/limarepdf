@@ -170,7 +170,7 @@ fn marks_made_with_mark_only_are_applied_later() {
     let mark = ["redact", "in.pdf", "-o", "marked.pdf", "--text", "zebra"];
     ok(&dir, &[&mark[..], &["--mark-only"]].concat());
     let marked = Pdf::open(dir.join("marked.pdf"), None).unwrap();
-    assert_eq!(marked.redaction_marks().len(), 1);
+    assert_eq!(marked.redaction_marks().unwrap().len(), 1);
     let text = marked.page_text(0);
     assert!(text.contains("Name: Zebra here"), "removed: {text:?}");
 
@@ -178,7 +178,10 @@ fn marks_made_with_mark_only_are_applied_later() {
     ok(&dir, &apply);
     let out = dir.join("applied.pdf");
     let applied = Pdf::open(&out, None).unwrap();
-    assert!(applied.redaction_marks().is_empty(), "the marks are left");
+    assert!(
+        applied.redaction_marks().unwrap().is_empty(),
+        "the marks are left"
+    );
     let text = applied.page_text(0);
     assert!(!text.contains("Zebra"), "{text:?}");
     for kept in ["Name:", "here", "Second Quokka line"] {

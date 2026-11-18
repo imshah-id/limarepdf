@@ -27,14 +27,17 @@
 //! The drawings are followed once before anything changes ([`Pdf::reach`]), so a document
 //! too complex to follow within the budget is refused unchanged.
 
+use crate::annot_ap::{self, Place};
+use crate::annots::with_replies;
+use crate::budget::{self, Work};
 use crate::fonts::FontCtx;
 use crate::matrix::{self as mx, apply, mul, M};
-use crate::objects::span_boxes;
+use crate::objects::{refused, span_boxes, STEPS};
 use crate::reach::{self, Decoded, Reach, Uses};
 use crate::redact_img::{black_out, inline_stream, is_clear};
 use crate::retained::{alt_refs, references_in, unread_said, Removed};
 use crate::trees::{self, Lookup};
-use crate::{Pdf, Result};
+use crate::{Annot, Pdf, Result};
 use anyhow::{anyhow, bail};
 use lopdf::content::{Content, Operation};
 use lopdf::{Dictionary, Object, ObjectId, Stream};
@@ -240,6 +243,21 @@ fn nums(op: &Operation) -> Vec<f32> {
         .collect()
 }
 
+/// The areas the redaction marks among `all` cover ([`Pdf::redaction_marks`]).
+fn marks_of(all: Vec<Annot>) -> Vec<(usize, [f32; 4])> {
+    all.into_iter()
+        .filter(|a| a.kind == crate::AnnotKind::Redact)
+        .flat_map(|a| {
+            let boxes = if a.quads.is_empty() {
+                vec![a.bbox]
+            } else {
+                a.quads
+            };
+            boxes.into_iter().map(move |b| (a.page, b))
+        })
+        .collect()
+}
+
 /// Lowercase, with whitespace runs as one space: how removed text is looked for.
 fn fold(s: &str) -> String {
     s.split_whitespace()
@@ -294,6 +312,17 @@ struct Marked {
     touched: bool,
 }
 
+/// The annotations the marks touch ([`Pdf::annots_under`]).
+#[derive(Default)]
+struct Under {
+    /// How many go with each marked page, by its number, replies included.
+    counts: HashMap<usize, usize>,
+    /// Those that go, with the replies to them; their popups go too.
+    gone: HashSet<ObjectId>,
+    /// The form widgets among them.
+    widgets: HashSet<ObjectId>,
+}
+
 struct Redactor<'a> {
     pdf: &'a Pdf,
     /// The marks, in page user space.
@@ -317,6 +346,11 @@ struct Redactor<'a> {
     /// keeps every name, the removed ones' too.
     unread: bool,
     out: PageRedaction,
+    /// The page's budget: a step for each operator and each form followed, and for each
+    /// kilobyte of a form's content (PB-104).
+    work: Work,
+    /// The forms being redacted inside, outermost first (`None` for one held in place).
+    forms: Vec<Option<ObjectId>>,
 }
 
 impl<'a> Redactor<'a> {
@@ -334,6 +368,8 @@ impl<'a> Redactor<'a> {
             uses,
             unread: false,
             out: PageRedaction::default(),
+            work: Work::new("redacting the page", budget::limit(STEPS)),
+            forms: Vec::new(),
         }
     }
 
@@ -437,6 +473,7 @@ impl<'a> Redactor<'a> {
         let mut xobjs_changed = false;
 
         for o in ops {
+            self.work.take(1)?;
             let v = nums(&o);
             let name = o.operator.clone();
             let is_path = matches!(name.as_str(), "m" | "l" | "c" | "v" | "y" | "re" | "h");
@@ -606,14 +643,21 @@ impl<'a> Redactor<'a> {
                             let fctm = mul(fm, gs.ctm);
                             if self.hit(mx::transform_rect(fctm, bbox)) {
                                 // Redacted inside as deep as drawings are followed; deeper
-                                // ones under a mark go whole.
-                                let redone = if nesting < crate::MAX_FORM_NESTING {
-                                    self.form(s, &res, fctm, nesting + 1)?
+                                // ones under a mark go whole, and so does one drawn again
+                                // inside itself, which hayro doesn't draw there and other
+                                // viewers might (PB-104).
+                                let again = id.is_some() && self.forms.contains(&id);
+                                let redone = if nesting < crate::MAX_FORM_NESTING && !again {
+                                    self.forms.push(id);
+                                    let redone = self.form(s, &res, fctm, nesting + 1);
+                                    self.forms.pop();
+                                    redone?
                                 } else {
                                     None
                                 };
                                 let Some(new) = redone.map(|f| f.map(Object::Reference)) else {
-                                    // Too deep, or unreadable: the whole form goes.
+                                    // Too deep, drawn again, or unreadable: the whole form
+                                    // goes.
                                     self.out.images += 1;
                                     self.dropped.extend(id);
                                     changed = true;
@@ -710,7 +754,7 @@ impl<'a> Redactor<'a> {
 
     /// Redact inside a form XObject drawn with `ctm`. `Ok(None)`: the form can't be read
     /// (so it has to go whole); `Ok(Some(None))`: nothing in it was under a mark;
-    /// `Ok(Some(Some(id)))`: the redacted copy.
+    /// `Ok(Some(Some(id)))`: the redacted copy. Refused past the page's budget.
     fn form(
         &mut self,
         s: &Stream,
@@ -718,9 +762,11 @@ impl<'a> Redactor<'a> {
         ctm: M,
         nesting: usize,
     ) -> Result<Option<Option<ObjectId>>> {
+        self.work.take(1)?;
         let Ok(data) = s.get_plain_content_with_limit(crate::MAX_CONTENT) else {
             return Ok(None);
         };
+        self.work.take(data.len() as u64 / 1024)?;
         let own = s
             .dict
             .get(b"Resources")
@@ -728,6 +774,7 @@ impl<'a> Redactor<'a> {
             .map(|o| self.pdf.resolved_dict(Some(o)));
         let inner = match self.content(&data, own.as_ref().unwrap_or(res), ctm, nesting) {
             Ok(r) => r,
+            Err(e) if refused(&e) => return Err(e),
             Err(_) => return Ok(None),
         };
         if !inner.changed {
@@ -1188,37 +1235,41 @@ impl Pdf {
     }
 
     /// The areas the document's redaction marks cover: (page, box in displayed-page
-    /// points, y down), one per marked area. Every mark counts, not only those shown.
-    pub fn redaction_marks(&self) -> Vec<(usize, [f32; 4])> {
-        self.every_annotation()
-            .into_iter()
-            .filter(|a| a.kind == crate::AnnotKind::Redact)
-            .flat_map(|a| {
-                let boxes = if a.quads.is_empty() {
-                    vec![a.bbox]
-                } else {
-                    a.quads
-                };
-                boxes.into_iter().map(move |b| (a.page, b))
-            })
-            .collect()
+    /// points, y down), one per marked area. Every mark counts, not only those shown, on
+    /// each page that lists it. Marks are placed and read as [`Pdf::annotations`] places
+    /// and reads them, and refused past either budget ([`crate::TooComplex`]) rather than
+    /// give one elsewhere than it is shown; [`Pdf::redaction_mark_count`] counts them
+    /// still.
+    pub fn redaction_marks(&self) -> Result<Vec<(usize, [f32; 4])>> {
+        let mut place = Place::drawn().stopping();
+        let marks = marks_of(self.every_mark(&mut place));
+        place.whole()?;
+        Ok(marks)
+    }
+
+    /// How many redaction marks the document has: marks, not the areas
+    /// [`Pdf::redaction_marks`] gives (a mark over several lines is one, PB-40), each once
+    /// however many pages list it, as the listing gives them (Q1), and those written into a
+    /// page's list directly, which applying applies too. None is built and nothing is
+    /// charged to a budget, so it is never refused. For the marks banner and the questions
+    /// before saving and applying, asked after every change.
+    pub fn redaction_mark_count(&self) -> usize {
+        self.count_of_kind(|k| *k == crate::AnnotKind::Redact)
     }
 
     /// Apply the document's redaction marks: remove everything under them as
     /// [`Pdf::redact`] does, then remove the marks. Refused, with nothing changed, as
-    /// [`Pdf::redact`] is.
+    /// [`Pdf::redact`] is, and when placing the marks is too complex
+    /// ([`crate::TooComplex`]), rather than apply one elsewhere than it is shown.
     pub fn apply_redactions(&mut self) -> Result<RedactReport> {
         self.atomically(|p| {
             p.own_direct_annots()?;
-            let marks = p.redaction_marks();
+            let marks = p.redaction_marks()?;
             if marks.is_empty() {
                 bail!("the document has no redaction marks");
             }
             let report = p.redact(&marks)?;
-            let ids = (p.every_annotation().into_iter())
-                .filter(|a| a.kind == crate::AnnotKind::Redact)
-                .map(|a| a.id)
-                .collect();
+            let ids = p.annotations_of_kind(|k| *k == crate::AnnotKind::Redact);
             p.drop_annotations(ids)?;
             Ok(report)
         })
@@ -1227,9 +1278,13 @@ impl Pdf {
     /// Marks covering every match of `query` (as [`Pdf::find_text_matches`] finds them):
     /// (page, box in displayed-page points, y down), one box per line of each match.
     pub fn find_redaction_marks(&self, query: &str) -> Result<Vec<(usize, [f32; 4])>> {
+        let q = crate::Query::new(query);
+        if q.is_empty() {
+            return Ok(Vec::new());
+        }
         let mut out = Vec::new();
-        for p in 0..self.page_count() {
-            for m in self.find_text_matches(p, query)? {
+        for (p, page) in self.page_ids().into_iter().enumerate() {
+            for m in self.text_matches_of(p, page, &q)? {
                 out.extend(m.into_iter().map(|b| (p, b)));
             }
         }
@@ -1256,7 +1311,9 @@ impl Pdf {
     /// [`Pdf::redact`] whatever its check finds ([`RedactReport::left`]), and leaving the
     /// document half changed when it fails: for finding what redacting would do, on a copy.
     pub(crate) fn redact_unchecked(&mut self, marks: &[(usize, [f32; 4])]) -> Result<RedactReport> {
-        let n = self.page_count();
+        // Found once: redacting adds and removes no page.
+        let ids = self.page_ids();
+        let n = ids.len();
         let mut by_page: BTreeMap<usize, Vec<[f32; 4]>> = BTreeMap::new();
         for &(p, b) in marks {
             if p >= n {
@@ -1268,28 +1325,30 @@ impl Pdf {
             }
             by_page.entry(p).or_default().push(b);
         }
-        // Looked up before anything changes, as a structure tree or a form that can't be
-        // followed is refused, and so is a page too complex to read.
+        // Looked up before anything changes, as a structure tree that can't be followed is
+        // refused, and so is a page too complex to read.
         let mut struct_parents = HashMap::new();
-        let mut page_areas = HashMap::new();
+        let mut page_areas = BTreeMap::new();
         let mut texts = HashMap::new();
-        let mut widgets = false;
         for (&p, rects) in &by_page {
-            let page = self.page_id_at(p)?;
+            let page = ids[p];
             let (vd, _, _) = self.vis_down(page);
             let areas: Vec<[f32; 4]> = rects.iter().map(|&b| mx::transform_rect(vd, b)).collect();
-            widgets |= self.widget_touched(page, &areas);
             struct_parents.insert(p, self.struct_parents(page)?);
-            texts.insert(p, self.text_under(p, &areas)?);
+            texts.insert(p, self.text_under(page, &areas)?);
             page_areas.insert(p, areas);
         }
-        if widgets {
+        // Annotations written into `/Annots` get objects first, to be found and followed.
+        // Those the marks touch are found now, with one budget for all the pages, and a form
+        // that can't be followed is refused when one is a widget.
+        self.own_direct_annots()?;
+        let under = self.annots_under(&ids, &page_areas, &mut annot_ap::work())?;
+        if !under.widgets.is_empty() {
             self.value_nodes()?;
         }
         // Drawings too complex to follow are refused now, not halfway through: every
-        // annotation's appearances too, so those written into `/Annots` get objects first.
-        // What they paint with now, so that a pattern only what goes painted with goes too.
-        self.own_direct_annots()?;
+        // annotation's appearances too. What they paint with now, so that a pattern only
+        // what goes painted with goes too.
         let mut uses = Decoded::new();
         let before = self.reach(&mut reach::work(), &mut uses)?;
         let mut report = RedactReport::default();
@@ -1299,7 +1358,7 @@ impl Pdf {
         };
         let (mut alts, mut unread, mut added_all) = (Vec::new(), Vec::new(), 0);
         for &p in by_page.keys() {
-            let page = self.page_id_at(p)?;
+            let page = ids[p];
             let areas = page_areas.remove(&p).unwrap_or_default();
             let data = self
                 .doc
@@ -1358,13 +1417,18 @@ impl Pdf {
                     .extend(pd.remove(k).iter().flat_map(references_in));
             }
             (removed.texts).extend(self.strip_struct_alt(&struct_parents[&p], &mcids));
-            let (annots, annots_gone) = self.redact_annots(page, &areas)?;
-            removed.annots.extend(annots_gone);
-            out.annots = annots;
+            out.annots = under.counts.get(&p).copied().unwrap_or(0);
             out.page = p;
             out.text = text;
             removed.xobjects.extend(gone);
             report.pages.push(out);
+        }
+        // The annotations go once, after every page: each list is changed once.
+        if !under.gone.is_empty() {
+            removed.annots.extend(self.take_out(&ids, &under.gone)?);
+        }
+        if !under.widgets.is_empty() {
+            self.prune_fields(&under.widgets, true)?;
         }
         removed.alts.extend(alts.iter().cloned());
         self.annots_held(&mut removed);
@@ -1375,22 +1439,22 @@ impl Pdf {
         removed.xobjects.extend(drawn);
         let reach = self.reach(&mut reach::work_after(added_all), &mut uses)?;
         let retained = self.clear_retained(&removed, &reach);
-        report.left = self.check_left(&by_page);
+        report.left = self.check_left(&ids, &by_page);
         unread.extend(retained.unread);
         unread.sort_unstable();
         unread.dedup();
         report.left.extend(unread.iter().map(|&p| unread_said(p)));
         report.left.extend(retained.left);
         report.pictures_elsewhere = retained.pictures;
-        report.elsewhere = self.find_elsewhere(&report, &alts, &reach);
+        report.elsewhere = self.find_elsewhere(&report, &alts, &reach)?;
         Ok(report)
     }
 
-    /// The text of page `p` under `areas` (page user space), as the page is read (so with
+    /// The text of `page` under `areas` (page user space), as the page is read (so with
     /// the spaces search sees): one entry per run of characters on a line. None for a page
     /// that can't be read; refused for one too complex to read.
-    fn text_under(&self, p: usize, areas: &[[f32; 4]]) -> Result<Vec<String>> {
-        let parsed = match self.parse_page(p) {
+    fn text_under(&self, page: ObjectId, areas: &[[f32; 4]]) -> Result<Vec<String>> {
+        let parsed = match self.parse_page_of(page) {
             Ok(parsed) => parsed,
             Err(e) if crate::objects::refused(&e) => return Err(e),
             Err(_) => return Ok(Vec::new()),
@@ -1422,64 +1486,68 @@ impl Pdf {
         Ok(out)
     }
 
-    /// Remove the annotations on `page` touching any of `areas` (page user space).
-    /// Returns how many went, replies included, and the annotations removed, popups too.
-    fn redact_annots(
-        &mut self,
-        page: ObjectId,
-        areas: &[[f32; 4]],
-    ) -> Result<(usize, HashSet<ObjectId>)> {
-        let mut gone = HashSet::new();
-        let mut widgets = HashSet::new();
-        for id in self.all_annot_refs(page) {
-            let Ok(d) = self.doc.get_dictionary(id) else {
+    /// The annotations touching the marks `page_areas` (page user space, by page number, of
+    /// `ids`), with the replies to them, redaction marks left out. Each list is read once
+    /// however many marked pages share it; each entry each page looks at is charged to
+    /// `work`, as is drawing those placed where they are drawn (PB-114). A page counts those
+    /// going with it: one gone with an earlier page, or its popup, isn't counted again.
+    fn annots_under(
+        &self,
+        ids: &[ObjectId],
+        page_areas: &BTreeMap<usize, Vec<[f32; 4]>>,
+        work: &mut Work,
+    ) -> Result<Under> {
+        // Each list's annotations, with whether each is a form widget, and its boxes: its
+        // `/Rect`, and for one placed by its points, where it is drawn.
+        type Listed = (ObjectId, bool, [Option<[f32; 4]>; 2]);
+        let mut lists: HashMap<ObjectId, Vec<Listed>> = HashMap::new();
+        let mut replies = None;
+        let mut under = Under::default();
+        for (&p, areas) in page_areas {
+            let page = ids[p];
+            let Some((at, list)) = self.annots_at(page) else {
                 continue;
             };
-            let sub = d.get(b"Subtype").and_then(|o| o.as_name()).unwrap_or(b"");
-            if sub == b"Redact" {
-                continue;
-            }
-            // Its `/Rect`, and for one placed by its points, where it is drawn (PB-114).
-            let boxes = [
-                d.get(b"Rect").ok().and_then(|o| self.rect(o)),
-                self.annot_rect(d),
-            ];
-            let hit = |b: &[f32; 4]| areas.iter().any(|&a| touches(norm(*b), a));
-            if boxes.iter().flatten().any(hit) {
-                gone.insert(id);
-                if sub == b"Widget" {
-                    widgets.insert(id);
+            let key = at.unwrap_or(page);
+            match lists.get(&key) {
+                Some(boxed) => work.take(boxed.len() as u64)?,
+                None => {
+                    work.take(list.len() as u64)?;
+                    #[cfg(test)]
+                    crate::annots::entries_read(list.len());
+                    let mut boxed = Vec::new();
+                    for id in list.iter().filter_map(|o| o.as_reference().ok()) {
+                        let Ok(d) = self.doc.get_dictionary(id) else {
+                            continue;
+                        };
+                        let sub = d.get(b"Subtype").and_then(|o| o.as_name()).unwrap_or(b"");
+                        if sub == b"Redact" {
+                            continue;
+                        }
+                        let rect = d.get(b"Rect").ok().and_then(|o| self.rect(o));
+                        boxed.push((id, sub == b"Widget", [rect, self.annot_rect(d, work)?]));
+                    }
+                    lists.insert(key, boxed);
                 }
             }
+            let hit = |b: &[f32; 4]| areas.iter().any(|&a| touches(norm(*b), a));
+            let hits: Vec<(ObjectId, bool)> = (lists[&key].iter())
+                .filter(|(_, _, boxes)| boxes.iter().flatten().any(hit))
+                .filter(|(id, _, _)| !under.gone.contains(id) && !self.popup_of(*id, &under.gone))
+                .map(|&(id, widget, _)| (id, widget))
+                .collect();
+            if hits.is_empty() {
+                continue;
+            }
+            under
+                .widgets
+                .extend(hits.iter().filter(|h| h.1).map(|h| h.0));
+            let replies = replies.get_or_insert_with(|| self.replies(ids));
+            let before = under.gone.len();
+            with_replies(&mut under.gone, hits.into_iter().map(|h| h.0), replies);
+            under.counts.insert(p, under.gone.len() - before);
         }
-        if gone.is_empty() {
-            return Ok((0, gone));
-        }
-        let out = self.drop_annotations_ids(gone)?;
-        if !widgets.is_empty() {
-            self.prune_fields(&widgets, true)?;
-        }
-        Ok(out)
-    }
-
-    /// Whether [`Pdf::redact_annots`] would remove a form widget of `page`: one touching
-    /// `areas`, direct dictionaries included, as they are given objects before it runs.
-    fn widget_touched(&self, page: ObjectId, areas: &[[f32; 4]]) -> bool {
-        self.annots_array(page).unwrap_or_default().iter().any(|o| {
-            let Some(d) = self
-                .doc
-                .dereference(o)
-                .ok()
-                .and_then(|(_, o)| o.as_dict().ok())
-            else {
-                return false;
-            };
-            d.get(b"Subtype").and_then(|o| o.as_name()).ok() == Some(b"Widget")
-                && d.get(b"Rect")
-                    .ok()
-                    .and_then(|o| self.rect(o))
-                    .is_some_and(|b| areas.iter().any(|&a| touches(norm(b), a)))
-        })
+        Ok(under)
     }
 
     /// The structure elements of `page`'s marked content, by MCID: its entry in the structure
@@ -1556,17 +1624,22 @@ impl Pdf {
         out
     }
 
-    /// Read the redacted pages again: any character or picture still touching a mark.
-    fn check_left(&self, by_page: &BTreeMap<usize, Vec<[f32; 4]>>) -> Vec<String> {
+    /// Read the redacted pages again: any character or picture still touching a mark. `ids`
+    /// are the pages' objects.
+    fn check_left(
+        &self,
+        ids: &[ObjectId],
+        by_page: &BTreeMap<usize, Vec<[f32; 4]>>,
+    ) -> Vec<String> {
         let mut left = Vec::new();
         for (&p, rects) in by_page {
-            let Ok(page) = self.page_id_at(p) else {
+            let Some(&page) = ids.get(p) else {
                 continue;
             };
             let (vd, _, _) = self.vis_down(page);
             let areas: Vec<[f32; 4]> = rects.iter().map(|&b| mx::transform_rect(vd, b)).collect();
             let under = |b: [f32; 4]| areas.iter().any(|&a| touches(norm(b), a));
-            let parsed = match self.parse_page(p) {
+            let parsed = match self.parse_page_of(page) {
                 Ok(x) => x,
                 Err(e) => {
                     left.push(format!(
@@ -1636,13 +1709,15 @@ impl Pdf {
 
     /// Look for the removed text, and the alternative text `alts` taken off, elsewhere: on
     /// any page, in the alternative text of what the pages draw (`reach`, a walk after the
-    /// change), in bookmarks, comments, form fields and the document information.
+    /// change), in bookmarks, comments (each named by the first page that lists it), form
+    /// fields and the document information. Refused when the comments are too many or too
+    /// long to read ([`crate::TooComplex`]), none read past that.
     fn find_elsewhere(
         &self,
         report: &RedactReport,
         alts: &[String],
         reach: &Reach,
-    ) -> Vec<(String, Vec<String>)> {
+    ) -> Result<Vec<(String, Vec<String>)>> {
         let mut queries: Vec<String> = Vec::new();
         let mut add = |q: String| {
             if q.chars().filter(|c| !c.is_whitespace()).count() >= 2 && !queries.contains(&q) {
@@ -1662,7 +1737,7 @@ impl Pdf {
             add(q);
         }
         if queries.is_empty() {
-            return Vec::new();
+            return Ok(Vec::new());
         }
         let n = self.page_count();
         let all: Vec<usize> = (0..n).collect();
@@ -1677,10 +1752,12 @@ impl Pdf {
                 fold(&b.title),
             ));
         }
-        for a in self.every_annotation() {
+        let mut place = Place::own().stopping();
+        for a in self.every_annotation(&mut place) {
             let all = format!("{} {} {}", a.contents, a.author, a.subject);
             other.push((format!("a comment on page {}", a.page + 1), fold(&all)));
         }
+        place.whole()?;
         for f in self.every_form_field() {
             if let crate::FieldValue::Text(v) = &f.value {
                 other.push((format!("form field \u{201c}{}\u{201d}", f.name), fold(v)));
@@ -1719,7 +1796,7 @@ impl Pdf {
                 out.push((q, places));
             }
         }
-        out
+        Ok(out)
     }
 }
 
