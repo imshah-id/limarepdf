@@ -1621,6 +1621,102 @@ fn a_typed_field_moved_into_or_out_of_a_signature_field_is_refused() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// The base document with node `X` of no kind and empty signature field `T`, both listing
+/// widget `K` (titled, of no kind of its own, with no `/Parent`): `X` listed first in the form
+/// if `x_first`. `K` is `T`'s, `T.K`, either way.
+fn kid_of_no_kind_and_of_a_signature_field(x_first: bool) -> Vec<u8> {
+    edit(&base_pdf(), |prev, new| {
+        let k = new.add_object(dictionary! {
+            "Type" => "Annot", "Subtype" => "Widget", "F" => 4, "P" => page(prev),
+            "Rect" => vec![150.into(), 100.into(), 250.into(), 140.into()],
+            "T" => Object::string_literal("K"),
+        });
+        add_annot(prev, new, k);
+        let kids = vec![Object::from(k)];
+        let x = dictionary! { "T" => Object::string_literal("X"), "Kids" => kids.clone() };
+        let x = new.add_object(x);
+        let t = dictionary! { "FT" => "Sig", "T" => Object::string_literal("T"), "Kids" => kids };
+        let t = new.add_object(t);
+        let fields = match x_first {
+            true => vec![Object::from(x), t.into()],
+            false => vec![Object::from(t), x.into()],
+        };
+        let r = root(prev);
+        let mut c = dict(prev, r);
+        c.set("AcroForm", dictionary! { "Fields" => fields });
+        new.set_object(r, Object::Dictionary(c));
+    })
+}
+
+/// `K` of [`kid_of_no_kind_and_of_a_signature_field`] signed, then approved, then its
+/// signature taken out: refused as a change to the signature in `T.K`, whichever of `X` and
+/// `T` is listed first. Before, with `X` first, the check named and typed `K` through `X`, a
+/// field of no kind, while the report showed the signature in `T.K`: its removal passed as
+/// `X.K` filled in, allowed.
+#[test]
+fn a_signature_in_a_field_a_node_of_no_kind_lists_first_stays_one() {
+    let mut wrong = Vec::new();
+    for x_first in [true, false] {
+        let form = kid_of_no_kind_and_of_a_signature_field(x_first);
+        let k = Field {
+            name: "K",
+            existing: true,
+            ..Field::default()
+        };
+        let signed = approve(&sign(&form, &id("p256"), &k, &Cms::default()));
+        let shown: Vec<_> = report(&signed)
+            .signatures
+            .into_iter()
+            .map(|s| s.fields)
+            .collect();
+        assert_eq!(
+            shown,
+            [vec!["T.K"], vec!["Signature1"]],
+            "X first {x_first}"
+        );
+        let e = edit(&signed, |prev, new| {
+            let k = titled(prev, "K");
+            let mut d = dict(prev, k);
+            d.remove(b"V");
+            new.set_object(k, Object::Dictionary(d));
+        });
+        let got = changes(&e);
+        let removed = (
+            ChangeKind::SignatureChanged("T.K".into()),
+            Some(Refusal::Never),
+        );
+        if !got.contains(&removed) || report(&e).all_ok() {
+            wrong.push(format!("X first {x_first}: {got:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// `K` of [`kid_of_no_kind_and_of_a_signature_field`] locked by the first signature, by the
+/// name the report shows, `T.K`, then signed: refused as locked, whichever of `X` and `T` is
+/// listed first. Before, with `X` first, the check named it `X.K`, which no lock named, and
+/// allowed its signing as `X.K` filled in.
+#[test]
+fn a_lock_reaches_a_field_a_node_of_no_kind_lists_first() {
+    let mut wrong = Vec::new();
+    for x_first in [true, false] {
+        let form = kid_of_no_kind_and_of_a_signature_field(x_first);
+        let locked = locked_by(&form, lock("Include", &["T.K"], None));
+        let k = Field {
+            name: "K",
+            existing: true,
+            ..Field::default()
+        };
+        let b = sign(&locked, &id("p256"), &k, &Cms::default());
+        let got = changes(&b);
+        let signed = (ChangeKind::Signed("T.K".into()), Some(Refusal::Locked));
+        if !got.contains(&signed) || report(&b).all_ok() {
+            wrong.push(format!("X first {x_first}: {got:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// The base document with signature field `Signature1`, its widget `W` on the page, and empty
 /// signature field `S2`: the kids of each in an array of their own if `arrays` (`S2`'s none),
 /// else `Signature1`'s listed in it and `S2` with none.

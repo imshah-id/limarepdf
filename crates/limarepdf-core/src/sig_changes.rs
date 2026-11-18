@@ -17,6 +17,7 @@
 //! annotation) don't make the target part of the linking structure.
 
 use crate::budget;
+use crate::forms;
 use crate::sig_verify::{is_white, FieldLock, Lexer, Permissions, Tok, Versions};
 use crate::Pdf;
 use lopdf::xref::XrefEntry;
@@ -1527,6 +1528,8 @@ struct FieldInfo {
     root: ObjectId,
     /// The field it is part of: itself when titled, else its parent's (a widget kid's field).
     field: ObjectId,
+    /// It has a kind, by its own or an inherited `/FT` ([`crate::forms::of_a_kind`]).
+    typed: bool,
     sig: bool,
     /// For a signature field: it holds a signature.
     signed: bool,
@@ -1677,7 +1680,10 @@ impl Roles {
             .and_then(|o| v.array(o))
             .cloned()
             .unwrap_or_default();
-        // (field, parent); a parent is recorded before its kids.
+        // (field, parent); a parent is recorded before its kids. A node is named and typed
+        // through the first node listing it, unless that gave it no kind: then through the
+        // first with a kind listing it after, as the form's reading ([`Pdf::form_nodes`])
+        // does, it and its kids recorded again, each at most once more.
         let mut stack: Vec<(ObjectId, Option<ObjectId>)> = roots
             .iter()
             .rev()
@@ -1687,19 +1693,27 @@ impl Roles {
         // Whether a list of kids, which fields may share, holds a widget that shows.
         let mut shown = HashMap::new();
         while let Some((id, parent)) = stack.pop() {
-            if let Some(f) = r.fields.get(&id) {
-                if f.parent != parent {
-                    r.again.insert((id, parent));
-                }
-                continue;
-            }
-            if r.fields.len() > MAX_NODES {
-                return Err(too_complex());
-            }
             let Some(d) = v.dict_of(id) else {
                 continue;
             };
             let up = parent.and_then(|p| r.fields.get(&p));
+            let ft = v.name(d, b"FT");
+            let typed = match ft {
+                Some(_) => forms::of_a_kind(ft),
+                None => up.is_some_and(|p| p.typed),
+            };
+            if let Some(f) = r.fields.get(&id) {
+                let renamed = typed && !f.typed;
+                if f.parent != parent {
+                    r.again
+                        .insert((id, if renamed { f.parent } else { parent }));
+                }
+                if !renamed {
+                    continue;
+                }
+            } else if r.fields.len() > MAX_NODES {
+                return Err(too_complex());
+            }
             let partial = d.get(b"T").ok().and_then(|t| v.pdf.text_value(t));
             let field = match (&partial, up) {
                 (None, Some(p)) => p.field,
@@ -1714,7 +1728,7 @@ impl Roles {
             if steps > limit {
                 return Err(too_complex());
             }
-            let sig = match v.name(d, b"FT") {
+            let sig = match ft {
                 Some(ft) => ft == b"Sig",
                 None => up.is_some_and(|p| p.sig),
             };
@@ -1731,6 +1745,7 @@ impl Roles {
                     parent,
                     root,
                     field,
+                    typed,
                     sig,
                     signed: sig && value.is_some(),
                     timestamp: sig && timestamp,
@@ -3846,6 +3861,96 @@ mod tests {
         assert_eq!(roles.fields[&g].name, "F1.F2.Y.G");
         let read = p.form_nodes().into_iter().find(|(_, n)| n.id == g);
         assert_eq!(read.map(|(f, _)| f.name).as_deref(), Some("F1.F2.Y.G"));
+    }
+
+    /// Each field the form's reading finds is named and typed alike by role assignment.
+    #[track_caller]
+    fn roles_read_the_form_as_it_is_shown(p: &Pdf) {
+        let v = Version {
+            pdf: p,
+            freed: HashSet::new(),
+        };
+        let roles = Roles::build(&v).unwrap();
+        let read = p.form_nodes();
+        assert!(!read.is_empty());
+        for (f, n) in read {
+            let r = &roles.fields[&n.id];
+            let sig = matches!(f.kind, FieldKind::Signature);
+            assert_eq!((r.name.as_str(), r.sig), (f.name.as_str(), sig));
+        }
+    }
+
+    /// Field `K` of no kind of its own, below `chain` untitled nodes, listed through them by
+    /// nodes `X1` and `X2` of no kind and by field `T` of kind `ft`, `T` first or last: role
+    /// assignment names and types it as the form's reading does, through `T`. Before, it took
+    /// `K` as named by the first node listing it, `X1.K`, of no kind, where the form showed
+    /// `T.K`.
+    #[test]
+    fn a_field_a_node_of_no_kind_lists_first_is_named_through_one_with_a_kind() {
+        for (ft, t_first, chain) in [
+            ("Sig", false, 0),
+            ("Sig", true, 0),
+            ("Tx", false, 0),
+            ("Sig", false, 3),
+            ("Ch", false, 3),
+        ] {
+            let mut p = Pdf::new();
+            p.insert_blank(0, 300.0, 200.0).unwrap();
+            let d = &mut p.doc;
+            let rect = vec![Object::from(20), 20.into(), 120.into(), 40.into()];
+            let mut top =
+                d.add_object(dictionary! { "T" => Object::string_literal("K"), "Rect" => rect });
+            for _ in 0..chain {
+                top = d.add_object(dictionary! { "Kids" => vec![Object::from(top)] });
+            }
+            let node = |d: &mut Document, t: &str, ft: Option<&str>| {
+                let mut n = dictionary! { "T" => Object::string_literal(t), "Kids" => vec![Object::from(top)] };
+                if let Some(ft) = ft {
+                    n.set("FT", Object::Name(ft.into()));
+                }
+                Object::from(d.add_object(n))
+            };
+            let mut fields = vec![node(d, "X1", None), node(d, "X2", None)];
+            let t = node(d, "T", Some(ft));
+            if t_first {
+                fields.insert(0, t);
+            } else {
+                fields.push(t);
+            }
+            let form = d.add_object(dictionary! { "Fields" => fields });
+            d.catalog_mut().unwrap().set("AcroForm", form);
+            assert_eq!(p.form_nodes()[0].0.name, "T.K");
+            roles_read_the_form_as_it_is_shown(&p);
+        }
+    }
+
+    /// 49 nodes of no kind, then a text field, listing the same 50 kid fields of no kind of
+    /// their own (forms' `nodes_of_no_kind_sharing_kid_fields_walk_them_once`): each kid is
+    /// the text field's, for role assignment as for the form's reading.
+    #[test]
+    fn kid_fields_nodes_of_no_kind_share_are_named_through_the_field() {
+        let n = 50;
+        let mut p = Pdf::new();
+        p.insert_blank(0, 300.0, 200.0).unwrap();
+        let d = &mut p.doc;
+        let name = |i: usize| Object::string_literal(format!("f{i}"));
+        let kids: Vec<Object> = (0..n)
+            .map(|i| d.add_object(dictionary! { "T" => name(n + i) }).into())
+            .collect();
+        let list = d.add_object(kids);
+        let fields: Vec<Object> = (0..n)
+            .map(|i| {
+                let mut f = dictionary! { "T" => name(i), "Kids" => list };
+                if i == n - 1 {
+                    f.set("FT", "Tx");
+                }
+                d.add_object(f).into()
+            })
+            .collect();
+        let form = d.add_object(dictionary! { "Fields" => fields });
+        d.catalog_mut().unwrap().set("AcroForm", form);
+        assert_eq!(p.form_nodes().len(), n);
+        roles_read_the_form_as_it_is_shown(&p);
     }
 
     /// Fields A and B listing the same kids, a widget that shows, and C listing a widget with

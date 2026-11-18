@@ -160,7 +160,7 @@ fn field_kind(inh: &Inherited) -> Option<FieldKind> {
 
 /// Whether a node whose own or inherited `/FT` is `ft` has a kind: whether [`field_kind`]
 /// gives it one.
-fn of_a_kind(ft: Option<&[u8]>) -> bool {
+pub(crate) fn of_a_kind(ft: Option<&[u8]>) -> bool {
     matches!(ft, Some(b"Tx" | b"Btn" | b"Ch" | b"Sig"))
 }
 
