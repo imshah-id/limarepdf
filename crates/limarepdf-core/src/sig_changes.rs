@@ -1323,10 +1323,12 @@ fn compare_versions(
             return malformed(format!("LimarePDF can't read object {num} reliably"));
         }
     }
-    // Everything else reads as before, except objects held in a rewritten object stream.
+    // Everything else reads as before, except objects held in a rewritten object stream, and
+    // object 0, which lopdf lists as free after reading a table but not a stream (an object
+    // 0 it reads is still compared below).
     let nums: BTreeSet<u32> = old_table.keys().chain(new_table.keys()).copied().collect();
     for num in nums {
-        if newest.contains_key(&num) {
+        if num == 0 || newest.contains_key(&num) {
             continue;
         }
         let (o, n) = (old_table.get(&num), new_table.get(&num));

@@ -1595,7 +1595,9 @@ so signed attributes are never re-encoded before checking. The cryptography is R
 appended revisions' cross-reference sections itself (lopdf corrects bad offsets and repairs broken tables, which
 would hide changes), checks that lopdf reads the same objects (in number order, so a revision with several faults
 always gives the same reason: saving compares the reasons before and after, and one naming another object would
-count as a new change), then compares each signed version with the next (a later signature's version is one when only
+count as a new change; object 0 aside, which lopdf lists as free after reading a table but not a stream, so a
+table after a stream was refused, `a_table_after_a_cross_reference_stream_changes_nothing_by_itself`), then compares
+each signed version with the next (a later signature's version is one when only
 white space lies between its end and a revision's, either way round: one ending at `%%EOF`, before the end of line
 the revision's end takes in, wasn't, so a change made before it and undone after was missed,
 `a_change_undone_before_the_next_signature_still_counts`; that end of line is at most `\r\n`, so a signature's end

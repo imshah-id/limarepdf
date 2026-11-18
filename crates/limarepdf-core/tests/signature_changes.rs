@@ -338,6 +338,23 @@ fn nothing_changed_after_signing() {
     assert!(sig(&w, "Signature1").changes.is_empty());
 }
 
+/// A revision with a cross-reference table listing only the head of the free list, after
+/// one with a stream, changes nothing. lopdf lists object 0 as free after reading such a
+/// table, but not before, and that was refused as "can't read object 0 reliably".
+#[test]
+fn a_table_after_a_cross_reference_stream_changes_nothing_by_itself() {
+    let mut d = Document::load_mem(&base_pdf()).unwrap();
+    d.reference_table.cross_reference_type = lopdf::xref::XrefType::CrossReferenceStream;
+    let mut base = Vec::new();
+    d.save_to(&mut base).unwrap();
+    let b = approve(&base);
+    assert!(sig(&b, "Signature1").changes.is_empty());
+    let b = append_raw(&b, &[], &[0], &[], "");
+    assert!(String::from_utf8_lossy(&b).contains("\nxref\n0 1\n"));
+    assert_eq!(changes(&b), []);
+    assert!(report(&b).all_ok());
+}
+
 #[test]
 fn filling_in_a_form_is_allowed() {
     let b = fill(&approve(&form(&["Name", "Date"])), "Name", "Jane");
