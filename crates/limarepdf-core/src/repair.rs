@@ -280,19 +280,47 @@ fn is_written_page_node(o: &Object) -> bool {
     matches!(o, Object::Dictionary(d) if is_page_node(d))
 }
 
-/// Roughly how much memory a copy of `o` takes, in bytes.
+/// Roughly how much memory a copy of `o` takes, in bytes: the object, and what it holds on
+/// the heap.
 fn copy_size(o: &Object) -> usize {
-    size_of::<Object>()
-        + match o {
-            Object::Name(s) | Object::String(s, _) => s.len(),
-            Object::Array(a) => a.iter().map(copy_size).sum(),
-            Object::Dictionary(d) => d.iter().map(|(k, v)| k.len() + copy_size(v)).sum(),
-            Object::Stream(s) => {
-                let dict: usize = s.dict.iter().map(|(k, v)| k.len() + copy_size(v)).sum();
-                dict + s.content.len()
-            }
-            _ => 0,
+    size_of::<Object>() + held(o)
+}
+
+/// Roughly how much heap a copy of `o` holds.
+fn held(o: &Object) -> usize {
+    match o {
+        Object::Name(s) | Object::String(s, _) => allocation(s.len()),
+        Object::Array(a) => {
+            allocation(a.len() * size_of::<Object>()) + a.iter().map(held).sum::<usize>()
         }
+        Object::Dictionary(d) => dictionary_held(d),
+        Object::Stream(s) => dictionary_held(&s.dict) + allocation(s.content.len()),
+        _ => 0,
+    }
+}
+
+/// Roughly how much heap a copy of `d` holds. A copy of its map keeps room for as many
+/// entries as its index has, at most twice as many as it holds and at least 3, each a hash,
+/// a key and an object; its index has a slot for at most 16/7 of an entry each and at least
+/// 4, each a `usize` and a control byte, and 16 control bytes more.
+fn dictionary_held(d: &Dictionary) -> usize {
+    let entry = size_of::<u64>() + size_of::<Vec<u8>>() + size_of::<Object>();
+    let slots = (d.len() * 16 / 7 + 1).max(4);
+    let room = allocation((2 * d.len()).max(3) * entry) + allocation(slots * 9 + 16);
+    room + d
+        .iter()
+        .map(|(k, v)| allocation(k.len()) + held(v))
+        .sum::<usize>()
+}
+
+/// The heap an allocation of `n` bytes takes: none for none, else at least the least an
+/// allocator gives with its header.
+fn allocation(n: usize) -> usize {
+    if n == 0 {
+        0
+    } else {
+        n.max(32)
+    }
 }
 
 /// Where each object's headers in `b` are, outside stream data, in the order they come: a

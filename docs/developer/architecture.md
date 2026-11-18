@@ -1235,7 +1235,9 @@ over such a list. `repair.rs`'s
 nearest the top (a node first reached too deep to mend what is below it went unmended before), and queues the kids
 such a list gives by reference once; each node takes its own copy of a list with pages written in it, so that each
 has pages of its own, inheriting from it (sharing one copy left lopdf, which reads no more of a page list than the
-file has objects, short of pages), and a file whose copies would take more than `MAX_SHARED_KIDS_COPIES` (64 MiB) is refused. It
+file has objects, short of pages), and a file whose copies would take more than `MAX_SHARED_KIDS_COPIES` (64 MiB) is
+refused: `copy_size` counts what a copy holds on the heap, a dictionary's room for its entries and index too, as
+indexmap and hashbrown keep it (`tests/shared_kids_memory.rs` checks it against a counting allocator). It
 reads the bytes' object headers once (`object_lines`) for the kids that aren't page nodes
 (`fields_sharing_their_kids_are_walked_once`, `widgets_shared_by_fields_go_to_the_first`,
 `page_tree_nodes_sharing_their_kids_queue_them_once`,
