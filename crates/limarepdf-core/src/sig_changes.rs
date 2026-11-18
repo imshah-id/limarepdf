@@ -2598,6 +2598,8 @@ impl<'a> Judge<'a> {
         // compared below, but a reader going by another would see the field there.
         let (or, nr) = (self.or, self.nr);
         let kept = |p: &ObjectId| or.fields.contains_key(p) && nr.fields.contains_key(p);
+        // Each field added outside its tree once, however many list it.
+        let mut outside = HashSet::new();
         for (id, by) in or.again.symmetric_difference(&nr.again) {
             match (or.fields.get(id), nr.fields.get(id), by.filter(kept)) {
                 (Some(o), Some(_), _) => {
@@ -2611,10 +2613,10 @@ impl<'a> Judge<'a> {
                 // Added in this step, and listed by a field kept too: that one changed.
                 (None, Some(_), Some(p)) => self.push_field(p, FieldChange::Changed, None),
                 // Or by `/Fields` or another field added: a field added outside its tree.
-                (None, Some(f), None) => {
-                    self.push(never(ChangeKind::FieldAdded(f.name.clone()), None));
+                (None, Some(f), None) if outside.insert(*id) => {
+                    self.push(never(ChangeKind::FieldAdded(f.copied_name()), None));
                 }
-                // Removed: refused as that above.
+                // Removed: refused as that above; or such a field listed again.
                 _ => {}
             }
         }
@@ -3698,6 +3700,43 @@ mod tests {
         assert_eq!(brief(&found), brief(&want));
         assert_eq!(found, want);
         assert_eq!(copied, 3, "names copied");
+    }
+
+    /// A field named with 64 KB, added after signing with 1,000 fields listing it: it is
+    /// found added once, its name copied once, not once for each field listing it but the
+    /// first (999 times before, 64 MB).
+    #[test]
+    fn a_field_added_listed_by_many_is_found_once() {
+        let mut p = Pdf::new();
+        p.insert_blank(0, 300.0, 200.0).unwrap();
+        let form = p
+            .doc
+            .add_object(dictionary! { "Fields" => Vec::<Object>::new() });
+        p.doc.catalog_mut().unwrap().set("AcroForm", form);
+        let signed = p.snapshot().unwrap();
+        let mut p = Pdf::from_bytes(&signed, None).unwrap();
+        let doc = &mut p.doc;
+        let name = Object::string_literal("a".repeat(65_536));
+        let field = doc.add_object(dictionary! { "FT" => "Tx", "T" => name });
+        let fields: Vec<Object> = (0..1_000)
+            .map(|i| {
+                let t = Object::string_literal(format!("{i}"));
+                doc.add_object(dictionary! { "T" => t, "Kids" => vec![field.into()] })
+                    .into()
+            })
+            .collect();
+        doc.get_dictionary_mut(form).unwrap().set("Fields", fields);
+        let bytes = append_revision(&signed, &p.doc).unwrap().bytes;
+        let whole = Pdf::from_bytes(&bytes, None).unwrap();
+        let mut versions = Versions::new(&bytes, None, &whole);
+        let end = signed.len();
+        let (listed, mut cache) = (listed(&whole), HashMap::new());
+        NAMES_COPIED.set(0);
+        let raw = changes_after(&mut versions, &bytes, end, &[end], &listed, &mut cache);
+        let copied = NAMES_COPIED.get();
+        let long = |s: &&Seen| matches!(&s.kind, ChangeKind::FieldAdded(n) if n.len() > 1_000);
+        assert_eq!(raw.iter().filter(long).count(), 1);
+        assert_eq!(copied, 1, "names copied");
     }
 
     /// A thousand fields each listing the same 1,000 kids, themselves, with no area on the

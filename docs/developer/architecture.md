@@ -1692,7 +1692,9 @@ signature's too), were found 1,000 times each before, and the test counts the na
 and again: an entry referring again to what one before it did is judged once a side, where a page listing a text
 field's and a signed signature field's widgets 1,000 times each, named with 64 KB and taken off after signing, and
 another field's put on 1,000 times, copied each name once an entry before, 3,000 in all
-(`a_widget_listed_again_and_again_is_judged_once`). A signature field added with a field of another
+(`a_widget_listed_again_and_again_is_judged_once`). So is a field added listed by many: one named with 64 KB and
+listed by 1,000 fields added with it was found added once for each but the first, 999 copies
+(`a_field_added_listed_by_many_is_found_once`). A signature field added with a field of another
 kind inside it is refused for that field, as adding one is never allowed, on its own or not: a text field inside one
 was allowed with it before, after an approval or a certification allowing form filling
 (`a_field_inside_a_new_signature_field_is_refused`). Trust is in `trust.rs`: the trust
