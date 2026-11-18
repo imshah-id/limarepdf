@@ -1224,8 +1224,13 @@ loop so names come out as `sig_changes` gives them), and a widget more than one 
 (`Walk::claimed`; it went to each before); a node of no kind (`field_kind`) is no field and takes neither the list
 nor a widget, so the field listing them after it still does
 (`flattening_draws_a_value_whose_widget_a_node_of_no_kind_lists`), but keeps the list told apart, untaken, for the
-next node listing it (`nodes_of_no_kind_sharing_widgets_read_them_once`; each read it again before);
-`value_nodes` passes over it. `repair.rs`'s
+next node listing it (`nodes_of_no_kind_sharing_widgets_read_them_once`; each read it again before). Its kid
+fields it walks as of no kind, without taking them, so a field listing them after it walks them again as its own
+(`flattening_draws_a_value_whose_kid_field_a_node_of_no_kind_lists`; they went to no field before), while a node
+of no kind listing them after it passes over them (`nodes_of_no_kind_sharing_kid_fields_walk_them_once`); a node
+walked with no kind is passed over when reached again with none
+(`nodes_of_no_kind_reached_again_are_walked_once`), so each node is walked at most twice. `value_nodes` passes
+over such a list. `repair.rs`'s
 `mend_page_tree` queues the kids such a list gives by reference again only from a node nearer the top, so at most
 once a depth; each node takes its own copy of a list with pages written in it, so that each has pages of its own,
 inheriting from it (sharing one copy left lopdf, which reads no more of a page list than the file has objects,

@@ -657,22 +657,45 @@ fn flattening_refuses_a_form_nested_too_deep_to_follow() {
 /// "SHAREDVALUE": both list `t`'s widget on the first page, with no drawing, in an array of
 /// their own or, when `shared`, in one array object.
 fn widget_listed_by_no_field(shared: bool) -> Pdf {
+    listed_by_no_field(shared, false)
+}
+
+/// A node of no kind, x, and a text field, t, listing the same kids in arrays of their own or
+/// `shared`: t's widget, or, for `kid`, a kid field with no kind of its own holding the value
+/// and the widget.
+fn listed_by_no_field(shared: bool, kid: bool) -> Pdf {
     let (mut p, _) = doc(Vec::new());
     let w = p.doc.add_object(widget(dictionary! {
         "Rect" => rect(10.0, 150.0, 150.0, 20.0), "F" => 4,
     }));
     place(&mut p, 0, w);
+    let t = p.doc.new_object_id();
+    let (listed, value) = match kid {
+        true => {
+            let k = p.doc.add_object(dictionary! {
+                "T" => text("k"), "V" => text("SHAREDVALUE"), "Kids" => vec![w.into()],
+                "Parent" => t,
+            });
+            p.doc.get_dictionary_mut(w).unwrap().set("Parent", k);
+            (k, None)
+        }
+        false => {
+            p.doc.get_dictionary_mut(w).unwrap().set("Parent", t);
+            (w, Some(text("SHAREDVALUE")))
+        }
+    };
     let kids: Object = match shared {
-        true => p.doc.add_object(vec![Object::Reference(w)]).into(),
-        false => vec![Object::Reference(w)].into(),
+        true => p.doc.add_object(vec![Object::Reference(listed)]).into(),
+        false => vec![Object::Reference(listed)].into(),
     };
     let x = p.doc.add_object(dictionary! {
         "T" => text("x"), "Kids" => kids.clone(),
     });
-    let t = p.doc.add_object(dictionary! {
-        "FT" => "Tx", "T" => text("t"), "V" => text("SHAREDVALUE"), "Kids" => kids,
-    });
-    p.doc.get_dictionary_mut(w).unwrap().set("Parent", t);
+    let mut field = dictionary! { "FT" => "Tx", "T" => text("t"), "Kids" => kids };
+    if let Some(v) = value {
+        field.set("V", v);
+    }
+    p.doc.objects.insert(t, field.into());
     let form = p.doc.catalog().unwrap().get(b"AcroForm").unwrap();
     let form = form.as_reference().unwrap();
     let form = p.doc.get_dictionary_mut(form).unwrap();
@@ -708,6 +731,41 @@ fn flattening_draws_a_value_whose_widget_a_node_of_no_kind_lists() {
 fn cross_check_a_value_whose_widget_a_node_of_no_kind_lists_with_poppler() {
     for shared in [false, true] {
         let mut p = widget_listed_by_no_field(shared);
+        p.flatten_form(None).unwrap();
+        let text = common::saved::tools::pdftotext(&p.to_bytes().unwrap());
+        assert!(text.contains("SHAREDVALUE"), "shared {shared}: {text}");
+    }
+}
+
+/// A kid field that a node of no kind lists first is the next field's, and flattening draws
+/// its value: the node walked it first, where it is no field, so the field never had it and
+/// flattening removed the value without drawing it or refusing.
+#[test]
+fn flattening_draws_a_value_whose_kid_field_a_node_of_no_kind_lists() {
+    for shared in [false, true] {
+        let mut p = listed_by_no_field(shared, true);
+        let fields = p.form_fields();
+        let names: Vec<&str> = fields.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, ["t.k"], "shared {shared}");
+        assert_eq!(fields[0].widgets.len(), 1, "shared {shared}");
+        assert_eq!(p.flatten_form(None).unwrap(), 1, "shared {shared}");
+        assert!(!has_form(&p));
+        let saved = Saved::of(&mut p);
+        assert!(saved.fields().is_empty(), "shared {shared}");
+        saved.assert_kept(&["SHAREDVALUE"]);
+        let back = Pdf::from_bytes(&saved.bytes, None).unwrap();
+        let text = back.page_text(0);
+        assert!(text.contains("SHAREDVALUE"), "shared {shared}: {text}");
+    }
+}
+
+/// Poppler reads the value [`flattening_draws_a_value_whose_kid_field_a_node_of_no_kind_lists`]
+/// draws. Opt-in: needs `pdftotext`.
+#[test]
+#[ignore]
+fn cross_check_a_value_whose_kid_field_a_node_of_no_kind_lists_with_poppler() {
+    for shared in [false, true] {
+        let mut p = listed_by_no_field(shared, true);
         p.flatten_form(None).unwrap();
         let text = common::saved::tools::pdftotext(&p.to_bytes().unwrap());
         assert!(text.contains("SHAREDVALUE"), "shared {shared}: {text}");
