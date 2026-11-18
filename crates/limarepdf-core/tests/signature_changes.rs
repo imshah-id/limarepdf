@@ -1745,13 +1745,18 @@ fn a_change_undone_before_the_next_signature_still_counts() {
     // Turned, countersigned, turned back: the page ends as the first signer signed it, but
     // the second signer signed something else. Before, as the second signature ends just
     // before the end of line its revision's end takes in, the first was checked against
-    // the end alone, and only the second signing was seen.
+    // the end alone, and only the second signing was seen. So too when the signed version is
+    // followed by "\r\n", the most end of line a revision's end takes in.
     let turned = countersign(&rotate(&b, Some(90)), "Signature2", false);
-    let b = rotate(&turned, None);
-    let d = Document::load_mem(&b).unwrap();
-    assert!(!dict(&d, page(&d)).has(b"Rotate"));
-    assert_refused(&b, &ChangeKind::PageContent);
-    assert!(!sig(&b, "Signature2").changes_allowed());
+    assert!(turned.ends_with(b"%%EOF"));
+    for eol in ["", "\r\n"] {
+        let turned = [&turned, eol.as_bytes()].concat();
+        let b = rotate(&turned, None);
+        let d = Document::load_mem(&b).unwrap();
+        assert!(!dict(&d, page(&d)).has(b"Rotate"));
+        assert_refused(&b, &ChangeKind::PageContent);
+        assert!(!sig(&b, "Signature2").changes_allowed());
+    }
 }
 
 // ---------------------------------------------------------------- attacks

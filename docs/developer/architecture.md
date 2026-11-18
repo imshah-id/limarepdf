@@ -1585,7 +1585,9 @@ always gives the same reason: saving compares the reasons before and after, and 
 count as a new change), then compares each signed version with the next (a later signature's version is one when only
 white space lies between its end and a revision's, either way round: one ending at `%%EOF`, before the end of line
 the revision's end takes in, wasn't, so a change made before it and undone after was missed,
-`a_change_undone_before_the_next_signature_still_counts`), judging every object that differs by each role it plays
+`a_change_undone_before_the_next_signature_still_counts`; that end of line is at most `\r\n`, so a signature's end
+lying further before a revision's end is never its end, and a run of white space after it isn't looked through again
+for each revision ending later, `white_space_after_a_signature_end_is_looked_at_once`), judging every object that differs by each role it plays
 (page content, comment, form field, signature, document structure) against the signer's permissions. Each version
 keeps each `/Annots` list once, however many pages share
 it, and each pair of lists (before and after) is compared once: its entries are looked for by their references, and

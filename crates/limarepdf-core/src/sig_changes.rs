@@ -326,10 +326,18 @@ fn changes_between(
         Err(why) => return malformed(why),
     };
     // A revision ends at `at` when only white space lies between, either way round: a
-    // signature may end at "%%EOF", before the end of line a revision's end takes in.
+    // signature may end at "%%EOF", before the end of line a revision's end takes in. That
+    // is at most 2 bytes (`revision_end`), so a run of white space after `at` isn't looked
+    // through once for each revision ending after it.
     let ends_at = |s: &Section, at: usize| {
+        if s.end > at + 2 {
+            return false;
+        }
         let (lo, hi) = (s.end.min(at), s.end.max(at));
-        bytes[lo..hi].iter().all(|&c| is_white(c))
+        let white = bytes[lo..hi].iter().take_while(|&&c| is_white(c)).count();
+        #[cfg(test)]
+        tests::SCANNED.set(tests::SCANNED.get() + (white + 1).min(hi - lo));
+        white == hi - lo
     };
     let ends_by = |s: &Section, at: usize| s.end <= at || ends_at(s, at);
     // The versions to compare: this one, each later signed version that is one of the
@@ -3047,6 +3055,8 @@ mod tests {
         pub(super) static FIELDS_LOOKED: Cell<usize> = const { Cell::new(0) };
         /// Field names copied for changes found (`FieldInfo::copied_name`), on this thread.
         pub(super) static NAMES_COPIED: Cell<usize> = const { Cell::new(0) };
+        /// Bytes looked at telling whether a revision ends at a version's end, on this thread.
+        pub(super) static SCANNED: Cell<usize> = const { Cell::new(0) };
     }
 
     fn square(n: usize) -> Dictionary {
@@ -3945,5 +3955,58 @@ mod tests {
         assert_eq!(found.len(), 2_000);
         let looked = FIELDS_LOOKED.get();
         assert!(looked <= 10_000, "{looked} fields looked at");
+    }
+
+    /// A revision after signing, a later signature ending in the 64 KB of spaces after it, and
+    /// 500 empty revisions after the spaces: telling which revisions end at each version's
+    /// end looks at each byte a few times, not at the spaces once a revision (96 MB before),
+    /// and the changes found are those without the spaces and empty revisions.
+    #[test]
+    fn white_space_after_a_signature_end_is_looked_at_once() {
+        let mut p = Pdf::new();
+        p.insert_blank(0, 300.0, 200.0).unwrap();
+        let signed = p.snapshot().unwrap();
+        let mut p = Pdf::from_bytes(&signed, None).unwrap();
+        let page = p.page_ids()[0];
+        p.doc.get_dictionary_mut(page).unwrap().set("Rotate", 90);
+        let plain = append_revision(&signed, &p.doc).unwrap().bytes;
+        let mut bytes = plain.clone();
+        let later = bytes.len() + 1;
+        bytes.resize(bytes.len() + 65_536, b' ');
+        let trailer = Pdf::from_bytes(&plain, None).unwrap().doc.trailer;
+        let (num, gen) = trailer.get(b"Root").unwrap().as_reference().unwrap();
+        let size = trailer.get(b"Size").unwrap().as_i64().unwrap();
+        let mut prev = last_startxref(&plain).unwrap();
+        // Each a cross-reference stream listing only itself, as the revision before.
+        for n in size..size + 500 {
+            let at = bytes.len();
+            let dict = format!(
+                "<< /Type /XRef /Size {} /Root {num} {gen} R /Prev {prev} /W [1 4 2] \
+                 /Index [{n} 1] /Length 7 >>",
+                n + 1
+            );
+            let head = format!("{n} 0 obj\n{dict}\nstream\n");
+            bytes.extend_from_slice(head.as_bytes());
+            bytes.push(1);
+            bytes.extend_from_slice(&(at as u32).to_be_bytes());
+            bytes.extend_from_slice(&[0, 0]);
+            let tail = format!("\nendstream\nendobj\nstartxref\n{at}\n%%EOF\n");
+            bytes.extend_from_slice(tail.as_bytes());
+            prev = at;
+        }
+        let end = signed.len();
+        let changes = |bytes: &[u8], sig_ends: &[usize]| {
+            let whole = Pdf::from_bytes(bytes, None).unwrap();
+            let mut versions = Versions::new(bytes, None, &whole);
+            let (listed, mut cache) = (listed(&whole), HashMap::new());
+            SCANNED.set(0);
+            let found = changes_after(&mut versions, bytes, end, sig_ends, &listed, &mut cache);
+            let found: Vec<_> = found.into_iter().map(|s| (s.kind, s.need)).collect();
+            (found, SCANNED.get())
+        };
+        let (found, scanned) = changes(&bytes, &[end, later]);
+        assert!(scanned <= 4 * bytes.len(), "{scanned} bytes looked at");
+        assert!(!found.is_empty());
+        assert_eq!(found, changes(&plain, &[end]).0);
     }
 }
