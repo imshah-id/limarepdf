@@ -1223,7 +1223,9 @@ file has, is walked once, not once a node: in `forms.rs` a node listing it again
 loop so names come out as `sig_changes` gives them), and a widget more than one field lists goes to the first
 (`Walk::claimed`; it went to each before); a node of no kind (`field_kind`) is no field and takes neither the list
 nor a widget, so the field listing them after it still does
-(`flattening_draws_a_value_whose_widget_a_node_of_no_kind_lists`); `value_nodes` passes over it. `repair.rs`'s
+(`flattening_draws_a_value_whose_widget_a_node_of_no_kind_lists`), but keeps the list told apart, untaken, for the
+next node listing it (`nodes_of_no_kind_sharing_widgets_read_them_once`; each read it again before);
+`value_nodes` passes over it. `repair.rs`'s
 `mend_page_tree` queues the kids such a list gives by reference again only from a node nearer the top, so at most
 once a depth; each node takes its own copy of a list with pages written in it, so that each has pages of its own,
 inheriting from it (sharing one copy left lopdf, which reads no more of a page list than the file has objects,

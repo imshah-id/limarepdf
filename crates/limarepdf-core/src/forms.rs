@@ -492,8 +492,12 @@ impl Pdf {
             }
             return;
         }
-        // A node of no kind is no field: it takes neither its list nor its widgets.
+        // A node of no kind is no field: it takes neither its list nor its widgets, but keeps
+        // the list told apart for the next node listing it.
         let Some(kind) = field_kind(&inh) else {
+            if let Some(l) = list {
+                w.kids.entry(l).or_insert(kids);
+            }
             return;
         };
         take(w);
@@ -899,5 +903,23 @@ mod tests {
         let form = dictionary! { "Fields" => fields };
         p.doc.catalog_mut().unwrap().set("AcroForm", form);
         assert_eq!(taken(&p), [1, 0]);
+    }
+
+    #[test]
+    fn nodes_of_no_kind_sharing_widgets_read_them_once() {
+        // Nodes of no kind, then a field, list the same widgets: each node of no kind read
+        // them again, and the field still takes them all.
+        let (n, m) = (2_000, 2_000);
+        let node = |i| match i {
+            i if i == n - 1 => text_field(i),
+            i => dictionary! { "T" => name(i) },
+        };
+        let p = sharing(n, node, |p, _| {
+            (0..m).map(|_| p.doc.add_object(widget()).into()).collect()
+        });
+        LOOKED.set(0);
+        assert_eq!(taken(&p), [m]);
+        let most = 4 * (n + m);
+        assert!(LOOKED.get() < most, "looked at {} entries", LOOKED.get());
     }
 }
