@@ -284,6 +284,7 @@ fn widget(p: &mut Pdf, extra: Dictionary) -> ObjectId {
 /// A form holding values in every place a value can be: a text field's value, default and
 /// rich text; a read-only field; a value inherited from a parent; a ticked checkbox; a chosen
 /// and a typed drop-down value; and a signed signature field. Options and names aren't values.
+/// Beside them, a text widget and a signed signature widget the field list leaves out.
 fn filled_form() -> Pdf {
     let mut p = make(
         "BT /F1 12 Tf 10 180 Td (Page text) Tj ET",
@@ -367,6 +368,14 @@ fn filled_form() -> Pdf {
             "AP" => dictionary! { "N" => shown },
         },
     );
+    // And a signed signature widget it leaves out.
+    widget(
+        &mut p,
+        dictionary! {
+            "FT" => "Sig", "T" => s("unlisted"),
+            "V" => dictionary! { "Type" => "Sig", "Name" => s("WALRUS-UNLISTED-SIGNER") },
+        },
+    );
     p
 }
 
@@ -380,9 +389,34 @@ const FORM_VALUES: [&str; 7] = [
     "WALRUS-ORPHAN",
 ];
 
+/// Give every node's `/FT` through a reference to its name.
+fn kinds_by_reference(p: &mut Pdf) {
+    let typed: Vec<(ObjectId, Object)> = (p.doc.objects.iter())
+        .filter_map(|(&id, o)| Some((id, o.as_dict().ok()?.get(b"FT").ok()?.clone())))
+        .filter(|(_, ft)| ft.as_name().is_ok())
+        .collect();
+    for (id, ft) in typed {
+        let ft = p.doc.add_object(ft);
+        p.doc.get_dictionary_mut(id).unwrap().set("FT", ft);
+    }
+}
+
 #[test]
 fn form_values_are_cleared_everywhere_they_are_kept() {
+    form_values_cleared(filled_form());
+}
+
+/// As where a field's kind is given directly: a signature field given its kind through a
+/// reference keeps its signature, and a text widget the tree leaves out loses its drawing.
+/// Before, the signature went and the drawing stayed.
+#[test]
+fn form_values_are_cleared_alike_when_kinds_are_given_through_references() {
     let mut p = filled_form();
+    kinds_by_reference(&mut p);
+    form_values_cleared(p);
+}
+
+fn form_values_cleared(mut p: Pdf) {
     Saved::of(&mut p).assert_kept(&FORM_VALUES);
     let rep = p.remove_hidden(&[Hidden::FormValues]).unwrap();
     assert_eq!(rep.count(Hidden::FormValues), 7, "{rep:?}");
@@ -396,8 +430,13 @@ fn form_values_are_cleared_everywhere_they_are_kept() {
     assert!(held.is_empty(), "{held:?}");
     let colour = fields.iter().find(|f| f.name == "colour").unwrap();
     assert!(!colour.appearance.contains("WALRUS"), "{colour:?}");
-    // Kept: the signature, the options, every field and the page.
-    saved.assert_kept(&["WALRUS-SIGNER", "WALRUS-OPTION-Red", "Page text"]);
+    // Kept: the signatures, the options, every field and the page.
+    saved.assert_kept(&[
+        "WALRUS-SIGNER",
+        "WALRUS-UNLISTED-SIGNER",
+        "WALRUS-OPTION-Red",
+        "Page text",
+    ]);
     let names: Vec<&str> = fields.iter().map(|f| f.name.as_str()).collect();
     assert_eq!(
         names,

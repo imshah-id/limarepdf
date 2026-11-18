@@ -349,9 +349,9 @@ impl Pdf {
             let Ok(d) = p.doc.get_dictionary(id) else {
                 return Ok(());
             };
-            let sig = match d.get(b"FT").and_then(|o| o.as_name()) {
-                Ok(ft) => ft == b"Sig",
-                Err(_) => sig,
+            let sig = match d.get(b"FT").ok().and_then(|o| p.name_value(o)) {
+                Some(ft) => ft == b"Sig",
+                None => sig,
             };
             out.push((id, sig));
             let kids = d
@@ -444,9 +444,7 @@ impl Pdf {
         };
         // A node reached first with no kind, as a kid of a node of no kind, is walked again
         // should a node with a kind list it: its kid fields are then that node's.
-        let ft = (d.get(b"FT").ok())
-            .and_then(|o| self.doc.dereference(o).ok())
-            .and_then(|(_, o)| o.as_name().ok());
+        let ft = d.get(b"FT").ok().and_then(|o| self.name_value(o));
         let typed = of_a_kind(ft.or(inh.ft.as_deref()));
         if typed {
             w.seen.insert(id);
@@ -791,6 +789,10 @@ impl Pdf {
 
     pub(crate) fn int_value(&self, o: &Object) -> Option<i64> {
         self.doc.dereference(o).ok()?.1.as_i64().ok()
+    }
+
+    pub(crate) fn name_value<'a>(&'a self, o: &'a Object) -> Option<&'a [u8]> {
+        self.doc.dereference(o).ok()?.1.as_name().ok()
     }
 
     /// A string's raw bytes.

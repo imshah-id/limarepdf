@@ -257,7 +257,7 @@ impl Pdf {
                 continue;
             }
             let ft = self.inherited(a, b"FT");
-            if ft.as_ref().and_then(|o| o.as_name().ok()) == Some(b"Sig") {
+            if ft.as_ref().and_then(|o| self.name_value(o)) == Some(b"Sig") {
                 continue;
             }
             let mut chain = vec![a];
@@ -288,13 +288,14 @@ impl Pdf {
             .inherited(id, b"Ff")
             .and_then(|o| self.int_value(&o))
             .unwrap_or(0);
-        match self.inherited(id, b"FT").as_ref().map(|o| o.as_name()) {
-            Some(Ok(b"Btn")) if ff & (1 << 16) == 0 => {
+        let ft = self.inherited(id, b"FT");
+        match ft.as_ref().and_then(|o| self.name_value(o)) {
+            Some(b"Btn") if ff & (1 << 16) == 0 => {
                 if let Ok(d) = self.doc.get_dictionary_mut(id) {
                     d.set("AS", "Off");
                 }
             }
-            Some(Ok(b"Tx" | b"Ch")) => undrawn.push(id),
+            Some(b"Tx" | b"Ch") => undrawn.push(id),
             _ => {}
         }
     }
