@@ -3924,6 +3924,39 @@ mod tests {
         }
     }
 
+    /// A field whose `/FT` is a reference to its kind, alone or listing with a node of no kind
+    /// listed before it the same field `K`: the form's reading gives it its kind, as role
+    /// assignment does. Before, it took the field as of no kind.
+    #[test]
+    fn a_kind_given_through_a_reference_is_read_alike() {
+        for shared in [false, true] {
+            let mut p = Pdf::new();
+            p.insert_blank(0, 300.0, 200.0).unwrap();
+            let d = &mut p.doc;
+            let rect = vec![Object::from(20), 20.into(), 120.into(), 40.into()];
+            let sig = d.add_object(Object::Name(b"Sig".to_vec()));
+            let k =
+                d.add_object(dictionary! { "T" => Object::string_literal("K"), "Rect" => rect });
+            let t = d.add_object(dictionary! {
+                "T" => Object::string_literal("T"),
+                "FT" => sig,
+                "Kids" => vec![Object::from(k)],
+            });
+            let mut fields = vec![Object::from(t)];
+            if shared {
+                let x =
+                    dictionary! { "T" => Object::string_literal("X"), "Kids" => vec![k.into()] };
+                fields.insert(0, d.add_object(x).into());
+            }
+            let form = d.add_object(dictionary! { "Fields" => fields });
+            d.catalog_mut().unwrap().set("AcroForm", form);
+            let read = p.form_nodes();
+            assert_eq!(read[0].0.name, "T.K");
+            assert!(matches!(read[0].0.kind, FieldKind::Signature));
+            roles_read_the_form_as_it_is_shown(&p);
+        }
+    }
+
     /// 49 nodes of no kind, then a text field, listing the same 50 kid fields of no kind of
     /// their own (forms' `nodes_of_no_kind_sharing_kid_fields_walk_them_once`): each kid is
     /// the text field's, for role assignment as for the form's reading.

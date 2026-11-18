@@ -444,7 +444,9 @@ impl Pdf {
         };
         // A node reached first with no kind, as a kid of a node of no kind, is walked again
         // should a node with a kind list it: its kid fields are then that node's.
-        let ft = d.get(b"FT").ok().and_then(|o| o.as_name().ok());
+        let ft = (d.get(b"FT").ok())
+            .and_then(|o| self.doc.dereference(o).ok())
+            .and_then(|(_, o)| o.as_name().ok());
         let typed = of_a_kind(ft.or(inh.ft.as_deref()));
         if typed {
             w.seen.insert(id);
