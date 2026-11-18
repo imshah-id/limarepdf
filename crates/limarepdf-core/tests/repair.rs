@@ -545,6 +545,59 @@ fn nodes_sharing_a_list_too_large_to_copy_for_each_are_refused() {
     assert!(format!("{e:#}").contains("too complex"), "{e:#}");
 }
 
+/// A page list node listing `kids`.
+fn node(doc: &mut Document, kids: Object) -> ObjectId {
+    doc.add_object(dictionary! { "Type" => "Pages", "Kids" => kids })
+}
+
+/// The top of a chain of `len` nodes, each listing the next, the last listing `kids`.
+fn chain(doc: &mut Document, len: usize, kids: Object) -> ObjectId {
+    (1..len).fold(node(doc, kids), |below, _| {
+        node(doc, vec![below.into()].into())
+    })
+}
+
+#[test]
+fn a_node_first_reached_far_down_is_mended_from_nearer_the_top() {
+    // Node Y, with a node written in its list holding a page written in its own, is two
+    // below the root through K, and 64 below at the end of a chain. A list K is in, that a
+    // node beside the chain lists again, was walked once, so the chain reached Y first, too
+    // deep to mend the page below it: the file was refused as having no pages.
+    let mut doc = Document::with_version("1.7");
+    let page = written_page(Some(("MediaBox", media_box(200))));
+    let written = dictionary! { "Type" => "Pages", "Kids" => vec![page] };
+    let y = node(&mut doc, vec![written.into()].into());
+    let k = node(&mut doc, vec![y.into()].into());
+    let c1 = chain(&mut doc, 61, vec![y.into()].into());
+    let list = doc.new_object_id();
+    let again = node(&mut doc, list.into());
+    let z = node(&mut doc, vec![c1.into(), again.into()].into());
+    doc.objects
+        .insert(list, Object::Array(vec![k.into(), z.into()]));
+    let shared = node(&mut doc, list.into());
+    let root = node(&mut doc, vec![shared.into()].into());
+    let pdf = Pdf::from_bytes(&saved(doc, root), None).unwrap();
+    assert_eq!(pages(&pdf).1, 1);
+    assert_eq!(pdf.page_size(0).unwrap(), (200.0, 100.0));
+}
+
+#[test]
+fn a_shared_list_first_reached_far_down_is_mended_from_nearer_the_top() {
+    // A list holding a node with a page written in its list is listed at the end of a chain
+    // 64 deep, too deep to mend the page, and by a node one below the root: that node
+    // mends it.
+    let mut doc = Document::with_version("1.7");
+    let page = written_page(Some(("MediaBox", media_box(200))));
+    let n = node(&mut doc, vec![page].into());
+    let list = doc.add_object(vec![n.into()]);
+    let deep = chain(&mut doc, 64, list.into());
+    let near = node(&mut doc, list.into());
+    let root = node(&mut doc, vec![near.into(), deep.into()].into());
+    let pdf = Pdf::from_bytes(&saved(doc, root), None).unwrap();
+    assert_eq!(pages(&pdf), (2, 1));
+    assert_eq!(pdf.page_size(0).unwrap(), (200.0, 100.0));
+}
+
 #[test]
 fn a_page_missing_from_the_list_is_passed_over_as_it_is_drawn() {
     // The page list names an object the file doesn't have between two pages. The renderer

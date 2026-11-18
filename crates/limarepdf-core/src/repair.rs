@@ -6,7 +6,7 @@
 //! mended too (see [`mend_page_tree`]).
 
 use lopdf::{Dictionary, Document, LoadOptions, Object, ObjectId};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fmt::Write as _;
 use std::io::Cursor;
 use std::ops::Range;
@@ -155,6 +155,8 @@ pub(crate) fn unpack_object_streams(doc: &mut Document) {
 /// page tree node written directly in a `/Kids` array is made an object of its own, and a
 /// kid whose object isn't a page or a node takes another copy of that object in `bytes` that
 /// is one (the file may give a second object the page's number, and lopdf keeps that one).
+/// The tree is walked a depth at a time, so a node several nodes list is mended from the one
+/// nearest the top, within [`MAX_PAGE_TREE_DEPTH`] as often as any is.
 /// Returns whether anything changed, or an error if the copies that nodes sharing a list of
 /// kids take would be more than [`MAX_SHARED_KIDS_COPIES`]; the tree is then part mended.
 pub(crate) fn mend_page_tree(doc: &mut Document, bytes: &[u8]) -> Result<bool, PagesTooComplex> {
@@ -171,17 +173,16 @@ pub(crate) fn mend_page_tree(doc: &mut Document, bytes: &[u8]) -> Result<bool, P
     let mut lines = None;
     // The kids no copy in `bytes` mends.
     let mut missing = HashSet::new();
-    // Each `/Kids` array object, by the shallowest depth its kids were queued from, and how
-    // much a copy of it takes if pages are written in it (0 if none are). Nodes sharing one,
-    // as no well-made tree has, each take their own copy of one with pages, so that each has
-    // pages of its own; the kids it lists by reference are queued again only from nearer the
-    // top, so at most once a depth.
-    let mut lists: HashMap<ObjectId, (usize, usize)> = HashMap::new();
+    // Each `/Kids` array object, by how much a copy of it takes if pages are written in it (0
+    // if none are). Nodes sharing one, as no well-made tree has, each take their own copy of
+    // one with pages, so that each has pages of its own; the kids it lists by reference are
+    // queued once, from the first node listing it, the nearest the top.
+    let mut lists: HashMap<ObjectId, usize> = HashMap::new();
     let mut copies = 0usize;
     let mut changed = false;
     let mut seen = HashSet::new();
-    let mut todo = vec![(root, 0)];
-    while let Some((node, depth)) = todo.pop() {
+    let mut todo = VecDeque::from([(root, 0)]);
+    while let Some((node, depth)) = todo.pop_front() {
         if depth > MAX_PAGE_TREE_DEPTH || !seen.insert(node) {
             continue;
         }
@@ -192,24 +193,26 @@ pub(crate) fn mend_page_tree(doc: &mut Document, bytes: &[u8]) -> Result<bool, P
                 let Ok(Object::Array(a)) = doc.get_object(list) else {
                     continue;
                 };
-                let (from, size) = match lists.get(&list) {
-                    Some(&(from, size)) => {
-                        if from <= depth && size == 0 {
-                            continue;
-                        }
+                let queue = match lists.get(&list) {
+                    Some(0) => continue,
+                    Some(&size) => {
                         copies += size;
                         if copies > MAX_SHARED_KIDS_COPIES {
                             return Err(PagesTooComplex);
                         }
-                        (from, size)
+                        false
                     }
-                    None if a.iter().any(is_written_page_node) => {
-                        (usize::MAX, a.iter().map(copy_size).sum())
+                    None => {
+                        let size = if a.iter().any(is_written_page_node) {
+                            a.iter().map(copy_size).sum()
+                        } else {
+                            0
+                        };
+                        lists.insert(list, size);
+                        true
                     }
-                    None => (usize::MAX, 0),
                 };
-                lists.insert(list, (from.min(depth), size));
-                (a.clone(), depth < from)
+                (a.clone(), queue)
             }
             _ => continue,
         };
@@ -249,7 +252,7 @@ pub(crate) fn mend_page_tree(doc: &mut Document, bytes: &[u8]) -> Result<bool, P
             *kid = Object::Reference(id);
             #[cfg(test)]
             tests::QUEUED.set(tests::QUEUED.get() + 1);
-            todo.push((id, depth + 1));
+            todo.push_back((id, depth + 1));
         }
         if written {
             if let Ok(d) = doc.get_dictionary_mut(node) {
@@ -757,33 +760,6 @@ mod tests {
         let page = doc.get_dictionary(page).unwrap();
         assert!(page.has_type(b"Page"));
         assert_eq!(page.get(b"Parent").unwrap(), &Object::Reference(last));
-    }
-
-    #[test]
-    fn shared_kids_are_queued_again_only_from_nearer_the_top() {
-        // Nodes at depths 1, 3 and 2, reached in that order, list one list of `n` pages and
-        // one written in it, which each takes a copy of: the `n` are queued from the first
-        // only, not again from the third as nearer the top than the second.
-        let n = 100;
-        let mut doc = Document::with_version("1.7");
-        let mut pages: Vec<Object> = (0..n)
-            .map(|_| doc.add_object(dictionary! { "Type" => "Page" }).into())
-            .collect();
-        pages.push(dictionary! { "Type" => "Page" }.into());
-        let list = doc.add_object(pages);
-        let node = |doc: &mut Document, kids: Object| {
-            doc.add_object(dictionary! { "Type" => "Pages", "Kids" => kids })
-        };
-        let deep = node(&mut doc, list.into());
-        let deep = node(&mut doc, vec![deep.into()].into());
-        let middle = node(&mut doc, list.into());
-        let branch = node(&mut doc, vec![middle.into(), deep.into()].into());
-        let first = node(&mut doc, list.into());
-        let root = node(&mut doc, vec![branch.into(), first.into()].into());
-        with_root(&mut doc, root);
-        QUEUED.set(0);
-        assert!(mend_page_tree(&mut doc, b"%PDF-1.7\n").unwrap());
-        assert!(QUEUED.get() < 2 * n, "queued {} kids", QUEUED.get());
     }
 
     #[test]
