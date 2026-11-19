@@ -18,7 +18,9 @@
 
 use crate::budget;
 use crate::forms;
-use crate::sig_verify::{is_white, FieldLock, Lexer, Permissions, Tok, Versions};
+use crate::sig_verify::{
+    is_white, too_many_versions, FieldLock, Lexer, Permissions, Tok, Versions,
+};
 use crate::Pdf;
 use lopdf::xref::XrefEntry;
 use lopdf::{Dictionary, Document, Object, ObjectId, Stream, StringFormat};
@@ -186,13 +188,18 @@ pub(crate) fn analyse(
     certified: Option<Permissions>,
 ) -> Vec<Vec<Change>> {
     let bytes = versions.bytes;
-    let ends: Vec<usize> = sigs.iter().map(|s| s.end).collect();
+    // A version a signature LimarePDF couldn't check signed is compared too, as other apps
+    // may show it as signed: one LimarePDF doesn't open, past its limits, is refused there.
+    let ends = signed_ends(
+        bytes,
+        (sigs.iter().map(|s| s.end)).chain(unchecked.iter().copied()),
+    );
     let mut cache: HashMap<(usize, usize), Vec<Seen>> = HashMap::new();
     sigs.iter()
         .map(|s| {
             let mut seen = changes_after(versions, bytes, s.end, &ends, listed, &mut cache);
-            // A later version other apps may read differently isn't compared, as its
-            // signature can't be checked: what they show there was never seen.
+            // A later version other apps may read differently is compared as lopdf reads it,
+            // as its signature can't be checked: what they show there was never seen.
             let later = (unchecked.iter().filter(|&&e| e > s.end))
                 .find_map(|&e| versions.peek(e)?.differs.as_ref());
             if let Some(why) = later {
@@ -299,13 +306,38 @@ fn refusal(
     lock.locks(field).then_some(Refusal::Locked)
 }
 
+/// Where signed versions end, in order, each with where the white space just before it
+/// starts: a version ends where a revision does when only white space lies between. Ends
+/// past the file sign no version of it. Each byte is looked at once, however many end in
+/// one run of white space.
+fn signed_ends(bytes: &[u8], ends: impl IntoIterator<Item = usize>) -> Vec<(usize, usize)> {
+    let mut ends: Vec<usize> = (ends.into_iter()).filter(|&e| e <= bytes.len()).collect();
+    ends.sort_unstable();
+    ends.dedup();
+    let mut out: Vec<(usize, usize)> = Vec::with_capacity(ends.len());
+    for e in ends {
+        let from = out.last().map_or(0, |&(p, _)| p);
+        let white = (bytes[from..e].iter().rev())
+            .take_while(|&&c| is_white(c))
+            .count();
+        #[cfg(test)]
+        tests::SCANNED.set(tests::SCANNED.get() + (white + 1).min(e - from));
+        let start = match out.last() {
+            Some(&(p, start)) if white == e - p => start,
+            _ => e - white,
+        };
+        out.push((e, start));
+    }
+    out
+}
+
 /// The changes after the version ending at `end` (see [`changes_between`]). A document
 /// other PDF apps may read differently from LimarePDF has a change that is never allowed.
 fn changes_after(
     versions: &mut Versions,
     bytes: &[u8],
     end: usize,
-    sig_ends: &[usize],
+    sig_ends: &[(usize, usize)],
     listed: &HashSet<ObjectId>,
     cache: &mut HashMap<(usize, usize), Vec<Seen>>,
 ) -> Vec<Seen> {
@@ -334,7 +366,7 @@ fn changes_between(
     versions: &mut Versions,
     bytes: &[u8],
     end: usize,
-    sig_ends: &[usize],
+    sig_ends: &[(usize, usize)],
     listed: &HashSet<ObjectId>,
     cache: &mut HashMap<(usize, usize), Vec<Seen>>,
 ) -> Vec<Seen> {
@@ -343,60 +375,88 @@ fn changes_between(
         Ok(s) => s,
         Err(why) => return malformed(why),
     };
-    // A revision ends at `at` when only white space lies between, either way round: a
-    // signature may end at "%%EOF", before the end of line a revision's end takes in. That
-    // is at most 2 bytes (`revision_end`), so a run of white space after `at` isn't looked
-    // through once for each revision ending after it.
-    let ends_at = |s: &Section, at: usize| {
-        if s.end > at + 2 {
-            return false;
+    // The sections a version ending at `at` has, from the first: sections come newest first,
+    // their ends falling, so they're the last ones. Only the one before them can end past
+    // `at`, at "%%EOF" before the end of line a revision's end takes in, at most 2 bytes
+    // (`revision_end`).
+    let ending_by = |at: usize| {
+        let k = sections.partition_point(|s| s.end > at);
+        match k.checked_sub(1) {
+            Some(i) if sections[i].end <= at + 2 => {
+                let gap = &bytes[at..sections[i].end];
+                #[cfg(test)]
+                tests::SCANNED.set(tests::SCANNED.get() + gap.len());
+                if gap.iter().all(|&c| is_white(c)) {
+                    i
+                } else {
+                    k
+                }
+            }
+            _ => k,
         }
-        let (lo, hi) = (s.end.min(at), s.end.max(at));
-        let white = bytes[lo..hi].iter().take_while(|&&c| is_white(c)).count();
-        #[cfg(test)]
-        tests::SCANNED.set(tests::SCANNED.get() + (white + 1).min(hi - lo));
-        white == hi - lo
     };
-    let ends_by = |s: &Section, at: usize| s.end <= at || ends_at(s, at);
-    // The versions to compare: this one, each later signed version that is one of the
-    // revisions read, and the whole file.
-    let mut anchors = vec![end];
-    let mut later: Vec<usize> = sig_ends
-        .iter()
-        .copied()
-        .filter(|&e| e > end && e < bytes.len())
-        .filter(|&e| sections.iter().any(|s| ends_at(s, e)))
+    // A version ends where a revision does when only white space lies between, either way;
+    // past every revision read, it's this signature's own version.
+    let at_revision = |(at, white): (usize, usize)| match sections.get(ending_by(at)) {
+        Some(s) => s.end > at || s.end >= white,
+        None => white <= end,
+    };
+    let from = sig_ends.partition_point(|&(e, _)| e <= end);
+    let to = sig_ends.partition_point(|&(e, _)| e < bytes.len());
+    let later = sig_ends.get(from..to).unwrap_or_default();
+    // A later version signed where no revision read ends is one other apps may show as
+    // signed, but that can't be compared: a revision off the chain, or part of one.
+    if !later.iter().all(|&e| at_revision(e)) {
+        return malformed(
+            "a later signature signs a part of the file that isn't one of the document's \
+             versions, which PDF apps may show as signed"
+                .into(),
+        );
+    }
+    // The versions to compare, each with where its sections start: this one, each later
+    // signed version, and the whole file.
+    let anchors: Vec<(usize, usize)> = (std::iter::once(end))
+        .chain(later.iter().map(|&(e, _)| e))
+        .chain(std::iter::once(bytes.len()))
+        .map(|at| (at, ending_by(at)))
         .collect();
-    later.sort_unstable();
-    later.dedup();
-    anchors.extend(later);
-    anchors.push(bytes.len());
 
     let mut out = Vec::new();
+    // The numbers the sections from `freed_by` on free, brought up to `a` only for a window
+    // compared, as a cached one doesn't need them.
+    let (mut freed, mut freed_by) = (HashSet::new(), sections.len());
     for w in anchors.windows(2) {
-        let (a, b) = (w[0], w[1]);
+        let ((a, by_a), (b, by_b)) = (w[0], w[1]);
         // Newest first, as read.
-        let between: Vec<&Section> = sections
-            .iter()
-            .filter(|s| s.offset >= a && ends_by(s, b))
-            .collect();
-        if between.is_empty() {
-            continue;
-        }
-        if let Some(found) = cache.get(&(a, b)) {
-            out.extend(found.iter().cloned());
-            continue;
-        }
-        let before: Vec<&Section> = sections
-            .iter()
-            .filter(|s| s.offset >= end && ends_by(s, a))
-            .collect();
-        let found = compare_versions(versions, end, a, b, &before, &between, listed);
+        let between: Vec<&Section> = match sections.get(by_b..by_a) {
+            Some(s) if !s.is_empty() => s.iter().collect(),
+            _ => continue,
+        };
+        // Shared by every signature: `freed` differs, but only in the numbers freed since,
+        // all of which the version at `a` has freed, so none hides a change.
+        let found = match cache.get(&(a, b)) {
+            Some(found) => found.clone(),
+            None => {
+                let since: Vec<&Section> = (sections.get(by_a..freed_by).unwrap_or_default())
+                    .iter()
+                    .collect();
+                for (num, e) in effective(&since) {
+                    if e == Entry::Free {
+                        freed.insert(num);
+                    } else {
+                        freed.remove(&num);
+                    }
+                }
+                freed_by = by_a;
+                let found = compare_versions(versions, a, b, &freed, &between, listed);
+                cache.insert((a, b), found.clone());
+                found
+            }
+        };
         let stop = found
             .iter()
             .any(|s| matches!(s.kind, ChangeKind::Malformed(_)));
-        out.extend(found.iter().cloned());
-        cache.insert((a, b), found);
+        out.extend(found);
         if stop {
             break;
         }
@@ -1220,12 +1280,22 @@ pub(crate) fn references(doc: &Document) -> HashSet<ObjectId> {
 /// doesn't rest on that.
 struct Version<'a> {
     pdf: &'a Pdf,
-    freed: HashSet<u32>,
+    /// The numbers freed, as of the version before `newer`.
+    freed: &'a HashSet<u32>,
+    /// The entries a later revision changes, which come first.
+    newer: Option<&'a BTreeMap<u32, Entry>>,
 }
 
 impl Version<'_> {
+    fn freed(&self, num: u32) -> bool {
+        match self.newer.and_then(|m| m.get(&num)) {
+            Some(e) => *e == Entry::Free,
+            None => self.freed.contains(&num),
+        }
+    }
+
     fn get(&self, id: ObjectId) -> Option<&Object> {
-        if self.freed.contains(&id.0) {
+        if self.freed(id.0) {
             return None;
         }
         self.pdf.doc.objects.get(&id)
@@ -1284,7 +1354,7 @@ impl Version<'_> {
 
     /// The ids lopdf holds for object number `num`.
     fn ids(&self, num: u32) -> Vec<ObjectId> {
-        if self.freed.contains(&num) {
+        if self.freed(num) {
             return Vec::new();
         }
         self.pdf
@@ -1296,40 +1366,34 @@ impl Version<'_> {
     }
 }
 
-/// Compares the version ending at `a` with the one ending at `b`. `before` are the
-/// sections between the signature's own version (ending at `sig_end`) and `a`; `between`
-/// those between `a` and `b`; both newest first. `listed` as for [`analyse`].
+/// Which objects the sections change, and which they free, newest entry first. Objects are
+/// checked in number order, so a revision with several faults always gives the same reason
+/// (a reason naming another object would read as a new change when saving).
+fn effective(secs: &[&Section]) -> BTreeMap<u32, Entry> {
+    let mut m: BTreeMap<u32, Entry> = BTreeMap::new();
+    for s in secs {
+        for &(num, e) in &s.entries {
+            if num != 0 {
+                m.entry(num).or_insert(e);
+            }
+        }
+    }
+    m
+}
+
+/// Compares the version ending at `a` with the one ending at `b`. `freed` are the numbers
+/// the sections after the signature's own version and up to `a` free; `between` the
+/// sections between `a` and `b`, newest first. `listed` as for [`analyse`].
 fn compare_versions(
     versions: &mut Versions,
-    sig_end: usize,
     a: usize,
     b: usize,
-    before: &[&Section],
+    freed: &HashSet<u32>,
     between: &[&Section],
     listed: &HashSet<ObjectId>,
 ) -> Vec<Seen> {
     let malformed = |why: String| vec![never(ChangeKind::Malformed(why), None)];
     let bytes = versions.bytes;
-    // Which objects the sections change, and which they free, newest entry first. Objects
-    // are checked in number order, so a revision with several faults always gives the same
-    // reason (a reason naming another object would read as a new change when saving).
-    let effective = |secs: &[&Section]| {
-        let mut m: BTreeMap<u32, Entry> = BTreeMap::new();
-        for s in secs {
-            for &(num, e) in &s.entries {
-                if num != 0 {
-                    m.entry(num).or_insert(e);
-                }
-            }
-        }
-        m
-    };
-    let freed = |m: &BTreeMap<u32, Entry>| -> HashSet<u32> {
-        m.iter()
-            .filter(|(_, e)| **e == Entry::Free)
-            .map(|(n, _)| *n)
-            .collect()
-    };
     // Object 0 heads the list of free objects, so no revision may list it in use, even when
     // a later one frees it again: lopdf keeps the object an entry's bytes name, so one
     // pointing at the signed bytes of another object brings back that old copy.
@@ -1341,29 +1405,27 @@ fn compare_versions(
         return malformed("LimarePDF can't read object 0 reliably".into());
     }
     let newest = effective(between);
-    // Frees before `a`, unless `between` reuses the number.
-    let old_freed = freed(&effective(before));
-    let new_freed: HashSet<u32> = {
-        let mut all: Vec<&Section> = between.to_vec();
-        all.extend(before.iter().copied());
-        freed(&effective(&all))
-    };
     versions.load(a);
     versions.load(b);
+    // Only a later signed version can be missing, as a signature's own was read to check it
+    // and the whole file is open; one not opened for the limits is past them.
     let (Some(old_pdf), Some(new_pdf)) = (versions.peek(a), versions.peek(b)) else {
-        return malformed(if a == sig_end {
-            "LimarePDF can't read the document as it is after signing".into()
-        } else {
+        return malformed(if versions.allowed(a) && versions.allowed(b) {
             "LimarePDF can't read a later signed version".into()
+        } else {
+            too_many_versions()
         });
     };
+    // Frees before `a`, unless `between` reuses the number.
     let old = Version {
         pdf: old_pdf,
-        freed: old_freed,
+        freed,
+        newer: None,
     };
     let new = Version {
         pdf: new_pdf,
-        freed: new_freed,
+        freed,
+        newer: Some(&newest),
     };
 
     // lopdf must read the same objects LimarePDF's reader finds.
@@ -3290,7 +3352,14 @@ mod tests {
                 stream_at: None,
             };
             let (a, b) = (signed.len(), bytes.len());
-            let found = compare_versions(&mut versions, a, a, b, &[], &[&freeing], &listed(&whole));
+            let found = compare_versions(
+                &mut versions,
+                a,
+                b,
+                &HashSet::new(),
+                &[&freeing],
+                &listed(&whole),
+            );
             let found: Vec<_> = found.into_iter().map(|s| (s.kind, s.need)).collect();
             let why = format!("LimarePDF can't read object {num} reliably");
             assert_eq!(found, [(ChangeKind::Malformed(why), Need::Never)]);
@@ -3773,8 +3842,9 @@ mod tests {
         let mut versions = Versions::new(&bytes, None, &whole);
         let end = signed.len();
         let (listed, mut cache) = (listed(&whole), HashMap::new());
+        let sig_ends = [(end, end)];
         NAMES_COPIED.set(0);
-        let raw = changes_after(&mut versions, &bytes, end, &[end], &listed, &mut cache);
+        let raw = changes_after(&mut versions, &bytes, end, &sig_ends, &listed, &mut cache);
         let copied = NAMES_COPIED.get();
         let count = |kind: ChangeKind| raw.iter().filter(|s| s.kind == kind).count();
         let found = [
@@ -3878,8 +3948,9 @@ mod tests {
         let mut versions = Versions::new(&bytes, None, &whole);
         let end = signed.len();
         let (listed, mut cache) = (listed(&whole), HashMap::new());
+        let sig_ends = [(end, end)];
         NAMES_COPIED.set(0);
-        let raw = changes_after(&mut versions, &bytes, end, &[end], &listed, &mut cache);
+        let raw = changes_after(&mut versions, &bytes, end, &sig_ends, &listed, &mut cache);
         let copied = NAMES_COPIED.get();
         let long = |s: &&Seen| matches!(&s.kind, ChangeKind::FieldAdded(n) if n.len() > 1_000);
         assert_eq!(raw.iter().filter(long).count(), 1);
@@ -3987,7 +4058,8 @@ mod tests {
         d.catalog_mut().unwrap().set("AcroForm", form);
         let v = Version {
             pdf: &p,
-            freed: HashSet::new(),
+            freed: &HashSet::new(),
+            newer: None,
         };
         let roles = Roles::build(&v).unwrap();
         assert_eq!(roles.fields[&g].name, "F1.F2.Y.G");
@@ -4000,7 +4072,8 @@ mod tests {
     fn roles_read_the_form_as_it_is_shown(p: &Pdf) {
         let v = Version {
             pdf: p,
-            freed: HashSet::new(),
+            freed: &HashSet::new(),
+            newer: None,
         };
         let roles = Roles::build(&v).unwrap();
         let read = p.form_nodes();
@@ -4142,7 +4215,8 @@ mod tests {
         d.catalog_mut().unwrap().set("AcroForm", form);
         let v = Version {
             pdf: &p,
-            freed: HashSet::new(),
+            freed: &HashSet::new(),
+            newer: None,
         };
         let roles = Roles::build(&v).unwrap();
         let shows = [a, b, c].map(|id| roles.fields[&id].visible);
@@ -4271,7 +4345,9 @@ mod tests {
     /// A revision after signing, a later signature ending in the 64 KB of spaces after it, and
     /// 500 empty revisions after the spaces: telling which revisions end at each version's
     /// end looks at each byte a few times, not at the spaces once a revision (96 MB before),
-    /// and the changes found are those without the spaces and empty revisions.
+    /// and the changes found are those without the spaces and empty revisions. So too with
+    /// a later end every 64 bytes of the spaces, as signatures LimarePDF couldn't check may
+    /// have, not at the spaces once an end.
     #[test]
     fn white_space_after_a_signature_end_is_looked_at_once() {
         let mut p = Pdf::new();
@@ -4311,7 +4387,8 @@ mod tests {
             let mut versions = Versions::new(bytes, None, &whole);
             let (listed, mut cache) = (listed(&whole), HashMap::new());
             SCANNED.set(0);
-            let found = changes_after(&mut versions, bytes, end, sig_ends, &listed, &mut cache);
+            let sig_ends = signed_ends(bytes, sig_ends.iter().copied());
+            let found = changes_after(&mut versions, bytes, end, &sig_ends, &listed, &mut cache);
             let found: Vec<_> = found.into_iter().map(|s| (s.kind, s.need)).collect();
             (found, SCANNED.get())
         };
@@ -4319,5 +4396,213 @@ mod tests {
         assert!(scanned <= 4 * bytes.len(), "{scanned} bytes looked at");
         assert!(!found.is_empty());
         assert_eq!(found, changes(&plain, &[end]).0);
+        let many: Vec<usize> = std::iter::once(end)
+            .chain((later..plain.len() + 65_536).step_by(64))
+            .collect();
+        let (found, scanned) = changes(&bytes, &many);
+        assert!(scanned <= 4 * bytes.len(), "{scanned} bytes looked at");
+        assert_eq!(found, changes(&plain, &[end]).0);
+    }
+
+    /// A plain one-page file, its page's number, the page written turned by the given angle
+    /// (0, as it is), and the end of a revision listing the page alone, at offset `entry`,
+    /// its section at `xref` following the one at `prev`.
+    #[allow(clippy::type_complexity)]
+    fn page_revisions() -> (
+        Vec<u8>,
+        u32,
+        impl Fn(i64) -> String,
+        impl Fn(usize, usize, usize) -> String,
+    ) {
+        let mut p = Pdf::new();
+        p.insert_blank(0, 300.0, 200.0).unwrap();
+        let signed = p.snapshot().unwrap();
+        let p = Pdf::from_bytes(&signed, None).unwrap();
+        let (num, gen) = p.page_ids()[0];
+        let Some(&XrefEntry::Normal { offset, .. }) = p.doc.reference_table.get(num) else {
+            panic!("the page isn't written plainly");
+        };
+        let at = offset as usize;
+        let len = signed[at..]
+            .windows(6)
+            .position(|w| w == b"endobj")
+            .unwrap()
+            + 6;
+        let page = String::from_utf8(signed[at..at + len].to_vec()).unwrap();
+        let turned = move |angle: i64| {
+            let close = page.rfind(">>").unwrap();
+            match angle {
+                0 => format!("{page}\n"),
+                _ => format!("{} /Rotate {angle}{}\n", &page[..close], &page[close..]),
+            }
+        };
+        let (root, root_gen) = p.doc.trailer.get(b"Root").unwrap().as_reference().unwrap();
+        let size = p.doc.trailer.get(b"Size").unwrap().as_i64().unwrap();
+        let tail = move |entry: usize, prev: usize, xref: usize| {
+            format!(
+                "xref\n{num} 1\n{entry:010} {gen:05} n \ntrailer\n<< /Size {size} /Root {root} \
+                 {root_gen} R /Prev {prev} >>\nstartxref\n{xref}\n%%EOF\n"
+            )
+        };
+        (signed, num, turned, tail)
+    }
+
+    /// A revision whose cross-reference pointer leads into the white space before its
+    /// section, past where a later version is signed, is compared after that version. It
+    /// fell between the versions compared and was never looked at: here it put the page,
+    /// turned, at bytes the revision before holds but doesn't list.
+    #[test]
+    fn a_revision_starting_before_a_later_signed_end_is_compared() {
+        let (signed, num, turned, tail) = page_revisions();
+        // The page as it was, after a turned copy no entry lists.
+        let mut bytes = signed.clone();
+        let turned_at = bytes.len();
+        bytes.extend_from_slice(turned(180).as_bytes());
+        let page_at = bytes.len();
+        bytes.extend_from_slice(turned(0).as_bytes());
+        let xref = bytes.len();
+        let r1 = tail(page_at, last_startxref(&signed).unwrap(), xref);
+        bytes.extend_from_slice(r1.as_bytes());
+        // Then 20 spaces, the next revision's pointer leading to the third.
+        let spaces = bytes.len();
+        bytes.resize(spaces + 20, b' ');
+        let r2 = tail(turned_at, xref, spaces + 3);
+        bytes.extend_from_slice(r2.as_bytes());
+        let end = signed.len();
+        let changes = |sig_ends: &[usize]| {
+            let whole = Pdf::from_bytes(&bytes, None).unwrap();
+            let mut versions = Versions::new(&bytes, None, &whole);
+            let (listed, mut cache) = (listed(&whole), HashMap::new());
+            let sig_ends = signed_ends(&bytes, sig_ends.iter().copied());
+            let found = changes_after(&mut versions, &bytes, end, &sig_ends, &listed, &mut cache);
+            found
+                .into_iter()
+                .map(|s| (s.kind, s.need))
+                .collect::<Vec<_>>()
+        };
+        // Compared alone, it points into the revision before; with it, the page turned.
+        let outside = format!("object {num} points outside the revision that changes it");
+        assert_eq!(
+            changes(&[end, spaces + 10]),
+            [(ChangeKind::Malformed(outside), Need::Never)]
+        );
+        assert_eq!(changes(&[end]), [(ChangeKind::PageContent, Need::Never)]);
+    }
+
+    /// Changes found for an earlier signature are reused for a later one, a refusal too: the
+    /// later signature stops at it, as when found afresh, not going on to what follows.
+    #[test]
+    fn a_refusal_found_for_an_earlier_signature_stops_a_later_one() {
+        let (signed, _, turned, tail) = page_revisions();
+        // A turned copy no entry lists, then the page listed as it was.
+        let mut bytes = signed.clone();
+        let turned_at = bytes.len();
+        bytes.extend_from_slice(turned(180).as_bytes());
+        let page_at = bytes.len();
+        bytes.extend_from_slice(turned(0).as_bytes());
+        let x1 = bytes.len();
+        bytes.extend_from_slice(tail(page_at, last_startxref(&signed).unwrap(), x1).as_bytes());
+        // A revision listing the copy, which lies in the revision before.
+        let x2 = bytes.len();
+        bytes.extend_from_slice(tail(turned_at, x1, x2).as_bytes());
+        // And one turning the page.
+        let (e1, e2, e3) = (signed.len(), x2, bytes.len());
+        let again = bytes.len();
+        bytes.extend_from_slice(turned(90).as_bytes());
+        let x3 = bytes.len();
+        bytes.extend_from_slice(tail(again, x2, x3).as_bytes());
+        let whole = Pdf::from_bytes(&bytes, None).unwrap();
+        let mut versions = Versions::new(&bytes, None, &whole);
+        let listed = listed(&whole);
+        let sig_ends = signed_ends(&bytes, [e1, e2, e3]);
+        let found = |end: usize, versions: &mut Versions, cache: &mut _| {
+            changes_after(versions, &bytes, end, &sig_ends, &listed, cache)
+                .into_iter()
+                .map(|s| s.kind)
+                .collect::<Vec<_>>()
+        };
+        let mut cache = HashMap::new();
+        let first = found(e1, &mut versions, &mut cache);
+        assert!(matches!(first[..], [ChangeKind::Malformed(_)]), "{first:?}");
+        let fresh = found(e2, &mut versions, &mut HashMap::new());
+        assert_eq!(fresh, first);
+        assert_eq!(found(e2, &mut versions, &mut cache), fresh);
+    }
+
+    /// A later signed version LimarePDF can't read refuses the earlier signatures, saying so,
+    /// not that it's past the limits: here its revision encrypts it, with a password the
+    /// empty one doesn't open, and the next leaves that out again.
+    #[test]
+    fn a_later_signed_version_that_cant_be_read_is_refused() {
+        let (signed, num, turned, tail) = page_revisions();
+        let mut bytes = signed.clone();
+        let r1 = tail(0, 0, 0);
+        let size = r1.split("/Size ").nth(1).unwrap();
+        let size: u32 = size[..size.find(' ').unwrap()].parse().unwrap();
+        let enc_at = bytes.len();
+        let zeros = "00".repeat(32);
+        let enc = format!(
+            "{size} 0 obj\n<< /Filter /Standard /V 1 /R 2 /O <{zeros}> /U <{zeros}> /P -4 >>\n\
+             endobj\n"
+        );
+        bytes.extend_from_slice(enc.as_bytes());
+        let x1 = bytes.len();
+        let r1 = tail(enc_at, last_startxref(&signed).unwrap(), x1)
+            .replacen(&format!("xref\n{num} 1"), &format!("xref\n{size} 1"), 1)
+            .replacen(&format!("/Size {size}"), &format!("/Size {}", size + 1), 1)
+            .replacen(
+                " >>\nstartxref",
+                &format!(" /Encrypt {size} 0 R /ID [<00> <00>] >>\nstartxref"),
+                1,
+            );
+        bytes.extend_from_slice(r1.as_bytes());
+        let later = bytes.len();
+        assert!(Pdf::from_bytes(&bytes, None).is_err());
+        let page_at = bytes.len();
+        bytes.extend_from_slice(turned(90).as_bytes());
+        let x2 = bytes.len();
+        bytes.extend_from_slice(tail(page_at, x1, x2).as_bytes());
+        let whole = Pdf::from_bytes(&bytes, None).unwrap();
+        let mut versions = Versions::new(&bytes, None, &whole);
+        let (listed, mut cache) = (listed(&whole), HashMap::new());
+        let end = signed.len();
+        let sig_ends = signed_ends(&bytes, [end, later]);
+        let found = changes_after(&mut versions, &bytes, end, &sig_ends, &listed, &mut cache);
+        let found: Vec<_> = found.into_iter().map(|s| s.kind).collect();
+        let why = "LimarePDF can't read a later signed version";
+        assert_eq!(found, [ChangeKind::Malformed(why.into())]);
+    }
+
+    /// A later signed version not opened for the limits is refused as past them, also when
+    /// it's first needed as the older one: here it's this signature's own version and some
+    /// white space, so the window up to it holds nothing to compare.
+    #[test]
+    fn a_later_signed_version_past_the_limits_is_refused_as_such() {
+        let (signed, _, turned, tail) = page_revisions();
+        let mut bytes = signed.clone();
+        bytes.extend_from_slice(b"  ");
+        let later = bytes.len();
+        let page_at = bytes.len();
+        bytes.extend_from_slice(turned(90).as_bytes());
+        let x1 = bytes.len();
+        bytes.extend_from_slice(tail(page_at, last_startxref(&signed).unwrap(), x1).as_bytes());
+        let whole = Pdf::from_bytes(&bytes, None).unwrap();
+        let mut versions = Versions::new(&bytes, None, &whole);
+        let listed = listed(&whole);
+        let end = signed.len();
+        let sig_ends = signed_ends(&bytes, [end, later]);
+        let found = |versions: &mut Versions| {
+            let cache = &mut HashMap::new();
+            changes_after(versions, &bytes, end, &sig_ends, &listed, cache)
+                .into_iter()
+                .map(|s| s.kind)
+                .collect::<Vec<_>>()
+        };
+        let (fresh, mut full) = (found(&mut versions), Versions::new(&bytes, None, &whole));
+        assert_eq!(fresh, [ChangeKind::PageContent]);
+        // Unreadable prefixes, each counted.
+        (1..=100).for_each(|n| full.load(n));
+        let want = [ChangeKind::Malformed(too_many_versions())];
+        assert_eq!(found(&mut full), want);
     }
 }

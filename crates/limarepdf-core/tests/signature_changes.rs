@@ -56,6 +56,18 @@ fn edit(b: &[u8], f: impl FnOnce(&Document, &mut Document)) -> Vec<u8> {
     })
 }
 
+/// Page 1 turned by `rotate` degrees, or not turned, in an appended revision.
+fn turned(b: &[u8], rotate: Option<i64>) -> Vec<u8> {
+    edit(b, |prev, new| {
+        let mut d = dict(prev, page(prev));
+        match rotate {
+            Some(r) => d.set("Rotate", r),
+            None => _ = d.remove(b"Rotate"),
+        }
+        new.set_object(page(prev), d);
+    })
+}
+
 fn root(d: &Document) -> ObjectId {
     d.trailer.get(b"Root").unwrap().as_reference().unwrap()
 }
@@ -654,36 +666,35 @@ fn a_number_listed_twice_differently_is_refused() {
 }
 
 /// A later signature whose version other apps may read differently from LimarePDF can't be
-/// checked, so the versions before and after it are compared as one, and the earlier
-/// signatures are refused too. A new number at object 1's signed bytes had lopdf read that
-/// old copy over a new one in an object stream, and the page tree turned for the second
-/// signer, then turned back, passed as allowed.
+/// checked, but its version is still compared with the ones before and after it, which
+/// refuses the earlier signatures. A new number at object 1's signed bytes had lopdf read
+/// that old copy over a new one in an object stream, and the page tree turned for the second
+/// signer, then turned back, passed as allowed, when the versions either side were compared
+/// as one.
 #[test]
 fn a_later_signed_version_read_differently_is_refused() {
-    let (end, _) = turned_for_the_second_signer(|b, turned, offset| {
+    let (end, n) = turned_for_the_second_signer(|b, turned, offset| {
         let r2 = hybrid_revision(b, turned, &[('n', offset)], &[]);
         assert!(Pdf::from_bytes(&r2.0, None).unwrap().differs().is_some());
         r2
     });
+    assert!(matches!(
+        sig(&end, "Signature2").status,
+        SigStatus::CantCheck(why) if why.starts_with("other PDF apps may read the version")
+    ));
+    let want = ChangeKind::Malformed(format!(
+        "object {n} points outside the revision that changes it"
+    ));
     let got = changes(&end);
-    let want = "other PDF apps may read a later signed version differently from LimarePDF (";
-    assert!(
-        got.iter().any(|c| matches!(c,
-            (ChangeKind::Malformed(why), Some(Refusal::Never)) if why.starts_with(want))),
-        "{got:#?}"
-    );
+    assert!(got.contains(&(want, Some(Refusal::Never))), "{got:#?}");
     // A signature after it, over a version read alike everywhere, is unaffected.
     let s3 = countersign(&end, "Signature3", true);
     assert_eq!(sig(&s3, "Signature3").status, SigStatus::Valid);
     assert!(sig(&s3, "Signature3").changes.is_empty());
 }
 
-/// A later signature that can't be checked for another reason refuses nothing earlier: the
-/// version it signed reads alike everywhere, and is compared with the rest.
-#[test]
-fn a_later_signature_broken_otherwise_refuses_nothing() {
-    let mut b = countersign(&approve(&base_pdf()), "Signature2", false);
-    // Signature2's range ending inside its revision's end-of-file marker.
+/// Moves the end of the last signature's range by `by` bytes, keeping its width.
+fn range_end_moved(b: &mut [u8], by: isize) {
     let key = b"/ByteRange";
     let at = b.windows(key.len()).rposition(|w| w == key).unwrap();
     let at = at + b[at..].iter().position(|&c| c == b'[').unwrap() + 1;
@@ -691,18 +702,186 @@ fn a_later_signature_broken_otherwise_refuses_nothing() {
     let text = String::from_utf8(b[at..close].to_vec()).unwrap();
     let d: usize = text.split_whitespace().last().unwrap().parse().unwrap();
     let i = text.rfind(&d.to_string()).unwrap();
-    let shorter = format!("{}{:<w$}", &text[..i], d - 3, w = text.len() - i);
-    b[at..close].copy_from_slice(shorter.as_bytes());
-    assert_eq!(
-        sig(&b, "Signature2").status,
-        SigStatus::Broken(
-            "the signed part doesn't end where a version of the document ends".into()
-        )
+    let moved = format!(
+        "{}{:<w$}",
+        &text[..i],
+        d.checked_add_signed(by).unwrap(),
+        w = text.len() - i
     );
+    b[at..close].copy_from_slice(moved.as_bytes());
+}
+
+/// A later signature signing a part of the file that isn't one of its versions refuses the
+/// earlier ones. Its range ending inside its revision's end-of-file marker, just before it,
+/// or after a comment following it, LimarePDF can't check it, but Poppler shows it as valid
+/// when it was signed over that range, and the file cut there shows the page as turned for
+/// the second signer: turned back after, that passed as allowed.
+#[test]
+fn a_later_signed_version_ending_elsewhere_is_refused() {
+    let want = ChangeKind::Malformed(
+        "a later signature signs a part of the file that isn't one of the document's \
+         versions, which PDF apps may show as signed"
+            .into(),
+    );
+    let s2 = countersign(
+        &turned(&approve(&base_pdf()), Some(180)),
+        "Signature2",
+        true,
+    );
+    let eof = s2.windows(5).rposition(|w| w == b"%%EOF").unwrap();
+    let mid = eof as isize + 2 - s2.len() as isize;
+    let before = eof as isize - s2.len() as isize;
+    for (by, comment) in [(mid, ""), (before, ""), (3, "%x\n")] {
+        let mut b = s2.clone();
+        b.extend_from_slice(comment.as_bytes());
+        range_end_moved(&mut b, by);
+        let end = turned(&b, None);
+        assert_eq!(
+            sig(&end, "Signature2").status,
+            SigStatus::Broken(
+                "the signed part doesn't end where a version of the document ends".into()
+            )
+        );
+        let got = changes(&end);
+        assert!(
+            got.contains(&(want.clone(), Some(Refusal::Never))),
+            "{by}: {got:#?}"
+        );
+    }
+}
+
+/// A later signature that can't be checked for another reason refuses nothing earlier: the
+/// version it signed reads alike everywhere, and is compared with the rest.
+#[test]
+fn a_later_signature_broken_otherwise_refuses_nothing() {
+    let mut b = countersign(&approve(&base_pdf()), "Signature2", false);
+    // A digit of Signature2's value, in the gap its range leaves, changed.
+    let key = b"/ByteRange";
+    let at = b.windows(key.len()).rposition(|w| w == key).unwrap();
+    let text = String::from_utf8_lossy(&b[at..at + 80]).into_owned();
+    let range: Vec<usize> = (text.split(['[', ']']).nth(1).unwrap().split_whitespace())
+        .map(|n| n.parse().unwrap())
+        .collect();
+    let at = range[1] + 41;
+    b[at] = if b[at] == b'0' { b'1' } else { b'0' };
+    assert!(!matches!(sig(&b, "Signature2").status, SigStatus::Valid));
     assert_eq!(
         changes(&b),
         [(ChangeKind::Signed("Signature2".into()), None)]
     );
+}
+
+/// A later signature whose range ends in the white space just after an earlier signer's
+/// version signs that version, and refuses nothing for its signer, as one ending right at it
+/// wouldn't. That white space was taken for a part of the file that isn't a version.
+#[test]
+fn a_later_signed_version_ending_in_white_space_after_one_refuses_nothing() {
+    let mut b = approve(&base_pdf());
+    let end = b.len();
+    b.extend_from_slice(b"\n   \n");
+    let mut b = countersign(&b, "Signature2", true);
+    // Signature2's range, the same width, ending 2 bytes into the white space.
+    let key = b"/ByteRange";
+    let at = b.windows(key.len()).rposition(|w| w == key).unwrap();
+    let at = at + b[at..].iter().position(|&c| c == b'[').unwrap() + 1;
+    let close = at + b[at..].iter().position(|&c| c == b']').unwrap();
+    let range = format!("0 1 2 {:<w$}", end, w = close - at - 6);
+    b[at..close].copy_from_slice(range.as_bytes());
+    assert!(!matches!(sig(&b, "Signature2").status, SigStatus::Valid));
+    assert_eq!(
+        changes(&b),
+        [(ChangeKind::Signed("Signature2".into()), None)]
+    );
+}
+
+/// A later signature past the most signed versions LimarePDF opens can't be checked, but its
+/// version is still compared with the ones before and after it, and as LimarePDF can't read
+/// it, the earlier signatures are refused. 99 signatures with empty values used up the limit
+/// before the second signer's, and the page turned for that signer, then turned back, passed
+/// as allowed.
+#[test]
+fn a_later_signed_version_past_the_limit_is_refused() {
+    let mut b = approve(&base_pdf());
+    for k in 1..100 {
+        let f = Field {
+            name: format!("Filler{k}").leak(),
+            invisible: true,
+            // Each placeholder its own size, as the empty values leave them in place.
+            room: 16 + k,
+            ..Field::default()
+        };
+        b = sign_with(&b, &f, |_| Vec::new());
+    }
+    let s2 = countersign(&turned(&b, Some(180)), "Signature2", true);
+    let end = turned(&s2, None);
+    assert_eq!(
+        sig(&end, "Signature2").status,
+        SigStatus::CantCheck(
+            "the document has more signed versions than LimarePDF checks (at most 100, 1024 MB \
+             together)"
+                .into()
+        )
+    );
+    let want = ChangeKind::Malformed(
+        "the document has more signed versions than LimarePDF checks (at most 100, 1024 MB \
+         together)"
+            .into(),
+    );
+    let got = changes(&end);
+    assert!(got.contains(&(want, Some(Refusal::Never))), "{got:#?}");
+}
+
+/// A later signed version that isn't one of the revisions the file's chain reads is refused.
+/// The last revision lists again what the two after the first signature wrote, the page not
+/// turned, and points back past them to the first signature's: the second signer's version,
+/// with the page turned, was never compared, and the turn passed unseen.
+#[test]
+fn a_later_signed_version_off_the_chain_is_refused() {
+    let b = approve(&base_pdf());
+    let s2 = countersign(&turned(&b, Some(180)), "Signature2", true);
+    let doc = Document::load_mem(&s2).unwrap();
+    let mut out = s2.clone();
+    let mut rows = String::new();
+    for (&n, e) in &doc.reference_table.entries {
+        let &lopdf::xref::XrefEntry::Normal { offset, generation } = e else {
+            continue;
+        };
+        let mut at = offset as usize;
+        if at < b.len() {
+            continue;
+        }
+        if (n, generation) == page(&doc) {
+            let len = s2[at..].windows(6).position(|w| w == b"endobj").unwrap() + 6;
+            let text = String::from_utf8_lossy(&s2[at..at + len]).replace("/Rotate 180", "");
+            at = out.len();
+            out.extend_from_slice(text.as_bytes());
+            out.push(b'\n');
+        }
+        rows += &format!("{n} 1\n{at:010} {generation:05} n \n");
+    }
+    let xref = out.len();
+    let (num, gen) = root(&doc);
+    let tail = format!(
+        "xref\n{rows}trailer\n<< /Size {} /Root {num} {gen} R /Prev {} >>\nstartxref\n{xref}\n\
+         %%EOF\n",
+        doc.max_id + 1,
+        last_startxref(&b)
+    );
+    out.extend_from_slice(tail.as_bytes());
+    let rotate = |b: &[u8]| {
+        let d = Document::load_mem(b).unwrap();
+        dict(&d, page(&d)).get(b"Rotate").ok().cloned()
+    };
+    // Other apps show the page turned where the second signer signed, and not at the end.
+    assert_eq!(rotate(&out[..s2.len()]), Some(Object::Integer(180)));
+    assert_eq!(rotate(&out), None);
+    let want = ChangeKind::Malformed(
+        "a later signature signs a part of the file that isn't one of the document's \
+         versions, which PDF apps may show as signed"
+            .into(),
+    );
+    let got = changes(&out);
+    assert!(got.contains(&(want, Some(Refusal::Never))), "{got:#?}");
 }
 
 /// A cross-reference stream whose rows are under 3 bytes wide, after signing, is refused.

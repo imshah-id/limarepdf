@@ -636,7 +636,7 @@ impl<'a> Versions<'a> {
     }
 
     /// Whether the version ending at `end` is open or may be opened within the limits.
-    fn allowed(&self, end: usize) -> bool {
+    pub(crate) fn allowed(&self, end: usize) -> bool {
         end == self.bytes.len()
             || self.cache.contains_key(&end)
             || (self.cache.len() < MAX_VERSIONS
@@ -665,6 +665,15 @@ impl<'a> Versions<'a> {
         self.load(end);
         self.peek(end)
     }
+}
+
+/// Why a version past the limits isn't opened.
+pub(crate) fn too_many_versions() -> String {
+    format!(
+        "the document has more signed versions than LimarePDF checks (at most {MAX_VERSIONS}, {} \
+         MB together)",
+        MAX_VERSION_BYTES >> 20
+    )
 }
 
 fn check_one(
@@ -772,11 +781,7 @@ fn check_into(
 
     // The version this signature signed, and the signature dictionary in it.
     if !versions.allowed(end) {
-        return cant(format!(
-            "the document has more signed versions than LimarePDF checks (at most {MAX_VERSIONS}, \
-             {} MB together)",
-            MAX_VERSION_BYTES >> 20
-        ));
+        return cant(too_many_versions());
     }
     let Some(signed) = versions.get(end) else {
         return cant("LimarePDF can't read the version of the document this signature covers");
@@ -1505,6 +1510,95 @@ mod tests {
         assert!(ends_revision(b"...%%EOF\r\n"));
         assert!(!ends_revision(b"...%%EOF\r\nxref"));
         assert!(!ends_revision(b"...endobj\n"));
+    }
+
+    /// A later version, signed by a signature that couldn't be checked, that other apps may
+    /// read differently refuses the earlier signatures, though comparing finds no change: what
+    /// they show there was never seen. The versions read alike, so the reason is made up.
+    #[test]
+    fn a_later_version_read_differently_refuses_the_earlier_ones() {
+        use sig_changes::{ChangeKind, Refusal};
+        let mut p = Pdf::new();
+        p.insert_blank(0, 300.0, 200.0).unwrap();
+        let signed = p.snapshot().unwrap();
+        // Revisions with only a new trailer.
+        let next = |b: &[u8], id: &[u8]| {
+            let mut p = Pdf::from_bytes(b, None).unwrap();
+            let id = Object::String(id.to_vec(), lopdf::StringFormat::Hexadecimal);
+            p.doc.trailer.set("ID", vec![id.clone(), id]);
+            crate::incremental::append_revision(b, &p.doc)
+                .unwrap()
+                .bytes
+        };
+        let later = next(&signed, b"later");
+        let bytes = next(&later, b"last");
+        let whole = Pdf::from_bytes(&bytes, None).unwrap();
+        for why in [None, Some("a reason")] {
+            let mut versions = Versions::new(&bytes, None, &whole);
+            versions.load(later.len());
+            let opened = versions
+                .cache
+                .get_mut(&later.len())
+                .unwrap()
+                .as_mut()
+                .unwrap();
+            assert!(opened.differs.is_none());
+            opened.differs = why.map(Into::into);
+            let sigs = [sig_changes::Signed {
+                end: signed.len(),
+                locks: None,
+            }];
+            let found =
+                sig_changes::analyse(&mut versions, &sigs, &[later.len()], &HashSet::new(), None);
+            let found: Vec<_> = found[0].iter().map(|c| (&c.kind, c.refused)).collect();
+            let want = why.map(|why| {
+                ChangeKind::Malformed(format!(
+                    "other PDF apps may read a later signed version differently from LimarePDF \
+                     ({why})"
+                ))
+            });
+            assert_eq!(
+                found,
+                Vec::from_iter(want.iter().map(|w| (w, Some(Refusal::Never))))
+            );
+        }
+    }
+
+    /// A later version signed by a signature that couldn't be checked, read alike everywhere,
+    /// is compared with the ones before and after it, as other apps may show it as signed: a
+    /// page turned there and turned back after is refused.
+    #[test]
+    fn a_later_version_that_couldnt_be_checked_is_compared() {
+        let mut p = Pdf::new();
+        p.insert_blank(0, 300.0, 200.0).unwrap();
+        let signed = p.snapshot().unwrap();
+        let mut p = Pdf::from_bytes(&signed, None).unwrap();
+        p.rotate_pages(&[0], 180).unwrap();
+        let turned = crate::incremental::append_revision(&signed, &p.doc)
+            .unwrap()
+            .bytes;
+        let mut p = Pdf::from_bytes(&turned, None).unwrap();
+        let old = Pdf::from_bytes(&signed, None).unwrap();
+        let page = old.page_ids()[0];
+        p.doc.objects.insert(page, old.doc.objects[&page].clone());
+        let bytes = crate::incremental::append_revision(&turned, &p.doc)
+            .unwrap()
+            .bytes;
+        let whole = Pdf::from_bytes(&bytes, None).unwrap();
+        let sigs = [sig_changes::Signed {
+            end: signed.len(),
+            locks: None,
+        }];
+        for (unchecked, changed) in [(&[][..], false), (&[turned.len()][..], true)] {
+            let mut versions = Versions::new(&bytes, None, &whole);
+            // Opened already, as checking its signature would have.
+            versions.load(turned.len());
+            assert!(versions.peek(turned.len()).is_some());
+            let found =
+                sig_changes::analyse(&mut versions, &sigs, unchecked, &HashSet::new(), None);
+            let refused = found[0].iter().any(|c| c.refused.is_some());
+            assert_eq!(refused, changed, "{:?}", found[0]);
+        }
     }
 
     #[test]
