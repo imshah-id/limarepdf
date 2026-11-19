@@ -561,12 +561,13 @@ fn a_cross_reference_stream_naming_another_is_refused() {
          apps read differently"
             .into(),
     );
-    let (got, _) = turned_for_the_second_signer(|b, turned, offset| {
+    let (end, _) = turned_for_the_second_signer(|b, turned, offset| {
         let r2 = object_one_in_a_stream(b, turned, (1, offset, 0), true);
         // LimarePDF says other apps read the file differently.
         assert!(Pdf::from_bytes(&r2, None).unwrap().differs().is_some());
         (r2, 0)
     });
+    let got = changes(&end);
     assert!(
         got.contains(&(want.clone(), Some(Refusal::Never))),
         "{got:#?}"
@@ -580,11 +581,10 @@ fn a_cross_reference_stream_naming_another_is_refused() {
 /// The page tree turned for a second signer by a revision that lopdf reads with object 1's
 /// signed copy, and turned back after: `revision` makes the first from the signed file,
 /// object 1 turned and where its signed copy starts, returning it and the number lopdf
-/// reads at that copy, which the last revision frees. Returns the changes found and that
-/// number.
+/// reads at that copy, which the last revision frees. Returns the file and that number.
 fn turned_for_the_second_signer(
     revision: impl Fn(&[u8], &str, u32) -> (Vec<u8>, u32),
-) -> (Vec<(ChangeKind, Option<Refusal>)>, u32) {
+) -> (Vec<u8>, u32) {
     let (b, offset, old) = object_one_signed();
     let turned = format!("{}/Rotate 180>>", old.strip_suffix(">>").unwrap());
     let (r2, n) = revision(&b, &turned, offset);
@@ -594,8 +594,7 @@ fn turned_for_the_second_signer(
         Some(&lopdf::xref::XrefEntry::Normal { offset: o, .. }) if o == offset
     ));
     let s2 = countersign(&r2, "Signature2", true);
-    let end = append_raw(&s2, &[(1, old.as_bytes())], &[n], &[], "");
-    (changes(&end), n)
+    (append_raw(&s2, &[(1, old.as_bytes())], &[n], &[], ""), n)
 }
 
 /// A hybrid revision whose table frees a number its cross-reference stream places, after
@@ -611,9 +610,10 @@ fn a_hybrid_table_freeing_what_its_stream_places_is_refused() {
              use in its cross-reference stream, which PDF apps read differently"
         ))
     };
-    let (got, n) = turned_for_the_second_signer(|b, turned, offset| {
+    let (end, n) = turned_for_the_second_signer(|b, turned, offset| {
         hybrid_revision(b, turned, &[('f', 0)], &[(1, offset, 0)])
     });
+    let got = changes(&end);
     assert!(got.contains(&(want(n), Some(Refusal::Never))), "{got:#?}");
     // The two entries alone are refused, with nothing changed.
     let (b, offset, old) = object_one_signed();
@@ -621,16 +621,100 @@ fn a_hybrid_table_freeing_what_its_stream_places_is_refused() {
     assert_eq!(changes(&plain), [(want(n), Some(Refusal::Never))]);
 }
 
+/// A revision giving a number two different entries in one cross-reference section, after
+/// signing, is refused. LimarePDF takes the first and lopdf the last: free, then at object
+/// 1's signed bytes, lopdf brought back that old copy over a new one in an object stream,
+/// and the page tree turned for the second signer, then turned back, passed as allowed.
+#[test]
+fn a_number_listed_twice_differently_is_refused() {
+    let want = |n| {
+        ChangeKind::Malformed(format!(
+            "a later revision gives object {n} two different cross-reference entries, which \
+             PDF apps read differently"
+        ))
+    };
+    // Twice in the table, or twice in the cross-reference stream.
+    for in_stream in [false, true] {
+        let revision = |b: &[u8], body: &str, offset| match in_stream {
+            false => hybrid_revision(b, body, &[('f', 0), ('n', offset)], &[]),
+            true => hybrid_revision(b, body, &[], &[(0, 0, 0), (1, offset, 0)]),
+        };
+        let (end, n) = turned_for_the_second_signer(revision);
+        let got = changes(&end);
+        assert!(got.contains(&(want(n), Some(Refusal::Never))), "{got:#?}");
+        // The two entries alone are refused, with nothing changed.
+        let (b, offset, old) = object_one_signed();
+        let (plain, n) = revision(&b, &old, offset);
+        assert_eq!(changes(&plain), [(want(n), Some(Refusal::Never))]);
+    }
+    // The same entry twice reads alike everywhere.
+    let (b, _, old) = object_one_signed();
+    let (twice, _) = hybrid_revision(&b, &old, &[('f', 0), ('f', 0)], &[]);
+    assert_eq!(changes(&twice), []);
+}
+
+/// A later signature whose version other apps may read differently from LimarePDF can't be
+/// checked, so the versions before and after it are compared as one, and the earlier
+/// signatures are refused too. A new number at object 1's signed bytes had lopdf read that
+/// old copy over a new one in an object stream, and the page tree turned for the second
+/// signer, then turned back, passed as allowed.
+#[test]
+fn a_later_signed_version_read_differently_is_refused() {
+    let (end, _) = turned_for_the_second_signer(|b, turned, offset| {
+        let r2 = hybrid_revision(b, turned, &[('n', offset)], &[]);
+        assert!(Pdf::from_bytes(&r2.0, None).unwrap().differs().is_some());
+        r2
+    });
+    let got = changes(&end);
+    let want = "other PDF apps may read a later signed version differently from LimarePDF (";
+    assert!(
+        got.iter().any(|c| matches!(c,
+            (ChangeKind::Malformed(why), Some(Refusal::Never)) if why.starts_with(want))),
+        "{got:#?}"
+    );
+    // A signature after it, over a version read alike everywhere, is unaffected.
+    let s3 = countersign(&end, "Signature3", true);
+    assert_eq!(sig(&s3, "Signature3").status, SigStatus::Valid);
+    assert!(sig(&s3, "Signature3").changes.is_empty());
+}
+
+/// A later signature that can't be checked for another reason refuses nothing earlier: the
+/// version it signed reads alike everywhere, and is compared with the rest.
+#[test]
+fn a_later_signature_broken_otherwise_refuses_nothing() {
+    let mut b = countersign(&approve(&base_pdf()), "Signature2", false);
+    // Signature2's range ending inside its revision's end-of-file marker.
+    let key = b"/ByteRange";
+    let at = b.windows(key.len()).rposition(|w| w == key).unwrap();
+    let at = at + b[at..].iter().position(|&c| c == b'[').unwrap() + 1;
+    let close = at + b[at..].iter().position(|&c| c == b']').unwrap();
+    let text = String::from_utf8(b[at..close].to_vec()).unwrap();
+    let d: usize = text.split_whitespace().last().unwrap().parse().unwrap();
+    let i = text.rfind(&d.to_string()).unwrap();
+    let shorter = format!("{}{:<w$}", &text[..i], d - 3, w = text.len() - i);
+    b[at..close].copy_from_slice(shorter.as_bytes());
+    assert_eq!(
+        sig(&b, "Signature2").status,
+        SigStatus::Broken(
+            "the signed part doesn't end where a version of the document ends".into()
+        )
+    );
+    assert_eq!(
+        changes(&b),
+        [(ChangeKind::Signed("Signature2".into()), None)]
+    );
+}
+
 /// A number LimarePDF reads as freed after signing but lopdf as in use is refused, as one
-/// lopdf reads in use is never compared: a table or a cross-reference stream listing it
-/// free and then in use, where LimarePDF takes the first entry and lopdf the last.
+/// lopdf reads in use is never compared: a hybrid revision's cross-reference stream frees
+/// it in rows too narrow for lopdf, which keeps the entry before, written plainly or in an
+/// object stream.
 #[test]
 fn a_number_lopdf_reads_in_use_but_freed_is_refused() {
     use lopdf::xref::XrefEntry::{Compressed, Normal};
     let (b, offset, old) = object_one_signed();
     let stm = Document::load_mem(&b).unwrap().max_id + 1;
-    let in_table = hybrid_revision(&b, &old, &[('f', 0), ('n', offset)], &[]);
-    let in_stream = hybrid_revision(&b, &old, &[], &[(0, 0, 0), (2, stm, 0)]);
+    let (in_stream, _) = hybrid_revision(&b, &old, &[], &[]);
     let read = [
         Normal {
             offset,
@@ -641,15 +725,49 @@ fn a_number_lopdf_reads_in_use_but_freed_is_refused() {
             index: 0,
         },
     ];
-    for ((r2, n), read) in [in_table, in_stream].into_iter().zip(read) {
-        let lopdf = Document::load_mem(&r2).unwrap();
+    for (r2, read) in [b, in_stream].into_iter().zip(read) {
+        let r3 = narrow_free(&r2, 1);
+        let lopdf = Document::load_mem(&r3).unwrap();
         assert_eq!(
-            format!("{:?}", lopdf.reference_table.get(n)),
+            format!("{:?}", lopdf.reference_table.get(1)),
             format!("{:?}", Some(read))
         );
-        let want = ChangeKind::Malformed(format!("LimarePDF can't read object {n} reliably"));
-        assert_eq!(changes(&r2), [(want, Some(Refusal::Never))]);
+        let want = ChangeKind::Malformed("LimarePDF can't read object 1 reliably".into());
+        assert_eq!(changes(&r3), [(want, Some(Refusal::Never))]);
     }
+}
+
+/// A hybrid revision written by hand whose cross-reference stream frees object `k` in rows
+/// two bytes wide (`/W [1 1 0]`), and whose table lists only that stream.
+fn narrow_free(b: &[u8], k: u32) -> Vec<u8> {
+    let d = Document::load_mem(b).unwrap();
+    let r = root(&d);
+    let prev = last_startxref(b);
+    let x = d.max_id + 1;
+    let mut out = [b, b"\n"].concat();
+    let at_x = out.len();
+    out.extend_from_slice(
+        format!(
+            "{x} 0 obj\n<< /Type /XRef /W [1 1 0] /Index [{k} 1] /Size {} /Length 2 >>\n\
+             stream\n",
+            x + 1
+        )
+        .as_bytes(),
+    );
+    out.extend_from_slice(&[0, 0]);
+    out.extend_from_slice(b"\nendstream\nendobj\n");
+    let at_t = out.len();
+    out.extend_from_slice(
+        format!(
+            "xref\n{x} 1\n{at_x:010} 00000 n\r\ntrailer\n<< /Size {} /Root {} {} R /Prev {prev} \
+             /XRefStm {at_x} >>\nstartxref\n{at_t}\n%%EOF\n",
+            x + 1,
+            r.0,
+            r.1
+        )
+        .as_bytes(),
+    );
+    out
 }
 
 #[test]

@@ -551,7 +551,11 @@ pub fn verify_signatures(
             locks: signatures[i].locks.as_ref(),
         })
         .collect();
-    let found = sig_changes::analyse(&mut versions, &inputs, &listed, certified);
+    let unchecked: Vec<usize> = (signatures.iter())
+        .filter(|s| s.signed_len.is_none())
+        .filter_map(|s| s.byte_range.and_then(|[_, _, c, d]| c.checked_add(d)))
+        .collect();
+    let found = sig_changes::analyse(&mut versions, &inputs, &unchecked, &listed, certified);
     for (i, changes) in which.into_iter().zip(found) {
         signatures[i].changes = changes;
     }

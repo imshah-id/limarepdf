@@ -176,10 +176,12 @@ pub(crate) struct Signed<'a> {
 /// `certified` (the strictest level any certification in the document claims) and each
 /// signature's own locks. `versions` opens the signed versions. `listed` are the fields
 /// whose signatures the report lists: a field signed after signing is allowed as signing
-/// only when it's one of them, as nothing else checks its signature.
+/// only when it's one of them, as nothing else checks its signature. `unchecked` are where
+/// the versions signed by the signatures that couldn't be checked end, in order.
 pub(crate) fn analyse(
     versions: &mut Versions,
     sigs: &[Signed],
+    unchecked: &[usize],
     listed: &HashSet<ObjectId>,
     certified: Option<Permissions>,
 ) -> Vec<Vec<Change>> {
@@ -188,7 +190,22 @@ pub(crate) fn analyse(
     let mut cache: HashMap<(usize, usize), Vec<Seen>> = HashMap::new();
     sigs.iter()
         .map(|s| {
-            let seen = changes_after(versions, bytes, s.end, &ends, listed, &mut cache);
+            let mut seen = changes_after(versions, bytes, s.end, &ends, listed, &mut cache);
+            // A later version other apps may read differently isn't compared, as its
+            // signature can't be checked: what they show there was never seen.
+            let later = (unchecked.iter().filter(|&&e| e > s.end))
+                .find_map(|&e| versions.peek(e)?.differs.as_ref());
+            if let Some(why) = later {
+                if !seen.iter().any(|x| x.need == Need::Never) {
+                    seen.push(never(
+                        ChangeKind::Malformed(format!(
+                            "other PDF apps may read a later signed version differently from \
+                             LimarePDF ({why})"
+                        )),
+                        None,
+                    ));
+                }
+            }
             let mut once: HashSet<Change> = HashSet::new();
             let mut out: Vec<Change> = Vec::new();
             for x in seen {
@@ -468,6 +485,7 @@ fn read_chain(bytes: &[u8], signed_end: usize) -> Result<Vec<Section>, String> {
                     .into(),
             );
         }
+        listed_once(&read.entries)?;
         let end = revision_end(bytes, read.after, at)
             .ok_or_else(|| format!("the revision at byte {at} isn't closed properly"))?;
         if let Some(newer) = sections.last() {
@@ -487,6 +505,7 @@ fn read_chain(bytes: &[u8], signed_end: usize) -> Result<Vec<Section>, String> {
             if extra.kind != SectionKind::Stream {
                 return Err("a hybrid revision's stream isn't a cross-reference stream".into());
             }
+            listed_once(&extra.entries)?;
             // lopdf lets the stream's entry replace a free one in the table, Poppler doesn't.
             let freed: HashSet<u32> = (entries.iter())
                 .filter(|(_, e)| *e == Entry::Free)
@@ -511,6 +530,19 @@ fn read_chain(bytes: &[u8], signed_end: usize) -> Result<Vec<Section>, String> {
         at = read
             .prev
             .ok_or("a later revision replaces the whole cross-reference instead of adding to it")?;
+    }
+}
+
+/// Refuses a section listing a number twice with different entries: LimarePDF's reader
+/// takes the first, lopdf the last.
+fn listed_once(entries: &[(u32, Entry)]) -> Result<(), String> {
+    let mut first: HashMap<u32, Entry> = HashMap::new();
+    match (entries.iter()).find(|&&(num, e)| *first.entry(num).or_insert(e) != e) {
+        Some((num, _)) => Err(format!(
+            "a later revision gives object {num} two different cross-reference entries, which \
+             PDF apps read differently"
+        )),
+        None => Ok(()),
     }
 }
 
@@ -3198,7 +3230,7 @@ mod tests {
             end: signed.len(),
             locks: None,
         };
-        let found = analyse(&mut versions, &[sig], &listed(&whole), certified);
+        let found = analyse(&mut versions, &[sig], &[], &listed(&whole), certified);
         found[0]
             .iter()
             .map(|c| (c.kind.clone(), c.page, c.allowed()))
