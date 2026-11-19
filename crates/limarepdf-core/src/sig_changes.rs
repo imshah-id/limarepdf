@@ -487,6 +487,19 @@ fn read_chain(bytes: &[u8], signed_end: usize) -> Result<Vec<Section>, String> {
             if extra.kind != SectionKind::Stream {
                 return Err("a hybrid revision's stream isn't a cross-reference stream".into());
             }
+            // lopdf lets the stream's entry replace a free one in the table, Poppler doesn't.
+            let freed: HashSet<u32> = (entries.iter())
+                .filter(|(_, e)| *e == Entry::Free)
+                .map(|&(num, _)| num)
+                .collect();
+            if let Some((num, _)) =
+                (extra.entries.iter()).find(|(num, e)| *e != Entry::Free && freed.contains(num))
+            {
+                return Err(format!(
+                    "a later revision lists object {num} as free in its cross-reference table \
+                     but in use in its cross-reference stream, which PDF apps read differently"
+                ));
+            }
             entries.extend(extra.entries);
         }
         sections.push(Section {
@@ -1314,7 +1327,11 @@ fn compare_versions(
     for (&num, &e) in &newest {
         changed.insert(num);
         let ok = match e {
-            Entry::Free => true,
+            // lopdf must find it free too: one it reads in use is never compared.
+            Entry::Free => matches!(
+                new_table.get(&num),
+                None | Some(XrefEntry::Free | XrefEntry::UnusableFree)
+            ),
             Entry::InUse { offset, gen } => {
                 if offset < a || offset >= b {
                     return malformed(format!(
