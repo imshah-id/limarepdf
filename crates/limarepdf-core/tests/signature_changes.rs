@@ -705,68 +705,87 @@ fn a_later_signature_broken_otherwise_refuses_nothing() {
     );
 }
 
-/// A number LimarePDF reads as freed after signing but lopdf as in use is refused, as one
-/// lopdf reads in use is never compared: a hybrid revision's cross-reference stream frees
-/// it in rows too narrow for lopdf, which keeps the entry before, written plainly or in an
-/// object stream.
+/// A cross-reference stream whose rows are under 3 bytes wide, after signing, is refused.
+/// lopdf can't read one unless its data is padded, and drops it from a hybrid revision, where
+/// other apps read it: there object 1 turned for the second signer, which lopdf read as
+/// signed, then turned back. The second signature's version reads differently, which refuses
+/// the first too; this check names the cause.
 #[test]
-fn a_number_lopdf_reads_in_use_but_freed_is_refused() {
-    use lopdf::xref::XrefEntry::{Compressed, Normal};
+fn a_cross_reference_stream_with_narrow_rows_is_refused() {
+    let want = ChangeKind::Malformed(
+        "a later revision's cross-reference stream has entries under 3 bytes wide, which some \
+         PDF apps can't read"
+            .into(),
+    );
     let (b, offset, old) = object_one_signed();
-    let stm = Document::load_mem(&b).unwrap().max_id + 1;
-    let (in_stream, _) = hybrid_revision(&b, &old, &[], &[]);
-    let read = [
-        Normal {
-            offset,
-            generation: 0,
-        },
-        Compressed {
-            container: stm,
-            index: 0,
-        },
-    ];
-    for (r2, read) in [b, in_stream].into_iter().zip(read) {
-        let r3 = narrow_free(&r2, 1);
-        let lopdf = Document::load_mem(&r3).unwrap();
-        assert_eq!(
-            format!("{:?}", lopdf.reference_table.get(1)),
-            format!("{:?}", Some(read))
-        );
-        let want = ChangeKind::Malformed("LimarePDF can't read object 1 reliably".into());
-        assert_eq!(changes(&r3), [(want, Some(Refusal::Never))]);
+    let turned = format!("{}/Rotate 180>>", old.strip_suffix(">>").unwrap());
+    let r2 = object_one_in_rows(&b, &turned, [0, 2], true);
+    let lopdf = Document::load_mem(&r2).unwrap();
+    assert!(matches!(
+        lopdf.reference_table.get(1),
+        Some(&lopdf::xref::XrefEntry::Normal { offset: o, .. }) if o == offset
+    ));
+    assert!(Pdf::from_bytes(&r2, None).unwrap().differs().is_some());
+    let s2 = countersign(&r2, "Signature2", true);
+    let end = append_raw(&s2, &[(1, old.as_bytes())], &[], &[], "");
+    let got = changes(&end);
+    assert!(
+        got.contains(&(want.clone(), Some(Refusal::Never))),
+        "{got:#?}"
+    );
+    // The stream alone is refused, with nothing changed, in a hybrid revision or its own.
+    for hybrid in [true, false] {
+        let plain = object_one_in_rows(&b, &old, [0, 2], hybrid);
+        assert_eq!(changes(&plain), [(want.clone(), Some(Refusal::Never))]);
+        // Rows of 3 bytes read alike everywhere, with the type or without.
+        for w in [[1, 2], [0, 3]] {
+            assert_eq!(changes(&object_one_in_rows(&b, &old, w, hybrid)), []);
+        }
     }
 }
 
-/// A hybrid revision written by hand whose cross-reference stream frees object `k` in rows
-/// two bytes wide (`/W [1 1 0]`), and whose table lists only that stream.
-fn narrow_free(b: &[u8], k: u32) -> Vec<u8> {
+/// A revision written by hand: object 1 as `body`, listed in a cross-reference stream with
+/// `/W [w[0] w[1] 0]`: type 1 in `w[0]` bytes (none or one) and its offset in `w[1]`. When
+/// `hybrid`, a table lists only that stream and names it with `/XRefStm`.
+fn object_one_in_rows(b: &[u8], body: &str, w: [usize; 2], hybrid: bool) -> Vec<u8> {
     let d = Document::load_mem(b).unwrap();
     let r = root(&d);
     let prev = last_startxref(b);
     let x = d.max_id + 1;
     let mut out = [b, b"\n"].concat();
+    let at_1 = u32::try_from(out.len()).unwrap();
+    assert!(at_1 < 1 << (8 * w[1]));
+    out.extend_from_slice(format!("1 0 obj\n{body}\nendobj\n").as_bytes());
+    let mut row = vec![1; w[0]];
+    row.extend_from_slice(&at_1.to_be_bytes()[4 - w[1]..]);
     let at_x = out.len();
+    let size = format!("/Size {}", x + 1);
+    let links = format!("/Root {} {} R /Prev {prev}", r.0, r.1);
+    let own = if hybrid { "" } else { &links };
     out.extend_from_slice(
         format!(
-            "{x} 0 obj\n<< /Type /XRef /W [1 1 0] /Index [{k} 1] /Size {} /Length 2 >>\n\
+            "{x} 0 obj\n<< /Type /XRef /W [{} {} 0] /Index [1 1] {size} {own} /Length {} >>\n\
              stream\n",
-            x + 1
+            w[0],
+            w[1],
+            row.len()
         )
         .as_bytes(),
     );
-    out.extend_from_slice(&[0, 0]);
+    out.extend_from_slice(&row);
     out.extend_from_slice(b"\nendstream\nendobj\n");
     let at_t = out.len();
-    out.extend_from_slice(
-        format!(
-            "xref\n{x} 1\n{at_x:010} 00000 n\r\ntrailer\n<< /Size {} /Root {} {} R /Prev {prev} \
-             /XRefStm {at_x} >>\nstartxref\n{at_t}\n%%EOF\n",
-            x + 1,
-            r.0,
-            r.1
-        )
-        .as_bytes(),
-    );
+    if hybrid {
+        out.extend_from_slice(
+            format!(
+                "xref\n{x} 1\n{at_x:010} 00000 n\r\ntrailer\n<< {size} {links} /XRefStm \
+                 {at_x} >>\n"
+            )
+            .as_bytes(),
+        );
+    }
+    let start = if hybrid { at_t } else { at_x };
+    out.extend_from_slice(format!("startxref\n{start}\n%%EOF\n").as_bytes());
     out
 }
 

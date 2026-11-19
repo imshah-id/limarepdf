@@ -485,6 +485,7 @@ fn read_chain(bytes: &[u8], signed_end: usize) -> Result<Vec<Section>, String> {
                     .into(),
             );
         }
+        wide_enough(&read)?;
         listed_once(&read.entries)?;
         let end = revision_end(bytes, read.after, at)
             .ok_or_else(|| format!("the revision at byte {at} isn't closed properly"))?;
@@ -505,6 +506,7 @@ fn read_chain(bytes: &[u8], signed_end: usize) -> Result<Vec<Section>, String> {
             if extra.kind != SectionKind::Stream {
                 return Err("a hybrid revision's stream isn't a cross-reference stream".into());
             }
+            wide_enough(&extra)?;
             listed_once(&extra.entries)?;
             // lopdf lets the stream's entry replace a free one in the table, Poppler doesn't.
             let freed: HashSet<u32> = (entries.iter())
@@ -546,6 +548,19 @@ fn listed_once(entries: &[(u32, Entry)]) -> Result<(), String> {
     }
 }
 
+/// Refuses a cross-reference stream whose rows are under 3 bytes wide: lopdf can't read one
+/// unless its data is padded, and drops it from a hybrid revision, where other apps read it.
+fn wide_enough(read: &ReadSection) -> Result<(), String> {
+    if read.narrow {
+        return Err(
+            "a later revision's cross-reference stream has entries under 3 bytes wide, which \
+             some PDF apps can't read"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
 #[derive(Debug, PartialEq, Eq)]
 enum SectionKind {
     Table,
@@ -561,6 +576,9 @@ struct ReadSection {
     /// specification gives a table's trailer only: lopdf adds that stream's entries, other
     /// apps don't.
     stray_xref_stm: bool,
+    /// Whether a cross-reference stream's rows are under 3 bytes wide (`/W`), which lopdf
+    /// can't read unless the data is padded.
+    narrow: bool,
     /// Where the section (with its trailer, or its object) ends.
     after: usize,
 }
@@ -626,6 +644,7 @@ fn read_table(bytes: &[u8], mut lx: Lexer) -> Option<ReadSection> {
         prev: direct_offset(&trailer, b"Prev")?,
         xref_stm: direct_offset(&trailer, b"XRefStm")?,
         stray_xref_stm: false,
+        narrow: false,
         after: lx.pos(),
     })
 }
@@ -735,6 +754,7 @@ fn read_xref_stream(bytes: &[u8], mut lx: Lexer) -> Option<ReadSection> {
         prev: direct_offset(&dict, b"Prev")?,
         xref_stm: None,
         stray_xref_stm: dict.has(b"XRefStm"),
+        narrow: row < 3,
         after: tail.pos(),
     })
 }
@@ -3235,6 +3255,46 @@ mod tests {
             .iter()
             .map(|c| (c.kind.clone(), c.page, c.allowed()))
             .collect()
+    }
+
+    /// A number LimarePDF reads as freed after signing but lopdf as in use, written plainly
+    /// or in an object stream, is refused, as one lopdf reads in use is never compared. The
+    /// files read alike, so the freeing section is made up.
+    #[test]
+    fn a_number_lopdf_reads_in_use_but_freed_is_refused() {
+        for modern in [false, true] {
+            let mut p = Pdf::new();
+            p.insert_blank(0, 300.0, 200.0).unwrap();
+            let mut signed = Vec::new();
+            match modern {
+                false => p.doc.save_to(&mut signed),
+                true => p.doc.save_modern(&mut signed),
+            }
+            .unwrap();
+            let mut p = Pdf::from_bytes(&signed, None).unwrap();
+            p.insert_blank(1, 300.0, 200.0).unwrap();
+            let bytes = append_revision(&signed, &p.doc).unwrap().bytes;
+            let whole = Pdf::from_bytes(&bytes, None).unwrap();
+            let root = whole.doc.trailer.get(b"Root").unwrap();
+            let num = root.as_reference().unwrap().0;
+            let read = whole.doc.reference_table.get(num);
+            match modern {
+                false => assert!(matches!(read, Some(XrefEntry::Normal { .. }))),
+                true => assert!(matches!(read, Some(XrefEntry::Compressed { .. }))),
+            }
+            let mut versions = Versions::new(&bytes, None, &whole);
+            let freeing = Section {
+                offset: signed.len(),
+                end: bytes.len(),
+                entries: vec![(num, Entry::Free)],
+                stream_at: None,
+            };
+            let (a, b) = (signed.len(), bytes.len());
+            let found = compare_versions(&mut versions, a, a, b, &[], &[&freeing], &listed(&whole));
+            let found: Vec<_> = found.into_iter().map(|s| (s.kind, s.need)).collect();
+            let why = format!("LimarePDF can't read object {num} reliably");
+            assert_eq!(found, [(ChangeKind::Malformed(why), Need::Never)]);
+        }
     }
 
     /// Two pages sharing a list of 2,000 annotations, one more added after signing: the list
