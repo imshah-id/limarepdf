@@ -532,6 +532,10 @@ fn read_chain(bytes: &[u8], signed_end: usize) -> Result<Vec<Section>, String> {
             if at != signed_xref {
                 return Err("a later revision doesn't build on the signed version".into());
             }
+            // lopdf must find the signed version's section where it does in that version.
+            if lopdf_moves(bytes, at) != lopdf_moves(&bytes[..signed_end], at) {
+                return Err(moved(at));
+            }
             return Ok(sections);
         }
         if !seen.insert(at) || sections.len() >= MAX_SECTIONS {
@@ -650,11 +654,82 @@ fn read_section(bytes: &[u8], at: usize) -> Result<ReadSection, String> {
     if !bytes[at..start].iter().all(|&c| is_white(c)) {
         return Err(bad());
     }
+    if lopdf_moves(bytes, at).iter().any(|&to| to != start) {
+        return Err(moved(at));
+    }
     match tok {
         Tok::Word(b"xref") => read_table(bytes, lx).ok_or_else(bad),
         Tok::Word(_) => read_xref_stream(bytes, Lexer::new(bytes, at)).ok_or_else(bad),
         _ => Err(bad()),
     }
+}
+
+fn moved(at: usize) -> String {
+    format!(
+        "PDF apps may take different cross-reference sections near byte {at}: the pointer to \
+         it doesn't lead straight to one"
+    )
+}
+
+/// Where lopdf may read the cross-reference section a pointer to `at` names, instead of
+/// after the white space there. A pointer that doesn't lead straight to `xref` or an object
+/// header moves to the nearest `xref` within 64 bytes (not the one in `startxref`, the
+/// earlier on a tie), or, failing that and unless a header follows the white space, to the
+/// nearest header within 64 bytes that starts a cross-reference stream. lopdf keeps a move
+/// when the section there reads: an `xref` counts when a line ends after it, as a table
+/// starts, and every header counts, so no move lopdf makes is missed.
+fn lopdf_moves(bytes: &[u8], at: usize) -> Vec<usize> {
+    const WINDOW: usize = 64;
+    let rest = bytes.get(at..).unwrap_or_default();
+    if rest.is_empty() || rest.starts_with(b"xref") || lopdf_header(rest) {
+        return Vec::new();
+    }
+    let (lo, hi) = (at.saturating_sub(WINDOW), bytes.len().min(at + WINDOW));
+    let xref = (lo..hi.saturating_sub(4))
+        .filter(|&p| bytes[p..].starts_with(b"xref") && !bytes[..p].ends_with(b"start"))
+        .min_by_key(|p| p.abs_diff(at));
+    // lopdf tries only the nearest `xref`, and reads at `at` when no table starts there.
+    if let Some(p) = xref {
+        let after = &bytes[p + 4..];
+        let after = after.strip_prefix(b" ").unwrap_or(after);
+        let table = after.starts_with(b"\n") || after.starts_with(b"\r");
+        return if table { vec![p] } else { Vec::new() };
+    }
+    let white = rest.iter().take_while(|c| c.is_ascii_whitespace()).count();
+    if lopdf_header(&rest[white..]) {
+        return Vec::new();
+    }
+    (lo..hi)
+        .filter(|&p| p == 0 || !bytes[p - 1].is_ascii_alphanumeric())
+        .filter(|&p| lopdf_header(&bytes[p..]))
+        .collect()
+}
+
+/// Whether `b` starts with an object header as lopdf finds one: a number up to 10 digits,
+/// spaces, a generation up to 5 digits, spaces, then `obj` not followed by a letter or digit.
+fn lopdf_header(b: &[u8]) -> bool {
+    fn digits<T: std::str::FromStr>(b: &[u8], cap: usize) -> Option<&[u8]> {
+        let n = b.iter().take_while(|c| c.is_ascii_digit()).count();
+        if n == 0 || n > cap {
+            return None;
+        }
+        std::str::from_utf8(&b[..n]).ok()?.parse::<T>().ok()?;
+        Some(&b[n..])
+    }
+    fn spaces(b: &[u8]) -> Option<&[u8]> {
+        let n = (b.iter())
+            .take_while(|c| matches!(c, b' ' | b'\t' | b'\r' | b'\n'))
+            .count();
+        (n > 0).then_some(&b[n..])
+    }
+    fn header(b: &[u8]) -> Option<()> {
+        let b = spaces(digits::<u32>(b, 10)?)?;
+        let b = spaces(digits::<u16>(b, 5)?)?.strip_prefix(b"obj")?;
+        b.first()
+            .is_none_or(|c| !c.is_ascii_alphanumeric())
+            .then_some(())
+    }
+    header(b).is_some()
 }
 
 fn word_num<T: std::str::FromStr>(t: Option<(usize, Tok, usize)>) -> Option<T> {
@@ -4604,5 +4679,134 @@ mod tests {
         (1..=100).for_each(|n| full.load(n));
         let want = [ChangeKind::Malformed(too_many_versions())];
         assert_eq!(found(&mut full), want);
+    }
+
+    /// 200 dots with `text` at each place given.
+    fn dots(texts: &[(usize, &str)]) -> Vec<u8> {
+        let mut b = vec![b'.'; 200];
+        for &(at, text) in texts {
+            b[at..at + text.len()].copy_from_slice(text.as_bytes());
+        }
+        b
+    }
+
+    #[test]
+    fn lopdf_finds_object_headers_its_way() {
+        for yes in [
+            "1 0 obj",
+            "1 0 obj<<",
+            "12\t\r\n3 \n obj ",
+            "4294967295 65535 obj",
+        ] {
+            assert!(lopdf_header(yes.as_bytes()), "{yes:?}");
+        }
+        for no in [
+            "1 0 objx",
+            "1 0 obj1",
+            "1 0obj",
+            "10 obj",
+            "1\x0c0 obj",
+            " 1 0 obj",
+            "12345678901 0 obj",
+            "4294967296 0 obj",
+            "1 123456 obj",
+            "1 65536 obj",
+            "",
+        ] {
+            assert!(!lopdf_header(no.as_bytes()), "{no:?}");
+        }
+    }
+
+    #[test]
+    fn lopdf_moves_a_pointer_to_the_nearest_xref() {
+        let moves = |texts: &[(usize, &str)]| lopdf_moves(&dots(texts), 100);
+        // Straight to a section, or past the end: no move.
+        assert_eq!(moves(&[(100, "xref")]), []);
+        assert_eq!(moves(&[(100, "7 0 obj"), (90, "xref\n")]), []);
+        assert_eq!(lopdf_moves(&dots(&[(150, "xref\n")]), 200), []);
+        assert_eq!(moves(&[(100, "\n"), (101, "xref\n")]), [101]);
+        assert_eq!(moves(&[(90, "xref\n"), (105, "xref\n")]), [105]);
+        assert_eq!(moves(&[(96, "xref\n"), (104, "xref\n")]), [96]);
+        // Not the one in `startxref`.
+        assert_eq!(moves(&[(97, "startxref\n"), (120, "xref\n")]), [120]);
+        let texts = [(96, "start"), (101, "xref\n"), (130, "xref\n")];
+        assert_eq!(moves(&texts), [130]);
+        // Within 64 bytes before, and up to 59 after (lopdf leaves 4 at the end).
+        assert_eq!(moves(&[(36, "xref\n")]), [36]);
+        assert_eq!(moves(&[(35, "xref\n")]), []);
+        assert_eq!(moves(&[(159, "xref\n")]), [159]);
+        assert_eq!(moves(&[(160, "xref\n")]), []);
+        assert_eq!(lopdf_moves(&dots(&[(0, "xref\n")]), 30), [0]);
+        let near_end = &dots(&[(150, "xref\n")])[..155];
+        assert_eq!(lopdf_moves(near_end, 140), [150]);
+    }
+
+    /// lopdf reads a table only where a line ends after `xref`, with one space before it
+    /// at most, and tries no other place when the nearest `xref` isn't one.
+    #[test]
+    fn lopdf_moves_a_pointer_only_to_an_xref_starting_a_table() {
+        let moves = |texts: &[(usize, &str)]| lopdf_moves(&dots(texts), 100);
+        for eol in ["\n", "\r", "\r\n", " \n", " \r"] {
+            assert_eq!(moves(&[(90, &format!("xref{eol}"))]), [90], "{eol:?}");
+        }
+        for not in ["xref", "xref)", "xref  \n", "xref\t\n", "xrefs\n"] {
+            assert_eq!(moves(&[(90, not), (70, "xref\n")]), [], "{not:?}");
+        }
+        assert_eq!(moves(&[(100, "\0"), (95, "xref)"), (101, "7 0 obj")]), []);
+        assert_eq!(lopdf_moves(&dots(&[(150, "xref")])[..154], 140), []);
+    }
+
+    #[test]
+    fn lopdf_moves_a_pointer_to_a_header_near_it_when_no_xref_is() {
+        let moves = |texts: &[(usize, &str)]| lopdf_moves(&dots(texts), 100);
+        // lopdf reads a stream after white space itself.
+        assert_eq!(
+            moves(&[(100, " \t\r\n\x0c"), (105, "7 0 obj"), (80, " 6 0 obj")]),
+            []
+        );
+        // Every header in the window may be one, nearest or not; not one inside a word.
+        let texts = [
+            (100, "\0"),
+            (101, "7 0 obj"),
+            (80, " 6 0 obj"),
+            (60, "a5 0 obj"),
+        ];
+        assert_eq!(moves(&texts), [81, 101]);
+        // Within 64 bytes before, and 63 after.
+        assert_eq!(
+            moves(&[(100, "\0"), (36, "5 0 obj"), (162, " 8 0 obj")]),
+            [36, 163]
+        );
+        assert_eq!(
+            moves(&[(100, "\0"), (35, "5 0 obj"), (163, " 8 0 obj")]),
+            []
+        );
+        assert_eq!(lopdf_moves(&dots(&[(0, "5 0 obj")]), 30), [0]);
+    }
+
+    /// The signed version's pointer must lead lopdf to the same section in the whole file as
+    /// in the signed version: a later revision's `xref` may be nearer to it than the signed one.
+    #[test]
+    fn a_signed_pointer_lopdf_moves_into_a_later_revision_is_refused() {
+        let file = |gap: usize| {
+            let mut b = b"%PDF-1.7\n".to_vec();
+            let x = b.len();
+            b.extend_from_slice(b"xref\n0 1\n0000000000 65535 f\r\ntrailer<</Size 1>>\n");
+            // Into the trailer, 41 bytes past the signed version's `xref`.
+            let at = x + 41;
+            b.extend_from_slice(format!("startxref\n{at}\n%%EOF\n").as_bytes());
+            let signed_end = b.len();
+            b.extend_from_slice(&vec![b' '; gap]);
+            let t = b.len();
+            let tail = format!("xref\n0 0\ntrailer<</Size 1/Prev {at}>>\nstartxref\n{t}\n%%EOF\n");
+            b.extend_from_slice(tail.as_bytes());
+            (b, signed_end, at)
+        };
+        let (b, signed_end, at) = file(0);
+        assert_eq!(lopdf_moves(&b[..signed_end], at), [9]);
+        assert_eq!(read_chain(&b, signed_end).err(), Some(moved(at)));
+        // Farther from it than the signed one.
+        let (b, signed_end, _) = file(20);
+        assert_eq!(read_chain(&b, signed_end).map(|s| s.len()), Ok(1));
     }
 }

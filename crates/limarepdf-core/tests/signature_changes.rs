@@ -968,6 +968,232 @@ fn object_one_in_rows(b: &[u8], body: &str, w: [usize; 2], hybrid: bool) -> Vec<
     out
 }
 
+/// A pointer to a cross-reference section that names the white space before it, after
+/// signing, is refused when lopdf finds another section near it. lopdf takes the nearest
+/// `xref` within 64 bytes of a pointer that doesn't lead straight to a section: a decoy table
+/// there named the signed catalog, or left out the section's entries, so lopdf read the page
+/// as signed while other apps read it turned, and the turn passed as allowed.
+#[test]
+fn a_pointer_lopdf_moves_to_a_section_near_it_is_refused() {
+    let want = |at| {
+        ChangeKind::Malformed(format!(
+            "PDF apps may take different cross-reference sections near byte {at}: the pointer \
+             to it doesn't lead straight to one"
+        ))
+    };
+    let b = approve(&base_pdf());
+    let rotate = |d: &Document| dict(d, page(d)).get(b"Rotate").ok().cloned();
+    for decoy in [Decoy::Stream, Decoy::Table, Decoy::XRefStm, Decoy::Prev] {
+        let (turned, at) = behind_a_decoy(&b, decoy, true, true);
+        // lopdf reads the page as signed.
+        assert_eq!(rotate(&Document::load_mem(&turned).unwrap()), None);
+        let got = changes(&turned);
+        assert!(
+            got.contains(&(want(at), Some(Refusal::Never))),
+            "{decoy:?}: {got:#?}"
+        );
+        assert!(Pdf::from_bytes(&turned, None).unwrap().differs().is_some());
+        // The decoy alone is refused, with nothing changed.
+        let (plain, at) = behind_a_decoy(&b, decoy, false, true);
+        assert_eq!(
+            changes(&plain),
+            [(want(at), Some(Refusal::Never))],
+            "{decoy:?}"
+        );
+        // A `/Prev` must name where its revision's own pointer does, white space or not.
+        if let Decoy::Prev = decoy {
+            continue;
+        }
+        // Without it, lopdf takes the section after the white space too, and reads the turn.
+        let (alone, _) = behind_a_decoy(&b, decoy, true, false);
+        assert_eq!(
+            rotate(&Document::load_mem(&alone).unwrap()),
+            Some(Object::Integer(180))
+        );
+        assert!(Pdf::from_bytes(&alone, None).unwrap().differs().is_none());
+        let got = changes(&alone);
+        assert!(
+            !got.is_empty()
+                && got
+                    .iter()
+                    .all(|(k, _)| !matches!(k, ChangeKind::Malformed(_))),
+            "{decoy:?}: {got:#?}"
+        );
+    }
+}
+
+/// Which pointer names the white space before a revision's cross-reference section, in
+/// [`behind_a_decoy`].
+#[derive(Clone, Copy, Debug)]
+enum Decoy {
+    /// `startxref`, before a cross-reference stream, which the decoy names with `/Prev`.
+    Stream,
+    /// `startxref`, before a table past more white space; the decoy names a cross-reference
+    /// stream listing the same with `/Prev`.
+    Table,
+    /// A hybrid table's `/XRefStm`, before its stream.
+    XRefStm,
+    /// The next revision's `/Prev`, before a cross-reference stream.
+    Prev,
+}
+
+/// A revision written by hand, page 1 turned when `rotate`, whose pointer (by `decoy`) names
+/// the white space just before its section. When `near`, a decoy table (`xref 0 0`) ends at
+/// that white space, which lopdf takes instead. Through `startxref`, the revision adds a new
+/// catalog over a copy of the page, and the decoy's trailer names the signed catalog;
+/// otherwise the page itself changes, and the decoy leads past the section listing it.
+/// Returns the file and where the pointer points.
+fn behind_a_decoy(b: &[u8], decoy: Decoy, rotate: bool, near: bool) -> (Vec<u8>, usize) {
+    let d = Document::load_mem(b).unwrap();
+    let (r, p) = (root(&d), page(&d));
+    let prev = last_startxref(b);
+    let n = d.max_id + 1;
+    let mut page = dict(&d, p);
+    if rotate {
+        page.set("Rotate", 180);
+    }
+    let mut out = [b, b"\n"].concat();
+    let put = |out: &mut Vec<u8>, num: u32, body: &Dictionary| {
+        let at = out.len();
+        out.extend_from_slice(format!("{num} 0 obj\n{body:?}\nendobj\n").as_bytes());
+        at
+    };
+    // A cross-reference stream listing objects at `offsets` (`/W [1 4 2]`).
+    let stream = |out: &mut Vec<u8>, num: u32, index: String, offsets: &[usize], more: String| {
+        let mut rows = Vec::new();
+        for &at in offsets {
+            rows.push(1);
+            rows.extend_from_slice(&u32::try_from(at).unwrap().to_be_bytes());
+            rows.extend_from_slice(&[0, 0]);
+        }
+        out.extend_from_slice(
+            format!(
+                "{num} 0 obj\n<< /Type /XRef /W [1 4 2] /Index [{index}] {more} /Length {} >>\n\
+                 stream\n",
+                rows.len()
+            )
+            .as_bytes(),
+        );
+        out.extend_from_slice(&rows);
+        out.extend_from_slice(b"\nendstream\nendobj\n");
+    };
+    // The decoy, ending where the pointer points.
+    let decoy_then = |out: &mut Vec<u8>, trailer: String| {
+        if near {
+            let text = format!("xref\n0 0\ntrailer<<{trailer}>>\n");
+            assert!(text.len() <= 64, "{text}");
+            out.extend_from_slice(text.as_bytes());
+        }
+        out.len()
+    };
+    let at = match decoy {
+        Decoy::Stream | Decoy::Table => {
+            // A new catalog over a new page tree holding a copy of the page.
+            let (c, q, p2) = (n, n + 1, n + 2);
+            let mut catalog = dict(&d, r);
+            let pages = catalog.get(b"Pages").unwrap().as_reference().unwrap();
+            catalog.set("Pages", (q, 0));
+            let mut tree = dict(&d, pages);
+            tree.set("Kids", vec![Object::Reference((p2, 0))]);
+            page.set("Parent", (q, 0));
+            let offsets = vec![
+                put(&mut out, c, &catalog),
+                put(&mut out, q, &tree),
+                put(&mut out, p2, &page),
+            ];
+            let size = n + 4;
+            let own = format!("/Size {size} /Root {c} 0 R /Prev {prev}");
+            if let Decoy::Stream = decoy {
+                // The stream follows one byte of white space; the decoy's `/Prev` names it.
+                let trailer = |x: usize| format!("/Size {size}/Root {} 0 R/Prev {x:05}", r.0);
+                let len = format!("xref\n0 0\ntrailer<<{}>>\n", trailer(0)).len();
+                let x = out.len() + if near { len } else { 0 } + 1;
+                let at = decoy_then(&mut out, trailer(x));
+                out.push(b'\n');
+                assert_eq!(out.len(), x);
+                let mut offsets = offsets;
+                offsets.push(x);
+                stream(&mut out, n + 3, format!("{c} 4"), &offsets, own);
+                at
+            } else {
+                // The same objects in a stream the decoy names with `/Prev`, then the table
+                // past more white space than lopdf looks through.
+                let s = out.len();
+                stream(
+                    &mut out,
+                    n + 3,
+                    format!("{c} 3"),
+                    &offsets,
+                    format!("/Size {size} /Prev {prev}"),
+                );
+                let at = decoy_then(&mut out, format!("/Size {size}/Root {} 0 R/Prev {s}", r.0));
+                out.extend_from_slice(if near { &[b' '; 70][..] } else { b"\n" });
+                let mut table = format!("xref\n{c} 3\n");
+                for o in &offsets {
+                    table += &format!("{o:010} 00000 n\r\n");
+                }
+                out.extend_from_slice(format!("{table}trailer\n<< {own} >>\n").as_bytes());
+                at
+            }
+        }
+        Decoy::XRefStm => {
+            let at_p = put(&mut out, p.0, &page);
+            let at = decoy_then(&mut out, format!("/Size {}", n + 1));
+            out.push(b'\n');
+            let x = out.len();
+            stream(
+                &mut out,
+                n,
+                format!("{} 1", p.0),
+                &[at_p],
+                format!("/Size {}", n + 1),
+            );
+            let t = out.len();
+            out.extend_from_slice(
+                format!(
+                    "xref\n{n} 1\n{x:010} 00000 n\r\ntrailer\n<< /Size {} /Root {} 0 R /Prev \
+                     {prev} /XRefStm {at} >>\nstartxref\n{t}\n%%EOF\n",
+                    n + 1,
+                    r.0
+                )
+                .as_bytes(),
+            );
+            return (out, at);
+        }
+        Decoy::Prev => {
+            // A revision read alike everywhere, but for the decoy before its section, then
+            // one whose `/Prev` names the white space before that section.
+            let at_p = put(&mut out, p.0, &page);
+            let at = decoy_then(
+                &mut out,
+                format!("/Size {}/Root {} 0 R/Prev {prev}", n + 1, r.0),
+            );
+            out.push(b'\n');
+            let x = out.len();
+            stream(
+                &mut out,
+                n,
+                format!("{} 1 {n} 1", p.0),
+                &[at_p, x],
+                format!("/Size {} /Root {} 0 R /Prev {prev}", n + 1, r.0),
+            );
+            let t = out.len() + 10 + x.to_string().len() + 7;
+            out.extend_from_slice(
+                format!(
+                    "startxref\n{x}\n%%EOF\nxref\n0 0\ntrailer\n<< /Size {} /Root {} 0 R /Prev \
+                     {at} >>\nstartxref\n{t}\n%%EOF\n",
+                    n + 1,
+                    r.0
+                )
+                .as_bytes(),
+            );
+            return (out, at);
+        }
+    };
+    out.extend_from_slice(format!("startxref\n{at}\n%%EOF\n").as_bytes());
+    (out, at)
+}
+
 #[test]
 fn filling_in_a_form_is_allowed() {
     let b = fill(&approve(&form(&["Name", "Date"])), "Name", "Jane");
