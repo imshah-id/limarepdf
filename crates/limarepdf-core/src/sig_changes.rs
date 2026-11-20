@@ -645,6 +645,8 @@ struct ReadSection {
     narrow: bool,
     /// Where the section (with its trailer, or its object) ends.
     after: usize,
+    /// A table's trailer, or the stream's dictionary.
+    trailer: Dictionary,
 }
 
 fn read_section(bytes: &[u8], at: usize) -> Result<ReadSection, String> {
@@ -781,6 +783,7 @@ fn read_table(bytes: &[u8], mut lx: Lexer) -> Option<ReadSection> {
         stray_xref_stm: false,
         narrow: false,
         after: lx.pos(),
+        trailer,
     })
 }
 
@@ -891,6 +894,7 @@ fn read_xref_stream(bytes: &[u8], mut lx: Lexer) -> Option<ReadSection> {
         stray_xref_stm: dict.has(b"XRefStm"),
         narrow: row < 3,
         after: tail.pos(),
+        trailer: dict,
     })
 }
 
@@ -1089,7 +1093,24 @@ pub(crate) fn compare_reading(bytes: &[u8], doc: &Document) -> Result<Reading, S
     let start = bytes.windows(5).position(|w| w == b"%PDF-").unwrap_or(0);
     let bytes = &bytes[start..];
     let pointer = last_startxref(bytes);
-    let (spec, deleted) = whole_xref(bytes, pointer.unwrap_or(doc.xref_start))?;
+    let WholeXref {
+        spec,
+        deleted,
+        trailer,
+    } = whole_xref(bytes, pointer.unwrap_or(doc.xref_start))?;
+    // lopdf must take the newest trailer too: its catalog, and its encryption dictionary,
+    // which lopdf drops from the trailer once it has decrypted the file with it.
+    let encrypt = (doc.trailer.get(b"Encrypt").ok().cloned()).or_else(|| {
+        let id = doc.encryption_state.as_ref()?.encrypt_object_id()?;
+        Some(Object::Reference(id))
+    });
+    if trailer.get(b"Root").ok() != doc.trailer.get(b"Root").ok()
+        || trailer.get(b"Encrypt").ok() != encrypt.as_ref()
+    {
+        return Err(
+            "they take its catalog or encryption from another cross-reference section".into(),
+        );
+    }
     let table = &doc.reference_table.entries;
     let mut unsure: HashSet<u32> = HashSet::new();
     let mut hidden = BTreeSet::new();
@@ -1203,6 +1224,13 @@ pub(crate) fn compare_reading(bytes: &[u8], doc: &Document) -> Result<Reading, S
         }
     }
 
+    // lopdf no longer holds the encryption dictionary (see `references`), and below it
+    // would count as one lopdf doesn't hold; but it must have found it where other apps do.
+    if let Ok(Object::Reference((n, _))) = trailer.get(b"Encrypt") {
+        if unsure.contains(n) {
+            return Err("they may decrypt it with another encryption dictionary".into());
+        }
+    }
     for &(n, g) in doc.objects.keys() {
         let seen = match spec.get(&n) {
             None | Some(Entry::Free) => false,
@@ -1251,24 +1279,34 @@ pub(crate) fn compare_reading(bytes: &[u8], doc: &Document) -> Result<Reading, S
     })
 }
 
+/// The cross-reference information a reader following the specification takes.
+struct WholeXref {
+    /// The entry each object number has.
+    spec: HashMap<u32, Entry>,
+    /// For each number the entry frees, the object a revision deleted.
+    deleted: HashMap<u32, Entry>,
+    /// The newest section's trailer.
+    trailer: Dictionary,
+}
+
 /// The cross-reference entry each object number has for a reader following the
 /// specification: every section from the one at `at` along the `/Prev` chain (a hybrid
 /// section's stream ranking after its table), the newest entry counting, free ones too.
 /// Also, for each number that entry frees, the newest older entry placing an object: the
 /// object a revision deleted.
-#[allow(clippy::type_complexity)]
-fn whole_xref(
-    bytes: &[u8],
-    mut at: usize,
-) -> Result<(HashMap<u32, Entry>, HashMap<u32, Entry>), String> {
+fn whole_xref(bytes: &[u8], mut at: usize) -> Result<WholeXref, String> {
     let mut spec = HashMap::new();
     let mut deleted = HashMap::new();
+    let mut trailer = Dictionary::new();
     let mut seen = HashSet::new();
     loop {
         if !seen.insert(at) || seen.len() > MAX_SECTIONS {
             return Err("its chain of revisions loops or is too long".into());
         }
         let read = read_section(bytes, at)?;
+        if seen.len() == 1 {
+            trailer = read.trailer;
+        }
         let mut entries = read.entries;
         if let Some(stm) = read.xref_stm {
             let extra = read_section(bytes, stm)?;
@@ -1284,7 +1322,13 @@ fn whole_xref(
         }
         match read.prev {
             Some(p) => at = p,
-            None => return Ok((spec, deleted)),
+            None => {
+                return Ok(WholeXref {
+                    spec,
+                    deleted,
+                    trailer,
+                })
+            }
         }
     }
 }
@@ -4808,5 +4852,81 @@ mod tests {
         // Farther from it than the signed one.
         let (b, signed_end, _) = file(20);
         assert_eq!(read_chain(&b, signed_end).map(|s| s.len()), Ok(1));
+    }
+
+    /// lopdf must take the trailer other apps take, the newest: its catalog, and its
+    /// encryption dictionary (lopdf drops `/Encrypt` from the trailer once it decrypts), which
+    /// it must find where they do.
+    #[test]
+    fn a_reading_taking_another_trailer_differs() {
+        let other = Err(
+            "they take its catalog or encryption from another cross-reference section".to_string(),
+        );
+        let read = |b: &[u8], change: &dyn Fn(&mut Document)| {
+            let mut d = Document::load_mem(b).unwrap();
+            change(&mut d);
+            compare_reading(b, &d).map(|_| ())
+        };
+        let mut p = Pdf::new();
+        p.insert_blank(0, 300.0, 200.0).unwrap();
+        let plain = p.to_bytes().unwrap();
+        assert_eq!(read(&plain, &|_| {}), Ok(()));
+        let pages = |d: &Document| d.catalog().unwrap().get(b"Pages").unwrap().clone();
+        assert_eq!(read(&plain, &|d| d.trailer.set("Root", pages(d))), other);
+        assert_eq!(read(&plain, &|d| d.trailer.set("Encrypt", pages(d))), other);
+        // A revision naming a new catalog.
+        let mut d = Document::load_mem(&plain).unwrap();
+        let root = d.add_object(d.catalog().unwrap().clone());
+        d.trailer.set("Root", root);
+        let newer = append_revision(&plain, &d).unwrap().bytes;
+        assert_eq!(read(&newer, &|_| {}), Ok(()));
+        // Encrypted, read decrypted or not.
+        let protect = |p: &mut Pdf, user: &str| {
+            p.set_encryption(Some(crate::Encryption {
+                user_password: user.into(),
+                owner_password: "owner".into(),
+                cipher: crate::Cipher::Aes128,
+                restrictions: crate::Restrictions::default(),
+            }));
+            p.to_bytes().unwrap()
+        };
+        let locked = protect(&mut p, "");
+        assert_eq!(read(&locked, &|_| {}), Ok(()));
+        let encrypt = |d: &Document| {
+            (d.encryption_state.as_ref())
+                .and_then(|s| s.encrypt_object_id())
+                .unwrap()
+        };
+        assert_eq!(
+            read(&locked, &|d| {
+                d.trailer.set("Encrypt", encrypt(d));
+                d.encryption_state = None;
+            }),
+            Ok(())
+        );
+        assert_eq!(read(&locked, &|d| d.encryption_state = None), other);
+        let another = |d: &mut Document| {
+            d.trailer.set("Encrypt", pages(d));
+            d.encryption_state = None;
+        };
+        assert_eq!(read(&locked, &another), other);
+        // Without the password lopdf keeps `/Encrypt`.
+        let password = protect(&mut p, "user");
+        assert_eq!(
+            read(&password, &|d| assert!(d.trailer.has(b"Encrypt"))),
+            Ok(())
+        );
+        // The dictionary found elsewhere.
+        let elsewhere = |d: &mut Document| {
+            let normal = XrefEntry::Normal {
+                offset: 0,
+                generation: 0,
+            };
+            d.reference_table.entries.insert(encrypt(d).0, normal);
+        };
+        assert_eq!(
+            read(&locked, &elsewhere),
+            Err("they may decrypt it with another encryption dictionary".into())
+        );
     }
 }

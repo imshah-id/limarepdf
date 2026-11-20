@@ -227,6 +227,21 @@ fn verify_names_the_digests() {
     }
 }
 
+/// A change after signing is listed whole: a malformed revision's says why.
+#[test]
+fn verify_lists_a_change_whole() {
+    let (dir, input) = setup("change-whole");
+    let mut bytes = std::fs::read(&input).unwrap();
+    bytes.extend_from_slice(b"junk\n");
+    std::fs::write(&input, bytes).unwrap();
+    let (code, text, err) = cli(&dir, "verify input.pdf");
+    assert_eq!(code, Some(1), "{err}");
+    let line = "- NOT ALLOWED: the later additions are malformed: the file doesn't end with a \
+                complete revision (data after the last end-of-file marker, or no \
+                cross-reference pointer) (never allowed after signing)\n";
+    assert_eq!(text.matches(line).count(), 2, "{text}");
+}
+
 /// `limarepdf-cli ARGS --trust-file trust.txt`, run in `dir` (`args` split at spaces): the
 /// exit code, what it printed and its errors.
 fn cli(dir: &Path, args: &str) -> (Option<i32>, String, String) {

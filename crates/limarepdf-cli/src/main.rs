@@ -1916,9 +1916,11 @@ fn print_verify(input: &Path, rep: &SignatureReport) -> Result<()> {
                 .unwrap_or_default();
             row!("Changes:", format!("after signing{signed}:"));
             for c in &s.changes {
+                // Whole, as the status: a malformed revision's says why.
+                let what = display_line(&c.to_string(), 300);
                 let line = match &c.refused {
-                    None => format!("- allowed: {}", clean(&c.to_string())),
-                    Some(r) => format!("- NOT ALLOWED: {} ({r})", clean(&c.to_string())),
+                    None => format!("- allowed: {what}"),
+                    Some(r) => format!("- NOT ALLOWED: {what} ({r})"),
                 };
                 row!("", line);
             }

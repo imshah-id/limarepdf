@@ -282,14 +282,17 @@ impl Pdf {
             checked: Default::default(),
             held: Default::default(),
         };
-        pdf.differs = pdf.match_other_readers(read);
+        // A copy ends with its own update, so whether the file ends cleanly is the file's.
+        let ends_cleanly = crate::sig_changes::last_startxref(bytes).is_some();
+        pdf.differs = pdf.match_other_readers(read, ends_cleanly);
         Ok(pdf)
     }
 
     /// Makes lopdf's reading of `bytes` what other PDF apps read: drops the objects they
     /// don't see (see [`crate::sig_changes::compare_reading`]). Returns why the readings
-    /// may still differ, if they may.
-    fn match_other_readers(&mut self, bytes: &[u8]) -> Option<String> {
+    /// may still differ, if they may. `ends_cleanly`: whether the file `bytes` were read
+    /// from (perhaps a copy of it) ends with its cross-reference pointer.
+    fn match_other_readers(&mut self, bytes: &[u8], ends_cleanly: bool) -> Option<String> {
         let reading = match crate::sig_changes::compare_reading(bytes, &self.doc) {
             Ok(r) => r,
             Err(why) => return Some(why),
@@ -297,7 +300,7 @@ impl Pdf {
         for id in &reading.hidden {
             self.doc.objects.remove(id);
         }
-        if !reading.ends_cleanly {
+        if !(reading.ends_cleanly && ends_cleanly) {
             return Some(
                 "it doesn't end with its cross-reference pointer (data may follow its \
                  end-of-file marker)"
@@ -1301,15 +1304,7 @@ fn blank_null_encrypt(bytes: &[u8]) -> Option<Vec<u8>> {
     // from where the last `startxref` points (counted from the header, as lopdf does) to
     // the next `startxref` or `stream`.
     let header = bytes.windows(5).position(|w| w == b"%PDF-").unwrap_or(0);
-    let s = bytes.windows(9).rposition(|w| w == b"startxref")? + 9;
-    let digits: Vec<u8> = bytes[s..]
-        .iter()
-        .skip_while(|b| b.is_ascii_whitespace())
-        .take_while(|b| b.is_ascii_digit())
-        .take(15)
-        .copied()
-        .collect();
-    let at = header.checked_add(std::str::from_utf8(&digits).ok()?.parse().ok()?)?;
+    let at = header.checked_add(startxref(bytes)?)?;
     let rest = bytes.get(at..)?;
     let end = [&b"startxref"[..], b"stream"]
         .iter()
@@ -1339,6 +1334,20 @@ fn blank_null_encrypt(bytes: &[u8]) -> Option<Vec<u8>> {
         from = end;
     }
     copy
+}
+
+/// The offset the last `startxref` in `bytes` gives, where lopdf reads the newest section
+/// (counted from the header), whatever follows it.
+fn startxref(bytes: &[u8]) -> Option<usize> {
+    let s = bytes.windows(9).rposition(|w| w == b"startxref")? + 9;
+    let digits: Vec<u8> = bytes[s..]
+        .iter()
+        .skip_while(|b| b.is_ascii_whitespace())
+        .take_while(|b| b.is_ascii_digit())
+        .take(15)
+        .copied()
+        .collect();
+    std::str::from_utf8(&digits).ok()?.parse().ok()
 }
 
 /// `bytes` with a copy of the encryption dictionary appended as an update in a form lopdf
@@ -1382,6 +1391,10 @@ fn encryption_lopdf_reads(bytes: &[u8]) -> Option<Vec<u8>> {
         return None;
     }
 
+    // The update builds on the section the file's pointer gives, not on the one lopdf read,
+    // which may be another near it: comparing readings must see that as in the file itself
+    // (see `crate::sig_changes::compare_reading`).
+    let prev = startxref(bytes)?;
     // lopdf counts offsets from the header, as in `blank_null_encrypt`.
     let header = bytes.windows(5).position(|w| w == b"%PDF-").unwrap_or(0);
     let mut out = bytes.to_vec();
@@ -1394,7 +1407,7 @@ fn encryption_lopdf_reads(bytes: &[u8]) -> Option<Vec<u8>> {
     }
     trailer.set("Size", size.unwrap_or(0).max(i64::from(n) + 1));
     trailer.set("Encrypt", (n, g));
-    trailer.set("Prev", doc.xref_start as i64);
+    trailer.set("Prev", prev as i64);
     let at = out.len() - header;
     let mut text = format!("{n} {g} obj\n");
     crate::repair::write_object(&mut text, &Object::Dictionary(enc), 0);
