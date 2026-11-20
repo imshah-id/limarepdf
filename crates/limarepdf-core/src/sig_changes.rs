@@ -550,6 +550,7 @@ fn read_chain(bytes: &[u8], signed_end: usize) -> Result<Vec<Section>, String> {
             );
         }
         wide_enough(&read)?;
+        decoded_alike(&read, at)?;
         listed_once(&read.entries)?;
         let end = revision_end(bytes, read.after, at)
             .ok_or_else(|| format!("the revision at byte {at} isn't closed properly"))?;
@@ -571,6 +572,7 @@ fn read_chain(bytes: &[u8], signed_end: usize) -> Result<Vec<Section>, String> {
                 return Err("a hybrid revision's stream isn't a cross-reference stream".into());
             }
             wide_enough(&extra)?;
+            decoded_alike(&extra, stm)?;
             listed_once(&extra.entries)?;
             // lopdf lets the stream's entry replace a free one in the table, Poppler doesn't.
             let freed: HashSet<u32> = (entries.iter())
@@ -625,6 +627,89 @@ fn wide_enough(read: &ReadSection) -> Result<(), String> {
     Ok(())
 }
 
+/// Refuses a cross-reference stream, its section starting at `at`, whose data other apps
+/// may decode differently from lopdf ([`decodes_alike`]).
+fn decoded_alike(read: &ReadSection, at: usize) -> Result<(), String> {
+    if read.lenient {
+        return Err(format!(
+            "the cross-reference stream at byte {at} holds data PDF apps may decode \
+             differently: damaged, or not plain Flate data"
+        ));
+    }
+    Ok(())
+}
+
+/// Whether other PDF apps decode stream `s` (at most `limit` bytes of it) as lopdf does:
+/// unfiltered, or whole Flate data with predictor parameters they all take alike. lopdf
+/// decodes damaged Flate data as far as it can, where some apps fail, and some then
+/// rebuild the cross-reference information by scanning the file, finding objects no
+/// section lists. lopdf reads neither indirect parameters nor the abbreviated keys some
+/// apps take for `/Filter` and `/DecodeParms`. Other filters aren't relied on.
+fn decodes_alike(s: &Stream, limit: usize) -> bool {
+    let d = &s.dict;
+    if [&b"F"[..], b"DP", b"FFilter", b"FDecodeParms"]
+        .into_iter()
+        .any(|k| d.has(k))
+    {
+        return false;
+    }
+    let none = |o: Option<&Object>| matches!(o, None | Some(Object::Null));
+    let flate = |o: &Object| matches!(o, Object::Name(n) if n == b"FlateDecode");
+    let (filter, parms) = (d.get(b"Filter").ok(), d.get(b"DecodeParms").ok());
+    // Apps take parameters in an array only for filters in an array, and lopdf takes
+    // parameters for one filter for all of them. lopdf decodes data with an empty list of
+    // filters as nothing.
+    let parms = match filter {
+        _ if none(filter) => return none(parms),
+        Some(f) if flate(f) => match parms {
+            Some(Object::Dictionary(p)) => Some(p),
+            p if none(p) => None,
+            _ => return false,
+        },
+        Some(Object::Array(f)) if matches!(f.as_slice(), [f] if flate(f)) => match parms {
+            Some(Object::Array(p)) => match p.as_slice() {
+                [Object::Dictionary(p)] => Some(p),
+                [Object::Null] => None,
+                _ => return false,
+            },
+            p if none(p) => None,
+            _ => return false,
+        },
+        _ => return false,
+    };
+    parms.is_none_or(predicted_alike)
+        && matches!(
+            crate::sanitise::inflate(&s.content, limit),
+            Ok(crate::sanitise::Inflated::Whole)
+        )
+}
+
+/// Whether other PDF apps take predictor parameters `p` as lopdf does: each value a direct
+/// integer in the range the spec allows, and no TIFF predictor (2), which Poppler and pdf.js
+/// decode differently from lopdf at 16 bits or with rows padded out to a byte. lopdf takes
+/// 0 for 1, where Poppler drops the predictor, and ignores predictors 3 to 9, as Poppler
+/// does, where pdf.js fails.
+fn predicted_alike(p: &Dictionary) -> bool {
+    let int = |k: &[u8], default: i64| match p.get(k) {
+        Err(_) | Ok(Object::Null) => Some(default),
+        Ok(Object::Integer(i)) => Some(*i),
+        Ok(_) => None,
+    };
+    let (Some(predictor), Some(columns), Some(colors), Some(bits)) = (
+        int(b"Predictor", 1),
+        int(b"Columns", 1),
+        int(b"Colors", 1),
+        int(b"BitsPerComponent", 8),
+    ) else {
+        return false;
+    };
+    matches!(predictor, 1 | 10..=15)
+        && (1..=32).contains(&colors)
+        && matches!(bits, 1 | 2 | 4 | 8 | 16)
+        && columns >= 1
+        && columns < i64::from(i32::MAX) / colors / bits
+}
+
 #[derive(Debug, PartialEq, Eq)]
 enum SectionKind {
     Table,
@@ -643,6 +728,9 @@ struct ReadSection {
     /// Whether a cross-reference stream's rows are under 3 bytes wide (`/W`), which lopdf
     /// can't read unless the data is padded.
     narrow: bool,
+    /// Whether a cross-reference stream's data may decode differently in other apps
+    /// ([`decodes_alike`]).
+    lenient: bool,
     /// Where the section (with its trailer, or its object) ends.
     after: usize,
     /// A table's trailer, or the stream's dictionary.
@@ -782,6 +870,7 @@ fn read_table(bytes: &[u8], mut lx: Lexer) -> Option<ReadSection> {
         xref_stm: direct_offset(&trailer, b"XRefStm")?,
         stray_xref_stm: false,
         narrow: false,
+        lenient: false,
         after: lx.pos(),
         trailer,
     })
@@ -825,7 +914,8 @@ fn read_xref_stream(bytes: &[u8], mut lx: Lexer) -> Option<ReadSection> {
     if dict.get(b"Type").ok()?.as_name().ok()? != b"XRef" {
         return None;
     }
-    let decoded = Stream::new(dict.clone(), data.to_vec())
+    let stream = Stream::new(dict.clone(), data.to_vec());
+    let decoded = stream
         .decompressed_content_with_limit(MAX_XREF_STREAM)
         .ok()?;
     let ints = |key: &[u8]| -> Option<Vec<i64>> {
@@ -893,6 +983,7 @@ fn read_xref_stream(bytes: &[u8], mut lx: Lexer) -> Option<ReadSection> {
         xref_stm: None,
         stray_xref_stm: dict.has(b"XRefStm"),
         narrow: row < 3,
+        lenient: !decodes_alike(&stream, MAX_XREF_STREAM),
         after: tail.pos(),
         trailer: dict,
     })
@@ -1158,6 +1249,9 @@ pub(crate) fn compare_reading(bytes: &[u8], doc: &Document) -> Result<Reading, S
     // from the stream at the place its entry gives. lopdf takes any object a stream holds
     // that has no entry of its own, and one whose own object it couldn't read.
     let mut copies: Vec<(u32, ObjectId)> = Vec::new();
+    // The objects listed in each object stream, gathered for the first that other apps may
+    // decode differently.
+    let mut listed_in: Option<HashMap<u32, Vec<u32>>> = None;
     for (&(c, g), o) in &doc.objects {
         let Object::Stream(s) = o else { continue };
         if !s.dict.has_type(b"ObjStm") {
@@ -1165,6 +1259,20 @@ pub(crate) fn compare_reading(bytes: &[u8], doc: &Document) -> Result<Reading, S
         }
         let members =
             objstm_members(s).ok_or_else(|| format!("its object stream {c} can't be read"))?;
+        // Other apps may read none of the objects listed in it. lopdf's stray copies of
+        // others are checked below.
+        if !decodes_alike(s, MAX_OBJECT_STREAM) {
+            let listed_in = listed_in.get_or_insert_with(|| {
+                let mut m: HashMap<u32, Vec<u32>> = HashMap::new();
+                for (&n, e) in &spec {
+                    if let Entry::Compressed { container, .. } = e {
+                        m.entry(*container).or_default().push(n);
+                    }
+                }
+                m
+            });
+            unsure.extend(listed_in.get(&c).into_iter().flatten());
+        }
         let mut seen = HashSet::new();
         for (i, &n) in members.iter().enumerate() {
             if !seen.insert(n) {
@@ -1304,6 +1412,7 @@ fn whole_xref(bytes: &[u8], mut at: usize) -> Result<WholeXref, String> {
             return Err("its chain of revisions loops or is too long".into());
         }
         let read = read_section(bytes, at)?;
+        decoded_alike(&read, at)?;
         if seen.len() == 1 {
             trailer = read.trailer;
         }
@@ -1313,6 +1422,7 @@ fn whole_xref(bytes: &[u8], mut at: usize) -> Result<WholeXref, String> {
             if extra.kind != SectionKind::Stream {
                 return Err("a hybrid revision's stream isn't a cross-reference stream".into());
             }
+            decoded_alike(&extra, stm)?;
             entries.extend(extra.entries);
         }
         for (num, e) in entries {
@@ -4928,5 +5038,169 @@ mod tests {
             read(&locked, &elsewhere),
             Err("they may decrypt it with another encryption dictionary".into())
         );
+    }
+
+    /// Unfiltered data and whole Flate data decode alike; anything else may not, however
+    /// lopdf takes the filter.
+    #[test]
+    fn data_decodes_alike_only_unfiltered_or_whole_flate() {
+        use std::io::Write;
+        let mut z = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        z.write_all(b"1 0 2 0").unwrap();
+        let z = z.finish().unwrap();
+        let alike = |filter: Option<Object>, data: &[u8]| {
+            let mut d = Dictionary::new();
+            if let Some(f) = filter {
+                d.set("Filter", f);
+            }
+            decodes_alike(&Stream::new(d, data.to_vec()), 1 << 10)
+        };
+        let flate = || Object::Name(b"FlateDecode".to_vec());
+        assert!(alike(None, b"1 0 2 0"));
+        assert!(alike(Some(flate()), &z));
+        assert!(alike(Some(Object::Array(vec![flate()])), &z));
+        // lopdf decodes these as unfiltered, or as far as it can.
+        assert!(!alike(Some(Object::Reference((9, 0))), &z));
+        assert!(!alike(Some(Object::Integer(1)), b"1 0 2 0"));
+        // lopdf decodes data with no filters in the list as nothing.
+        assert!(!alike(Some(Object::Array(vec![])), b"1 0 2 0"));
+        assert!(!alike(Some(Object::Array(vec![flate(), flate()])), &z));
+        assert!(!alike(Some(flate()), &z[..z.len() - 1]));
+        assert!(!alike(Some(flate()), b""));
+        // Over the limit.
+        let mut big = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        big.write_all(&[0; 2 << 10]).unwrap();
+        assert!(!alike(Some(flate()), &big.finish().unwrap()));
+        // No filter, as the spec reads a null value.
+        assert!(alike(Some(Object::Null), b"1 0 2 0"));
+    }
+
+    /// Flate data decodes alike only with predictor values every app takes the same way,
+    /// written directly, and without the abbreviated keys some apps read as `/Filter`.
+    #[test]
+    fn decode_parms_decode_alike_only_in_range() {
+        use std::io::Write;
+        let mut z = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        z.write_all(b"1 0 2 0").unwrap();
+        let z = z.finish().unwrap();
+        let alike = |entries: Vec<(&str, Object)>| {
+            let mut d = Dictionary::new();
+            d.set("Filter", Object::Name(b"FlateDecode".to_vec()));
+            for (k, v) in entries {
+                d.set(k, v);
+            }
+            decodes_alike(&Stream::new(d, z.clone()), 1 << 10)
+        };
+        let parms = |pairs: &[(&str, Object)]| {
+            let mut d = Dictionary::new();
+            for (k, v) in pairs {
+                d.set(*k, v.clone());
+            }
+            Object::Dictionary(d)
+        };
+        let int = Object::Integer;
+        let png = |more: &[(&str, Object)]| {
+            parms(
+                &[
+                    [("Predictor", int(12)), ("Columns", int(5))].as_slice(),
+                    more,
+                ]
+                .concat(),
+            )
+        };
+        assert!(alike(vec![]));
+        assert!(alike(vec![("DecodeParms", Object::Null)]));
+        assert!(alike(vec![("DecodeParms", png(&[]))]));
+        let in_array = || {
+            (
+                "Filter",
+                Object::Array(vec![Object::Name(b"FlateDecode".to_vec())]),
+            )
+        };
+        assert!(alike(vec![in_array()]));
+        assert!(alike(vec![
+            in_array(),
+            ("DecodeParms", Object::Array(vec![png(&[])]))
+        ]));
+        assert!(alike(vec![
+            in_array(),
+            ("DecodeParms", Object::Array(vec![Object::Null]))
+        ]));
+        // Poppler takes parameters for a filter in an array only from an array, and for a
+        // filter on its own only from a dictionary.
+        assert!(!alike(vec![in_array(), ("DecodeParms", png(&[]))]));
+        for bad in [
+            vec![],
+            vec![png(&[]), png(&[])],
+            vec![Object::Reference((9, 0))],
+            vec![Object::Integer(12)],
+        ] {
+            let bad = Object::Array(bad);
+            assert!(
+                !alike(vec![in_array(), ("DecodeParms", bad.clone())]),
+                "{bad:?}"
+            );
+        }
+        assert!(!alike(vec![("DecodeParms", Object::Array(vec![png(&[])]))]));
+        for p in [1, 10, 15] {
+            assert!(
+                alike(vec![("DecodeParms", parms(&[("Predictor", int(p))]))]),
+                "{p}"
+            );
+        }
+        assert!(alike(vec![(
+            "DecodeParms",
+            png(&[("Colors", int(32)), ("BitsPerComponent", int(16))])
+        )]));
+        // As if left out, as lopdf and Poppler read it.
+        assert!(alike(vec![(
+            "DecodeParms",
+            png(&[("Colors", Object::Null)])
+        )]));
+        // lopdf and some app take these differently (Poppler takes references and drops the
+        // predictor for values out of its range, pdf.js takes 12.0 as 12 and fails on
+        // predictor 3), or the spec doesn't allow them (3 bits). Poppler and pdf.js decode
+        // the TIFF predictor differently from lopdf at some widths.
+        for bad in [
+            parms(&[("Predictor", int(2))]),
+            parms(&[("Predictor", int(2)), ("BitsPerComponent", int(16))]),
+            Object::Reference((9, 0)),
+            Object::Integer(12),
+            Object::Array(vec![]),
+            Object::Array(vec![png(&[]), png(&[])]),
+            Object::Array(vec![Object::Reference((9, 0))]),
+            parms(&[("Predictor", int(3))]),
+            parms(&[("Predictor", int(16))]),
+            parms(&[("Predictor", Object::Real(12.0))]),
+            parms(&[("Predictor", Object::Reference((9, 0)))]),
+            png(&[("Colors", int(0))]),
+            png(&[("Colors", int(33))]),
+            png(&[("BitsPerComponent", int(3))]),
+            png(&[("BitsPerComponent", int(0))]),
+            png(&[("Columns", int(0))]),
+            png(&[("Columns", int(i64::from(i32::MAX)))]),
+        ] {
+            assert!(!alike(vec![("DecodeParms", bad.clone())]), "{bad:?}");
+        }
+        // Read by some apps as /Filter and /DecodeParms.
+        assert!(!alike(vec![("F", Object::Name(b"FlateDecode".to_vec()))]));
+        assert!(!alike(vec![("DP", png(&[]))]));
+        assert!(!alike(vec![(
+            "FFilter",
+            Object::Name(b"FlateDecode".to_vec())
+        )]));
+        assert!(!alike(vec![("FDecodeParms", png(&[]))]));
+        // Without /Filter, an abbreviation, or parameters for no filter.
+        for (k, v) in [
+            ("F", Object::Name(b"FlateDecode".to_vec())),
+            ("DecodeParms", png(&[])),
+        ] {
+            let mut d = Dictionary::new();
+            d.set(k, v);
+            assert!(
+                !decodes_alike(&Stream::new(d, b"1 0 2 0".to_vec()), 1 << 10),
+                "{k}"
+            );
+        }
     }
 }

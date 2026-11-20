@@ -1194,6 +1194,353 @@ fn behind_a_decoy(b: &[u8], decoy: Decoy, rotate: bool, near: bool) -> (Vec<u8>,
     (out, at)
 }
 
+/// A cross-reference stream or object stream whose data other apps may decode differently
+/// from lopdf is refused, after signing and when opening. lopdf decodes damaged Flate data
+/// as far as it can, where some apps fail and rebuild the cross-reference information by
+/// scanning the file, finding objects no section lists: a page turned after signing and
+/// listed nowhere, behind a stream with its zlib header garbled, passed as unchanged, and
+/// Poppler shows it turned. So did a predictor Poppler drops and lopdf applies, a filter
+/// named only by its abbreviation, which lopdf doesn't read, and an object stream with an
+/// empty list of filters, which lopdf decodes as nothing. Data in other filters, and
+/// predictors the spec doesn't define, are refused too.
+#[test]
+fn a_stream_other_apps_cant_decode_is_refused() {
+    let in_xref = |at| {
+        ChangeKind::Malformed(format!(
+            "the cross-reference stream at byte {at} holds data PDF apps may decode \
+             differently: damaged, or not plain Flate data"
+        ))
+    };
+    let b = approve(&base_pdf());
+    let p = page(&Document::load_mem(&b).unwrap());
+    let in_objstm = ChangeKind::Malformed(format!(
+        "other PDF apps may read the document differently from LimarePDF (LimarePDF can't \
+         read its object {} the way they do)",
+        p.0
+    ));
+    let rotate = |d: &Document| dict(d, page(d)).get(b"Rotate").ok().cloned();
+    for data in [
+        Data::BadHeader,
+        Data::BadChecksum,
+        Data::NoChecksum,
+        Data::CutOff,
+        Data::Hex,
+        Data::NoColors,
+        Data::CutRow,
+        Data::Tiff,
+        Data::OddPredictor,
+        Data::Abbreviated,
+        Data::NoFilters,
+    ] {
+        for route in [Route::Stream, Route::Hybrid, Route::Packed] {
+            let (bad, at) = behind_a_stream(&b, data, route);
+            // lopdf reads the stream, and the page as signed. It reads a cross-reference
+            // stream with no filters as empty, fails on one with a cut row, and rebuilds
+            // the information; it fails on an object stream with a cut row.
+            let unread = matches!(data, Data::NoFilters | Data::CutRow);
+            if !matches!((data, route), (Data::CutRow, Route::Packed)) {
+                let rebuilt = unread && matches!(route, Route::Stream);
+                assert_eq!(
+                    rotate(&Document::load_mem(&bad).unwrap()),
+                    rebuilt.then_some(Object::Integer(180)),
+                    "{data:?}, {route:?}"
+                );
+            }
+            // Such a cross-reference stream lists nothing.
+            let want = match (data, route) {
+                (Data::CutRow, Route::Packed) => {
+                    ChangeKind::Malformed(format!("LimarePDF can't read object {} reliably", p.0))
+                }
+                (_, Route::Packed) => in_objstm.clone(),
+                _ if unread => ChangeKind::Malformed(format!(
+                    "the cross-reference section at byte {at} is malformed"
+                )),
+                _ => in_xref(at),
+            };
+            assert_eq!(
+                changes(&bad),
+                [(want, Some(Refusal::Never))],
+                "{data:?}, {route:?}"
+            );
+            let opened = Pdf::from_bytes(&bad, None).unwrap();
+            assert!(opened.differs().is_some(), "{data:?}, {route:?}");
+        }
+    }
+    // Unfiltered data and whole Flate data read alike everywhere, and no reader sees the
+    // page listed nowhere.
+    for data in [
+        Data::Flate,
+        Data::FlateInArray,
+        Data::FlateThenNewline,
+        Data::Predicted,
+        Data::FilterNull,
+    ] {
+        for route in [Route::Stream, Route::Hybrid, Route::Packed] {
+            let (ok, _) = behind_a_stream(&b, data, route);
+            assert_eq!(changes(&ok), [], "{data:?}, {route:?}");
+            let opened = Pdf::from_bytes(&ok, None).unwrap();
+            assert!(opened.differs().is_none(), "{data:?}, {route:?}");
+        }
+    }
+    // No reader takes anything from an object stream whose objects are listed elsewhere.
+    for data in [
+        Data::Flate,
+        Data::BadHeader,
+        Data::NoColors,
+        Data::Abbreviated,
+    ] {
+        for route in [Route::Unused, Route::UnusedPacked] {
+            let (ok, _) = behind_a_stream(&b, data, route);
+            assert_eq!(changes(&ok), [], "{data:?}, {route:?}");
+            let opened = Pdf::from_bytes(&ok, None).unwrap();
+            assert!(opened.differs().is_none(), "{data:?}, {route:?}");
+        }
+    }
+}
+
+/// How [`behind_a_stream`] writes its stream's data.
+#[derive(Clone, Copy, Debug)]
+enum Data {
+    /// Whole Flate data, `/Filter /FlateDecode`.
+    Flate,
+    /// The same, `/Filter [/FlateDecode]`.
+    FlateInArray,
+    /// Whole Flate data, a line end after it.
+    FlateThenNewline,
+    /// Whole Flate data with the PNG predictor rows of 7 bytes take.
+    Predicted,
+    /// Unfiltered data, `/Filter null`.
+    FilterNull,
+    /// Flate data with its zlib header garbled, which lopdf decodes as raw deflate data.
+    BadHeader,
+    /// Flate data with a wrong checksum.
+    BadChecksum,
+    /// Flate data ending before its checksum.
+    NoChecksum,
+    /// Flate data cut off part way, after everything the stream holds.
+    CutOff,
+    /// Hexadecimal data (`/ASCIIHexDecode`).
+    Hex,
+    /// Flate data with the PNG predictor and `/Colors 0`, which Poppler drops and lopdf
+    /// takes as one color.
+    NoColors,
+    /// The PNG predictor's data, its last row cut short.
+    CutRow,
+    /// Flate data with the TIFF predictor, which Poppler and pdf.js decode differently
+    /// from lopdf at some widths (16 bits, or rows padded out to a byte).
+    Tiff,
+    /// Flate data with predictor 3, which the spec doesn't define: lopdf and Poppler ignore
+    /// it, and pdf.js fails.
+    OddPredictor,
+    /// Unfiltered data with `/F /FlateDecode`, which Poppler takes as `/Filter` and lopdf
+    /// ignores.
+    Abbreviated,
+    /// Unfiltered data with `/Filter []`, which lopdf decodes as nothing and Poppler as
+    /// unfiltered.
+    NoFilters,
+}
+
+impl Data {
+    /// The stream dictionary's filter entries and its data, holding `plain`.
+    fn write(self, plain: &[u8]) -> (&'static str, Vec<u8>) {
+        use std::io::Write;
+        match self {
+            Data::Hex => {
+                let hex: String = plain.iter().map(|b| format!("{b:02x}")).collect();
+                return ("/Filter /ASCIIHexDecode", format!("{hex}>").into_bytes());
+            }
+            Data::FilterNull => return ("/Filter null", plain.to_vec()),
+            Data::Abbreviated => return ("/F /FlateDecode", plain.to_vec()),
+            Data::NoFilters => return ("/Filter []", plain.to_vec()),
+            _ => {}
+        }
+        let (plain, level) = match self {
+            // Stored and padded, so what is left after a cut still holds all of `plain`.
+            Data::CutOff => ([plain, &[b' '; 64]].concat(), flate2::Compression::none()),
+            // Rows of 7 bytes padded out with spaces, each byte the difference from the one
+            // before it.
+            Data::Tiff => {
+                let mut d = plain.to_vec();
+                d.resize(plain.len().div_ceil(7) * 7, b' ');
+                for row in d.chunks_mut(7) {
+                    for i in (1..row.len()).rev() {
+                        row[i] = row[i].wrapping_sub(row[i - 1]);
+                    }
+                }
+                (d, flate2::Compression::default())
+            }
+            // Rows of 7 bytes padded out with spaces, each the differences from the row
+            // above it (PNG's Up).
+            Data::Predicted | Data::NoColors | Data::CutRow => {
+                let mut padded = plain.to_vec();
+                padded.resize(plain.len().div_ceil(7) * 7, b' ');
+                let mut above = [0; 7];
+                let mut d = Vec::new();
+                for row in padded.chunks(7) {
+                    d.push(2);
+                    d.extend(row.iter().zip(above).map(|(b, a)| b.wrapping_sub(a)));
+                    above.copy_from_slice(row);
+                }
+                if let Data::CutRow = self {
+                    d.truncate(d.len() - 3);
+                }
+                (d, flate2::Compression::default())
+            }
+            _ => (plain.to_vec(), flate2::Compression::default()),
+        };
+        let mut z = flate2::write::ZlibEncoder::new(Vec::new(), level);
+        z.write_all(&plain).unwrap();
+        let mut z = z.finish().unwrap();
+        match self {
+            Data::BadHeader => z[..2].copy_from_slice(&[0, 0]),
+            Data::BadChecksum => *z.last_mut().unwrap() ^= 1,
+            Data::NoChecksum => z.truncate(z.len() - 4),
+            Data::CutOff => z.truncate(z.len() - 4 - 32),
+            Data::FlateThenNewline => z.extend_from_slice(b"\r\n"),
+            _ => {}
+        }
+        let filter = match self {
+            Data::FlateInArray => "/Filter [/FlateDecode]",
+            Data::Predicted | Data::CutRow => {
+                "/Filter /FlateDecode /DecodeParms << /Predictor 12 /Columns 7 >>"
+            }
+            Data::NoColors => {
+                "/Filter /FlateDecode /DecodeParms << /Predictor 12 /Colors 0 /Columns 7 >>"
+            }
+            Data::Tiff => "/Filter /FlateDecode /DecodeParms << /Predictor 2 /Columns 7 >>",
+            Data::OddPredictor => "/Filter /FlateDecode /DecodeParms << /Predictor 3 /Columns 7 >>",
+            _ => "/Filter /FlateDecode",
+        };
+        (filter, z)
+    }
+}
+
+/// Where [`behind_a_stream`] writes its data.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Route {
+    /// In the revision's cross-reference stream.
+    Stream,
+    /// In the cross-reference stream a revision's table names with `/XRefStm`.
+    Hybrid,
+    /// In an object stream holding the page as signed.
+    Packed,
+    /// In an object stream holding the page as signed, which is listed as a plain object.
+    Unused,
+    /// In an object stream holding the page as signed, which is listed in another object
+    /// stream.
+    UnusedPacked,
+}
+
+/// A revision written by hand: page 1 turned and listed nowhere, which a reader rebuilding
+/// the cross-reference information by scanning finds, then a cross-reference stream listing
+/// only itself, its data written as `data`. In a hybrid revision, a table listing the
+/// stream too names it. When packed, the page as signed is in an object stream written as
+/// `data` before the turned copy, and the cross-reference stream, written plainly, lists it
+/// there. When unused, nothing is turned, and the page as signed is listed elsewhere: written
+/// plainly before the object stream holding it, or in an unfiltered object stream after it.
+/// Returns the file and where the cross-reference stream starts.
+fn behind_a_stream(b: &[u8], data: Data, route: Route) -> (Vec<u8>, usize) {
+    let d = Document::load_mem(b).unwrap();
+    let (r, p) = (root(&d), page(&d));
+    let prev = last_startxref(b);
+    let n = d.max_id + 1;
+    let page = dict(&d, p);
+    let mut turned = page.clone();
+    turned.set("Rotate", 180);
+    let mut out = [b, b"\n"].concat();
+    // Rows of type and offset or container (`/W [1 4 2]`, the index 0).
+    let row = |kind: u8, f1: usize| {
+        let mut r = vec![kind];
+        r.extend_from_slice(&u32::try_from(f1).unwrap().to_be_bytes());
+        r.extend_from_slice(&[0, 0]);
+        r
+    };
+    let mut rows = Vec::new();
+    let packed = matches!(route, Route::Packed | Route::Unused | Route::UnusedPacked);
+    let (x, index) = if packed {
+        match route {
+            Route::Unused => {
+                rows.extend(row(1, out.len()));
+                out.extend_from_slice(format!("{} 0 obj\n{page:?}\nendobj\n", p.0).as_bytes());
+            }
+            Route::UnusedPacked => rows.extend(row(2, (n + 1).try_into().unwrap())),
+            _ => rows.extend(row(2, n.try_into().unwrap())),
+        }
+        let at = out.len();
+        let head = format!("{} 0 ", p.0);
+        let body = format!("{head}{page:?}");
+        let (filter, z) = data.write(body.as_bytes());
+        out.extend_from_slice(
+            format!(
+                "{n} 0 obj\n<< /Type /ObjStm /N 1 /First {} {filter} /Length {} >>\n\
+                 stream\n",
+                head.len(),
+                z.len()
+            )
+            .as_bytes(),
+        );
+        out.extend_from_slice(&z);
+        out.extend_from_slice(b"\nendstream\nendobj\n");
+        rows.extend(row(1, at));
+        if route == Route::UnusedPacked {
+            rows.extend(row(1, out.len()));
+            out.extend_from_slice(
+                format!(
+                    "{} 0 obj\n<< /Type /ObjStm /N 1 /First {} /Length {} >>\n\
+                     stream\n{body}\nendstream\nendobj\n",
+                    n + 1,
+                    head.len(),
+                    body.len()
+                )
+                .as_bytes(),
+            );
+            (n + 2, format!("{} 1 {n} 3", p.0))
+        } else {
+            (n + 1, format!("{} 1 {n} 2", p.0))
+        }
+    } else {
+        (n, format!("{n} 1"))
+    };
+    if !matches!(route, Route::Unused | Route::UnusedPacked) {
+        out.extend_from_slice(format!("{} 0 obj\n{turned:?}\nendobj\n", p.0).as_bytes());
+    }
+    let at = out.len();
+    rows.extend(row(1, at));
+    let (filter, rows) = if packed {
+        (String::new(), rows)
+    } else {
+        let (filter, z) = data.write(&rows);
+        (format!(" {filter}"), z)
+    };
+    let size = format!("/Size {}", x + 1);
+    let trailer = format!("{size} /Root {} {} R /Prev {prev}", r.0, r.1);
+    let own = if route == Route::Hybrid {
+        &size
+    } else {
+        &trailer
+    };
+    out.extend_from_slice(
+        format!(
+            "{x} 0 obj\n<< /Type /XRef /W [1 4 2] /Index [{index}] {own}{filter} /Length {} \
+             >>\nstream\n",
+            rows.len()
+        )
+        .as_bytes(),
+    );
+    out.extend_from_slice(&rows);
+    out.extend_from_slice(b"\nendstream\nendobj\n");
+    let mut start = at;
+    if route == Route::Hybrid {
+        start = out.len();
+        out.extend_from_slice(
+            format!("xref\n{x} 1\n{at:010} 00000 n\r\ntrailer\n<< {trailer} /XRefStm {at} >>\n")
+                .as_bytes(),
+        );
+    }
+    out.extend_from_slice(format!("startxref\n{start}\n%%EOF\n").as_bytes());
+    (out, at)
+}
+
 #[test]
 fn filling_in_a_form_is_allowed() {
     let b = fill(&approve(&form(&["Name", "Date"])), "Name", "Jane");

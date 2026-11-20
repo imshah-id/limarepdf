@@ -1918,7 +1918,7 @@ fn readable(s: &lopdf::Stream) -> Read {
 }
 
 /// What [`inflate`] found.
-enum Inflated {
+pub(crate) enum Inflated {
     Whole,
     /// Complete, but its checksum is wrong or missing: the data with the right one.
     BadChecksum(Vec<u8>),
@@ -1927,7 +1927,7 @@ enum Inflated {
 }
 
 /// Check zlib data `z` (Flate data) to its end, decoding at most `limit` bytes of it.
-fn inflate(z: &[u8], limit: usize) -> Result<Inflated> {
+pub(crate) fn inflate(z: &[u8], limit: usize) -> Result<Inflated> {
     use flate2::{Decompress, FlushDecompress, Status};
     // A zlib header: deflate, a valid window, no preset dictionary, its check bits right.
     let header = z.len() >= 2

@@ -607,7 +607,15 @@ refuses as malformed:
 - a later revision that doesn't lead back to the signed version, or data after the end of the file;
 - an object whose cross-reference entry points into the signed part, outside its own revision, or at another
   object (the published "shadow" attacks that re-point objects at content hidden in the signed file);
-- an object that can't be read, or that LimarePDF and its PDF library read differently.
+- an object that can't be read, or that LimarePDF and its PDF library read differently;
+- a cross-reference stream, or an object stream holding an object in use, whose data other apps may decode
+  differently: compressed data that is damaged (cut off, or with a wrong header or checksum), which LimarePDF's PDF
+  library decodes as far as it can where some apps fail and may then scan the file for objects no section lists;
+  decoding parameters out of range, written as references, under abbreviated names, or for the rarely used TIFF
+  predictor, which apps read differently;
+  or data in a format other than the usual Flate compression, or marked with an empty list of formats. A signed
+  file whose own streams are like this opens as a file other apps may read differently, so its signatures show
+  *can't check*.
 
 An object deleted while still in use, and an object the signed version referred to but didn't have, are refused
 too. These are the shapes of the published shadow (hide, replace, hide-and-replace) and incremental-saving attacks.
