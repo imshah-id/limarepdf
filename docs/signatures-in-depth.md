@@ -607,6 +607,14 @@ LimarePDF reads the later additions with its own strict reader rather than the l
 refuses as malformed:
 
 - a later revision that doesn't lead back to the signed version, or data after the end of the file;
+- a cross-reference section Poppler can't read as written, which makes it scan the whole file for objects and take
+  the last copy of each it finds: one making room for more than 8,388,608 objects (the newest trailer's `/Size`, a
+  cross-reference stream's, or a subsection reaching past that number; Poppler 26 can't make room for more than
+  16,777,216, older versions for more than 33,554,432, and a machine short of memory for fewer); a cross-reference
+  stream's object number, a generation or a compressed object's index above 2,147,483,647, or an offset above
+  9,223,372,036,854,775,807, which Poppler takes as damage; or a cross-reference stream's type wider than 4 bytes. A
+  signed file whose own sections are like this opens as a file other apps may read differently, so its signatures
+  show *can't check*;
 - an object whose cross-reference entry points into the signed part, outside its own revision, or at another
   object (the published "shadow" attacks that re-point objects at content hidden in the signed file);
 - an object that can't be read, or that LimarePDF and its PDF library read differently;

@@ -544,6 +544,9 @@ fn read_chain(bytes: &[u8], signed_end: usize) -> Result<Vec<Section>, String> {
             return Err("the chain of revisions loops or is too long".into());
         }
         let read = read_section(bytes, at)?;
+        if sections.is_empty() {
+            newest_has_room(&read, at)?;
+        }
         if read.stray_xref_stm {
             return Err(
                 "a later revision's cross-reference stream names another one (/XRefStm), \
@@ -740,7 +743,7 @@ struct ReadSection {
 }
 
 fn read_section(bytes: &[u8], at: usize) -> Result<ReadSection, String> {
-    let bad = || format!("the cross-reference section at byte {at} is malformed");
+    let bad = || malformed(at);
     let mut lx = Lexer::new(bytes, at);
     let (start, tok, _) = lx.next().ok_or_else(bad)?;
     if !bytes[at..start].iter().all(|&c| is_white(c)) {
@@ -753,6 +756,20 @@ fn read_section(bytes: &[u8], at: usize) -> Result<ReadSection, String> {
         Tok::Word(b"xref") => read_table(bytes, lx).ok_or_else(bad),
         Tok::Word(_) => read_xref_stream(bytes, Lexer::new(bytes, at)).ok_or_else(bad),
         _ => Err(bad()),
+    }
+}
+
+fn malformed(at: usize) -> String {
+    format!("the cross-reference section at byte {at} is malformed")
+}
+
+/// Refuses the newest section, the one at `at`, when its `/Size` reaches past
+/// [`MAX_ENTRIES`]: Poppler makes room for as many objects as the newest trailer gives (and
+/// as every cross-reference stream's gives, which [`read_xref_stream`] checks).
+fn newest_has_room(read: &ReadSection, at: usize) -> Result<(), String> {
+    match read.trailer.get(b"Size") {
+        Ok(Object::Integer(n)) if *n > MAX_ENTRIES => Err(malformed(at)),
+        _ => Ok(()),
     }
 }
 
@@ -833,6 +850,17 @@ fn word_num<T: std::str::FromStr>(t: Option<(usize, Tok, usize)>) -> Option<T> {
     }
 }
 
+/// The most objects a cross-reference section may make room for: its `/Size`, or a
+/// subsection's first number and count. Poppler 26 can't make room for more than 2^24, older
+/// versions for 2^25, and a machine short of memory for fewer: it then takes the section as
+/// damaged, and scans the whole file for objects instead.
+const MAX_ENTRIES: i64 = 1 << 23;
+
+/// Whether the `count` object numbers from `first` fit in [`MAX_ENTRIES`].
+fn has_room(first: i64, count: i64) -> bool {
+    first >= 0 && count >= 0 && first.saturating_add(count) <= MAX_ENTRIES
+}
+
 fn read_table(bytes: &[u8], mut lx: Lexer) -> Option<ReadSection> {
     let mut entries = Vec::new();
     loop {
@@ -843,16 +871,17 @@ fn read_table(bytes: &[u8], mut lx: Lexer) -> Option<ReadSection> {
         }
         let first: u32 = word_num(lx.next())?;
         let count: usize = word_num(lx.next())?;
-        if count > bytes.len() / 18 {
+        if count > bytes.len() / 18 || !has_room(first.into(), i64::try_from(count).ok()?) {
             return None;
         }
         for i in 0..count {
             let num = first.checked_add(u32::try_from(i).ok()?)?;
-            let offset: usize = word_num(lx.next())?;
-            let gen: u32 = word_num(lx.next())?;
+            // Poppler takes an offset past 2^63 - 1, or a generation past 2^31 - 1, as damage.
+            let offset: i64 = word_num(lx.next())?;
+            let gen: i32 = word_num(lx.next())?;
             let e = match lx.next()? {
                 (_, Tok::Word(b"n"), _) => Entry::InUse {
-                    offset,
+                    offset: usize::try_from(offset).ok()?,
                     gen: u16::try_from(gen).ok()?,
                 },
                 (_, Tok::Word(b"f"), _) => Entry::Free,
@@ -888,7 +917,8 @@ fn direct_offset(d: &Dictionary, key: &[u8]) -> Option<Option<usize>> {
 }
 
 fn read_xref_stream(bytes: &[u8], mut lx: Lexer) -> Option<ReadSection> {
-    let _: u32 = word_num(lx.next())?;
+    // Poppler takes an object number past 2^31 - 1 as damage.
+    let _: i32 = word_num(lx.next())?;
     let _: u16 = word_num(lx.next())?;
     if !matches!(lx.next()?, (_, Tok::Word(b"obj"), _)) {
         return None;
@@ -933,10 +963,14 @@ fn read_xref_stream(bytes: &[u8], mut lx: Lexer) -> Option<ReadSection> {
         return None;
     };
     let row = w0 + w1 + w2;
-    if row == 0 {
+    // Poppler takes a type wider than 4 bytes as damage.
+    if row == 0 || w0 > 4 {
         return None;
     }
     let size = dict.get(b"Size").ok()?.as_i64().ok()?;
+    if !has_room(0, size) {
+        return None;
+    }
     let index = match dict.get(b"Index") {
         Ok(_) => ints(b"Index")?,
         Err(_) => vec![0, size],
@@ -950,7 +984,7 @@ fn read_xref_stream(bytes: &[u8], mut lx: Lexer) -> Option<ReadSection> {
     for pair in index.chunks(2) {
         let first = u32::try_from(pair[0]).ok()?;
         let count = usize::try_from(pair[1]).ok()?;
-        if count > decoded.len() / row {
+        if count > decoded.len() / row || !has_room(pair[0], pair[1]) {
             return None;
         }
         for i in 0..count {
@@ -959,6 +993,13 @@ fn read_xref_stream(bytes: &[u8], mut lx: Lexer) -> Option<ReadSection> {
             let kind = if w0 == 0 { 1 } else { field(&r[..w0]) };
             let (f1, f2) = (field(&r[w0..w0 + w1]), field(&r[w0 + w1..]));
             let num = first.checked_add(u32::try_from(i).ok()?)?;
+            // Poppler takes an offset past 2^63 - 1, or a generation or index past 2^31 - 1, as
+            // damage, whatever the type, but for 0xFFFFFFFF in object 0's, which it reads as
+            // 65535 (in a free entry; in another, LimarePDF couldn't read it alike).
+            let wrapped = kind == 0 && num == 0 && f2 == u64::from(u32::MAX);
+            if i64::try_from(f1).is_err() || (i32::try_from(f2).is_err() && !wrapped) {
+                return None;
+            }
             let e = match kind {
                 0 => Entry::Free,
                 1 => Entry::InUse {
@@ -1886,6 +1927,7 @@ fn whole_xref(bytes: &[u8], mut at: usize) -> Result<WholeXref, String> {
         let read = read_section(bytes, at)?;
         decoded_alike(&read, at)?;
         if seen.len() == 1 {
+            newest_has_room(&read, at)?;
             trailer = read.trailer;
             table = read.kind == SectionKind::Table;
         }
@@ -6036,6 +6078,57 @@ mod tests {
             []
         );
         assert_eq!(lopdf_moves(&dots(&[(0, "5 0 obj")]), 30), [0]);
+    }
+
+    /// Poppler takes a table's offset past 2^63 - 1, or an object stream index past 2^31 - 1,
+    /// as damage, a free entry's or an unused object's too, and scans the whole file for
+    /// objects (review round 4). LimarePDF's PDF library rebuilds a file with such an offset
+    /// itself, so the comparison of readings refused it anyway; it misreads such an index,
+    /// which was refused only where the object is used.
+    #[test]
+    fn numbers_poppler_takes_as_damage_are_refused() {
+        let table = |offset: &str| format!("xref\n0 1\n{offset} 65535 f\r\ntrailer<</Size 1>>\n");
+        assert!(read_section(table("9223372036854775807").as_bytes(), 0).is_ok());
+        assert!(read_section(table("9223372036854775808").as_bytes(), 0).is_err());
+        let stream = |index: u32| {
+            let mut b =
+                b"1 0 obj\n<</Type/XRef/Size 2/Index [1 1]/W [1 1 4]/Length 6>>\nstream\n".to_vec();
+            b.extend([2, 5]);
+            b.extend(index.to_be_bytes());
+            b.extend(b"\nendstream\nendobj\n");
+            b
+        };
+        assert!(read_section(&stream(i32::MAX as u32), 0).is_ok());
+        assert!(read_section(&stream(1 << 31), 0).is_err());
+    }
+
+    /// Poppler can't make room for as many objects as the newest trailer's `/Size` past
+    /// [`MAX_ENTRIES`] gives, and scans the whole file for objects instead; for an older
+    /// trailer's it doesn't make room (review round 4).
+    #[test]
+    fn a_size_poppler_cant_make_room_for_differs() {
+        let plain = table_file(&[
+            "<< /Type /Catalog /Pages 2 0 R >>",
+            "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 200] >>",
+        ]);
+        let at = last_startxref(&plain).unwrap();
+        let sized = |n: i64| {
+            let s = at + plain[at..].windows(5).position(|w| w == b"/Size").unwrap() + 5;
+            let s = s + plain[s..].iter().position(u8::is_ascii_digit).unwrap();
+            let e = s + plain[s..].iter().position(|c| !c.is_ascii_digit()).unwrap();
+            [&plain[..s], n.to_string().as_bytes(), &plain[e..]].concat()
+        };
+        let read = |b: &[u8]| compare_reading(b, &Document::load_mem(b).unwrap()).map(|_| ());
+        assert_eq!(read(&sized(MAX_ENTRIES)), Ok(()));
+        assert_eq!(read(&sized(MAX_ENTRIES + 1)), Err(malformed(at)));
+        let older = sized(MAX_ENTRIES + 1);
+        let newer = format!(
+            "xref\n0 1\n0000000000 65535 f\r\ntrailer\n<< /Size 4 /Root 1 0 R /Prev {at} >>\n\
+             startxref\n{}\n%%EOF\n",
+            older.len()
+        );
+        assert_eq!(read(&[older, newer.into_bytes()].concat()), Ok(()));
     }
 
     /// The signed version's pointer must lead lopdf to the same section in the whole file as

@@ -1087,6 +1087,196 @@ fn a_cross_reference_stream_lopdf_reads_otherwise_is_refused() {
     }
 }
 
+/// A cross-reference section Poppler can't read as written, after signing, is refused:
+/// Poppler then scans the whole file for objects and takes the last copy of each it finds, so
+/// a stray turned copy of the page after the signed version showed turned in Poppler while
+/// the revision passed as unchanged (review round 4). Poppler can't make room for many more
+/// objects than 2^23 (the newest trailer's or a cross-reference stream's `/Size`, or a
+/// subsection reaching past that), and takes a number past its whole numbers, an offset past
+/// 2^63 - 1 or a type wider than 4 bytes as damage. Those just within the limits pass, as
+/// Poppler reads them as written.
+#[test]
+fn a_cross_reference_section_poppler_cant_read_is_refused() {
+    const ROOM: u32 = 1 << 23;
+    let check = |f: &[u8], at: usize, refused: bool, case: &str| {
+        let why = format!("the cross-reference section at byte {at} is malformed");
+        let want = vec![(ChangeKind::Malformed(why), Some(Refusal::Never))];
+        assert_eq!(changes(f), if refused { want } else { vec![] }, "{case}");
+    };
+    let b = approve(&base_pdf());
+    let d = Document::load_mem(&b).unwrap();
+    let (p, _, turned) = page_texts(&b);
+    let (r, prev, free) = (root(&d), last_startxref(&b), d.max_id + 1);
+    let table = |rows: &str, size: u32| {
+        let stray = format!("% {} 0 obj {turned} endobj\n", p.0);
+        let mut out = [&b[..], b"\n", stray.as_bytes()].concat();
+        let at = out.len();
+        out.extend_from_slice(
+            format!(
+                "xref\n0 1\n0000000000 65535 f\r\n{rows}trailer\n<< /Size {size} /Root {} {} R \
+                 /Prev {prev} >>\nstartxref\n{at}\n%%EOF\n",
+                r.0, r.1
+            )
+            .as_bytes(),
+        );
+        (out, at)
+    };
+    for (rows, size, refused) in [
+        (String::new(), ROOM, false),
+        (String::new(), ROOM + 1, true),
+        (format!("{ROOM} 0\n"), free + 1, false),
+        (format!("{} 0\n", ROOM + 1), free + 1, true),
+        (
+            format!("{free} 1\n0000000000 2147483647 f\r\n"),
+            free + 1,
+            false,
+        ),
+        (
+            format!("{free} 1\n0000000000 2147483648 f\r\n"),
+            free + 1,
+            true,
+        ),
+    ] {
+        let (f, at) = table(&rows, size);
+        check(&f, at, refused, &format!("{rows:?} /Size {size}"));
+    }
+    // An older table's `/Size`, which Poppler doesn't make room for.
+    let (older, at) = table("", ROOM + 1);
+    let newer = format!(
+        "xref\n0 1\n0000000000 65535 f\r\ntrailer\n<< /Size {free} /Root {} {} R /Prev {at} >>\n\
+         startxref\n{}\n%%EOF\n",
+        r.0,
+        r.1,
+        older.len()
+    );
+    let f = [older, newer.into_bytes()].concat();
+    check(&f, 0, false, "an older /Size");
+
+    let (b, _, old) = object_one_signed();
+    fn gen(g: u32) -> Vec<u8> {
+        g.to_be_bytes().into()
+    }
+    fn far(f1: u64) -> Vec<u8> {
+        [vec![0], f1.to_be_bytes().into(), gen(0)].concat()
+    }
+    type Rows = fn(u32) -> Vec<u8>;
+    let rows: [(&str, Rows, bool); 11] = [
+        (
+            "/W [4 4 0] /Index [1 1]",
+            |at| [vec![0; 3], row(1, at)].concat(),
+            false,
+        ),
+        (
+            "/W [5 4 0] /Index [1 1]",
+            |at| [vec![0; 4], row(1, at)].concat(),
+            true,
+        ),
+        (
+            "/W [1 4 0] /Index [1 1 8388607 1]",
+            |at| [row(1, at), row(0, 0)].concat(),
+            false,
+        ),
+        (
+            "/W [1 4 0] /Index [1 1 8388608 1]",
+            |at| [row(1, at), row(0, 0)].concat(),
+            true,
+        ),
+        (
+            "/W [1 4 4] /Index [1 1 1000 1]",
+            |at| [row(1, at), gen(0), row(0, 0), gen(i32::MAX as u32)].concat(),
+            false,
+        ),
+        (
+            "/W [1 4 4] /Index [1 1 1000 1]",
+            |at| [row(1, at), gen(0), row(0, 0), gen(1 << 31)].concat(),
+            true,
+        ),
+        (
+            "/W [1 4 4] /Index [0 1 1 1]",
+            |at| [row(0, 0), gen(u32::MAX), row(1, at), gen(0)].concat(),
+            false,
+        ),
+        (
+            "/W [1 4 4] /Index [1 1 1000 1]",
+            |at| [row(1, at), gen(0), row(0, 0), gen(u32::MAX)].concat(),
+            true,
+        ),
+        (
+            "/W [1 4 4] /Index [0 1 1 1]",
+            |at| [row(0, 0), gen(u32::MAX - 1), row(1, at), gen(0)].concat(),
+            true,
+        ),
+        (
+            "/W [1 8 4] /Index [1 1 1000 1]",
+            |at| {
+                [
+                    vec![1],
+                    u64::from(at).to_be_bytes().into(),
+                    gen(0),
+                    far(i64::MAX as u64),
+                ]
+                .concat()
+            },
+            false,
+        ),
+        (
+            "/W [1 8 4] /Index [1 1 1000 1]",
+            |at| {
+                [
+                    vec![1],
+                    u64::from(at).to_be_bytes().into(),
+                    gen(0),
+                    far(1 << 63),
+                ]
+                .concat()
+            },
+            true,
+        ),
+    ];
+    for (i, (keys, rows, refused)) in rows.into_iter().enumerate() {
+        for hybrid in [true, false] {
+            let f = object_one_listed(&b, &old, &[], keys, |at| rows(at[0]), "", hybrid);
+            check(
+                &f,
+                xref_stream_at(&f),
+                refused,
+                &format!("{i} {keys} {hybrid}"),
+            );
+        }
+    }
+    // The number in a cross-reference stream's header, and its own `/Size`.
+    let keys = "/W [1 4 0] /Index [1 1]";
+    let plain = object_one_listed(&b, &old, &[], keys, |at| row(1, at[0]), "", false);
+    let at = xref_stream_at(&plain);
+    let header = at + plain[at..].iter().position(|&c| c == b' ').unwrap();
+    for (num, refused) in [("2147483647", false), ("2147483648", true)] {
+        let f = [&plain[..at], num.as_bytes(), &plain[header..]].concat();
+        check(&f, at, refused, num);
+    }
+    // Poppler makes room for every cross-reference stream's `/Size`, under a newer table too.
+    let s = at + plain[at..].windows(6).position(|w| w == b"/Size ").unwrap() + 6;
+    let e = s + plain[s..].iter().position(|c| !c.is_ascii_digit()).unwrap();
+    let r = root(&Document::load_mem(&plain).unwrap());
+    for (size, refused) in [
+        (ROOM.to_string(), false),
+        ((ROOM + 1).to_string(), true),
+        ("-1".into(), true),
+    ] {
+        let f = [&plain[..s], size.as_bytes(), &plain[e..]].concat();
+        check(&f, at, refused, &size);
+        let newer = format!(
+            "xref\n0 1\n0000000000 65535 f\r\ntrailer\n<< /Size {} /Root {} {} R /Prev {at} >>\n\
+             startxref\n{}\n%%EOF\n",
+            String::from_utf8_lossy(&plain[s..e]),
+            r.0,
+            r.1,
+            f.len()
+        );
+        let f = [f, newer.into_bytes()].concat();
+        check(&f, at, refused, &format!("{size} under a table"));
+    }
+}
+
 /// A cross-reference stream row of type `kind` and a 4-byte field `f1`.
 fn row(kind: u8, f1: u32) -> Vec<u8> {
     [vec![kind], f1.to_be_bytes().into()].concat()
