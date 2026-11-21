@@ -1381,14 +1381,25 @@ pub(crate) fn compare_reading(bytes: &[u8], doc: &Document) -> Result<Reading, S
     }
     // lopdf keeps an object under the number its header gives, whichever entry led to it.
     // Other apps read the object as LimarePDF does when it is one whole object, followed by
-    // `endobj` or a stream's data.
+    // `endobj` or a stream's data, and, in an encrypted file, lopdf doesn't cut it short.
+    let endobjs: Option<Vec<usize>> = encrypt.is_some().then(|| {
+        (bytes.windows(6).enumerate())
+            .filter(|(_, w)| *w == b"endobj")
+            .map(|(i, _)| i)
+            .collect()
+    });
     let mut lengths = HashSet::new();
     for (&num, e) in table {
         if let XrefEntry::Normal { offset, generation } = *e {
             let id = (num, generation);
             match header(bytes, offset as usize) {
                 Some((found, lx)) if found == id => {
-                    if doc.objects.contains_key(&id) && !whole_object(lx, &mut lengths) {
+                    if doc.objects.contains_key(&id)
+                        && (!whole_object(lx.clone(), &mut lengths)
+                            || endobjs.as_deref().is_some_and(|endobjs| {
+                                cut_short(bytes, offset as usize, lx, &spec, endobjs)
+                            }))
+                    {
                         unsure.insert(num);
                     }
                 }
@@ -1685,6 +1696,43 @@ fn whole_object(mut lx: Lexer, lengths: &mut HashSet<ObjectId>) -> bool {
                 && matches!(lx.next_word(), Some((_, Tok::Word(b"obj"), _)))
         }
     }
+}
+
+/// Whether lopdf, reading an encrypted file, may cut short the object `lx` starts, just past
+/// its header at `at`. There it first cuts each object at the first `endobj` after its header,
+/// in a string, a comment or a stream's data too (`endobjs` lists where each starts), and
+/// reads only what it cut, where other apps read on: past a comment into a reference or a
+/// stream, or a stream's data as long as its `/Length`, which lopdf then takes shorter.
+fn cut_short(
+    bytes: &[u8],
+    at: usize,
+    mut lx: Lexer,
+    spec: &HashMap<u32, Entry>,
+    endobjs: &[usize],
+) -> bool {
+    let from = lx.pos();
+    let Some(&cut) = endobjs.get(endobjs.partition_point(|&e| e < from)) else {
+        return true;
+    };
+    let first = lx.clone().next();
+    let end = match first {
+        Some((_, Tok::Word(w), end)) if w.ends_with(b"endobj") => end,
+        _ if !skip_object(&mut lx) => return true,
+        _ => match lx.clone().next_word() {
+            Some((_, Tok::Word(b"stream"), _)) if matches!(first, Some((_, Tok::DictOpen, _))) => {
+                let Some(data) = stream_data(bytes, at, spec) else {
+                    return true;
+                };
+                let mut tail = Lexer::new(bytes, data.end);
+                tail.next_word();
+                tail.pos()
+            }
+            _ => lx.pos(),
+        },
+    };
+    // What lopdf cuts keeps the `endobj` it cuts at, and so the whole object where that ends
+    // it, glued to a number or a name.
+    cut + 6 < end
 }
 
 /// The cross-reference information a reader following the specification takes.
@@ -6043,6 +6091,85 @@ mod tests {
         };
         let (took, twin) = (timed(b"(     "), timed(b"x     "));
         assert!(took < twin * 20, "{took:?}, {twin:?} with x");
+    }
+
+    /// Reading an encrypted file, lopdf cuts each object at the first `endobj` after its
+    /// header and reads only what it cut, where other apps read on: a stream's data as long as
+    /// its `/Length` past an `endobj` in it, a reference or a stream past a comment holding
+    /// one. Such an object is unsure; one whose first `endobj` ends it isn't.
+    #[test]
+    fn an_encrypted_object_lopdf_cuts_at_an_endobj_inside_it_is_unsure() {
+        let mut d = Document::with_version("1.7");
+        let kids = Vec::<Object>::new();
+        let pages = d.add_object(dictionary! { "Type" => "Pages", "Kids" => kids, "Count" => 0 });
+        let root = d.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages });
+        d.trailer.set("Root", root);
+        let encrypt = encrypt_with_identity(&mut d);
+        let mut base = Vec::new();
+        d.save_to(&mut base).unwrap();
+        let prev = Document::load_mem(&base).unwrap().xref_start;
+        // Whether the object written `text` is unsure, and what lopdf holds.
+        let unsure = |text: &str| {
+            let (n, x) = (d.max_id + 1, d.max_id + 2);
+            let mut b = [&base[..], b"\n"].concat();
+            let at_n = b.len();
+            b.extend_from_slice(format!("{n} 0 obj\n{text}\nendobj\n").as_bytes());
+            let at = b.len();
+            let row =
+                |f1: usize| [&[1][..], &u32::try_from(f1).unwrap().to_be_bytes(), &[0, 0]].concat();
+            let rows = [row(at_n), row(at)].concat();
+            b.extend_from_slice(
+                format!(
+                    "{x} 0 obj\n<< /Type /XRef /W [1 4 2] /Index [{n} 2] /Size {} /Root {} 0 R \
+                     /Encrypt {} 0 R /ID [<{id}> <{id}>] /Prev {prev} /Length {} >>\nstream\n",
+                    x + 1,
+                    root.0,
+                    encrypt.0,
+                    rows.len(),
+                    id = "07".repeat(16)
+                )
+                .as_bytes(),
+            );
+            b.extend_from_slice(&rows);
+            b.extend_from_slice(
+                format!("\nendstream\nendobj\nstartxref\n{at}\n%%EOF\n").as_bytes(),
+            );
+            let read = Document::load_mem(&b).unwrap();
+            assert!(read.encryption_state.is_some());
+            let held = read.objects.get(&(n, 0)).cloned();
+            let found = compare_reading(&b, &read).unwrap().unsure.contains(&n);
+            (found, held)
+        };
+        let content = |o: Option<Object>| o.unwrap().as_stream().unwrap().content.clone();
+
+        let data = "AB\nendstream\nendobj\nCD";
+        let (cut, held) = unsure(&format!(
+            "<< /Length {} >>\nstream\n{data}\nendstream",
+            data.len()
+        ));
+        assert!(cut);
+        assert_eq!(content(held), b"AB");
+        let (cut, held) = unsure("12 %endobj\n0 R");
+        assert!(cut);
+        assert_eq!(held, Some(Object::Integer(12)));
+        let (cut, held) = unsure("<< /Length 2 >> %endobj\nstream\nAB\nendstream");
+        assert!(cut);
+        assert!(held.unwrap().as_dict().is_ok());
+
+        let (cut, held) = unsure("<< /Length 2 >>\nstream\nAB\nendstream");
+        assert!(!cut);
+        assert_eq!(content(held), b"AB");
+        for whole in [
+            "12 0 R",
+            "<< /A 1 >>",
+            "58endobj",
+            "/Aendobj",
+            "<< /A 1 >> %endobj",
+        ] {
+            let (cut, held) = unsure(whole);
+            assert!(!cut, "{whole}");
+            assert!(held.is_some(), "{whole}");
+        }
     }
 
     /// Encrypts `d`, which has no `/ID` yet, with the Identity crypt filter, which leaves strings

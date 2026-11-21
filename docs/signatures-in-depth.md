@@ -639,12 +639,14 @@ refuses as malformed:
   name may instead be followed by the next object, the cross-reference information or the end of the file, which
   every app reads alike); one in an object stream numbered as the place in the file of an object
   listed outside it (pdf.js then takes the stream's copy of that object); one in an object stream LimarePDF's PDF
-  library can't open; and one in an object stream reached by a reference under a generation other than 0, which
-  other apps follow and LimarePDF's PDF library doesn't. Some apps read the encryption dictionary, and the objects
-  it names, before they can decrypt, as written in the file: so an object it names that holds text or stream data,
-  which LimarePDF's PDF library decrypts, is refused where it is used, and so is every object in an object stream
-  holding one it names; when the encryption dictionary itself is in an object stream
-  or can't be read as written, the whole revision is;
+  library can't open; one in an object stream reached by a reference under a generation other than 0, which
+  other apps follow and LimarePDF's PDF library doesn't; and, in an encrypted file, one holding `endobj` before its
+  end, in a string, a comment or its stream data: LimarePDF's PDF library reads it only as far as that, where other
+  apps read on, past a comment into a reference or a stream, or a stream's data as long as its `/Length`. Some apps
+  read the encryption dictionary, and the objects it names, before they can decrypt, as written in the file: so an
+  object it names that holds text or stream data, which LimarePDF's PDF library decrypts, is refused where it is
+  used, and so is every object in an object stream holding one it names; when the encryption dictionary itself is in
+  an object stream or can't be read as written, the whole revision is;
 - a dictionary of 32 entries or more giving a key twice, at any depth: LimarePDF's PDF library and pdf.js take its
   last value, and so does Poppler below 32 entries, but from 32 Poppler sorts them and may take another. The object
   holding it is refused where it is used; in cross-reference information, the whole revision is;
