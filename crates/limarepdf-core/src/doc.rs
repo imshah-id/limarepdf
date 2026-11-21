@@ -307,7 +307,7 @@ impl Pdf {
                     .into(),
             );
         }
-        let used = crate::sig_changes::references(&self.doc);
+        let mut used = crate::sig_changes::references(&self.doc);
         if let Some(id) = reading.hidden.iter().filter(|id| used.contains(id)).min() {
             return Some(format!(
                 "it uses object {}, which its cross-reference information deletes or doesn't \
@@ -315,9 +315,13 @@ impl Pdf {
                 id.0
             ));
         }
+        used.extend(&reading.lengths);
         let unsure = used
             .iter()
-            .filter(|id| reading.unsure.contains(&id.0))
+            .filter(|id| {
+                reading.unsure.contains(&id.0)
+                    || (!self.doc.objects.contains_key(id) && reading.others_find(**id))
+            })
             .min();
         unsure.map(|id| format!("LimarePDF can't read its object {} the way they do", id.0))
     }

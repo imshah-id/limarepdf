@@ -1056,7 +1056,7 @@ pub(crate) fn is_white(ch: u8) -> bool {
     matches!(ch, b' ' | b'\t' | b'\n' | b'\r' | b'\x0c' | b'\0')
 }
 
-fn is_delim(ch: u8) -> bool {
+pub(crate) fn is_delim(ch: u8) -> bool {
     matches!(
         ch,
         b'(' | b')' | b'<' | b'>' | b'[' | b']' | b'{' | b'}' | b'/' | b'%'
@@ -1188,6 +1188,12 @@ impl<'a> Lexer<'a> {
     /// Where the next token starts looking.
     pub(crate) fn pos(&self) -> usize {
         self.pos
+    }
+
+    /// Once [`Lexer::next`] has given `None`: whether that was the end rather than malformed
+    /// input.
+    pub(crate) fn at_end(&self) -> bool {
+        self.pos >= self.bytes.len()
     }
 
     /// The next token with its start and end, or `None` at the end or on malformed input.

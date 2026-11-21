@@ -615,7 +615,34 @@ refuses as malformed:
   predictor, which apps read differently;
   or data in a format other than the usual Flate compression, or marked with an empty list of formats. A signed
   file whose own streams are like this opens as a file other apps may read differently, so its signatures show
-  *can't check*.
+  *can't check*;
+- an object stream holding an object in use whose objects apps may find in different places: LimarePDF's PDF
+  library reads each at the place the stream's index gives, and some apps read each in a stretch as long as from its
+  place to the next one's, but start every stretch early: by the first object's place or by where the objects begin,
+  whichever is less. Others read the last object on past the end of the stream's data. So anything but white space
+  and comments before an object (from either start); after one, anything but whole objects, `endobj`, white space,
+  comments and a lone sign or point some apps read as 0 (so a `stream` keyword, or a sign ending the data, which
+  some apps read on past and can't read as a number); offsets out of order; an object running past the next one's
+  place or into what follows the data; a comment hiding where the next object starts; a comment ending the data with
+  no line end after it (as after compressed data); a reference written with a sign; a name with a `#` not followed
+  by two hexadecimal digits; a number with a sign inside it (but for minus signs after its point and a digit, which
+  every app skips); an index with other white space than PDF's between its numbers or running into the objects
+  without a space; data where `/Length` doesn't end it just before `endstream`, a line end at most apart (some apps
+  then take the data as long as `/Length`, LimarePDF's PDF library on to an `endstream` of its own finding); or more
+  than a million objects or an object number above 2,147,483,647 (some apps then read none of them) is refused. A
+  stream any entry names as an object stream is checked so, with or without its type;
+- an object in use that other apps may find otherwise, also when it serves only as a stream's length: one listed in
+  the cross-reference information that isn't written as one whole object followed by `endobj` or its stream data,
+  or whose header gives another number (a number may run straight into `endobj`, and a dictionary, array, string or
+  name may instead be followed by the next object, the cross-reference information or the end of the file, which
+  every app reads alike); one in an object stream numbered as the place in the file of an object
+  listed outside it (pdf.js then takes the stream's copy of that object); one in an object stream LimarePDF's PDF
+  library can't open; and one in an object stream reached by a reference under a generation other than 0, which
+  other apps follow and LimarePDF's PDF library doesn't. Some apps read the encryption dictionary, and the objects
+  it names, before they can decrypt, as written in the file: so an object it names that holds text or stream data,
+  which LimarePDF's PDF library decrypts, is refused where it is used, and so is every object in an object stream
+  holding one it names; when the encryption dictionary itself is in an object stream
+  or can't be read as written, the whole revision is.
 
 An object deleted while still in use, and an object the signed version referred to but didn't have, are refused
 too. These are the shapes of the published shadow (hide, replace, hide-and-replace) and incremental-saving attacks.

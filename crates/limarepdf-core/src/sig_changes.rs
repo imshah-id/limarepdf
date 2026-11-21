@@ -19,13 +19,14 @@
 use crate::budget;
 use crate::forms;
 use crate::sig_verify::{
-    is_white, too_many_versions, FieldLock, Lexer, Permissions, Tok, Versions,
+    is_delim, is_white, too_many_versions, FieldLock, Lexer, Permissions, Tok, Versions,
 };
 use crate::Pdf;
 use lopdf::xref::XrefEntry;
 use lopdf::{Dictionary, Document, Object, ObjectId, Stream, StringFormat};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
+use std::ops::Range;
 
 // ---------------------------------------------------------------- report types
 
@@ -895,14 +896,10 @@ fn read_xref_stream(bytes: &[u8], mut lx: Lexer) -> Option<ReadSection> {
         Object::Dictionary(d) => d,
         _ => return None,
     };
-    let (_, Tok::Word(b"stream"), mut start) = lx.next()? else {
+    let (_, Tok::Word(b"stream"), keyword) = lx.next()? else {
         return None;
     };
-    start += match bytes.get(start..start + 2)? {
-        b"\r\n" => 2,
-        [b'\n', _] => 1,
-        _ => return None,
-    };
+    let start = data_start(bytes, keyword)?;
     let len = usize::try_from(dict.get(b"Length").ok()?.as_i64().ok()?).ok()?;
     let data = bytes.get(start..start.checked_add(len)?)?;
     let mut tail = Lexer::new(bytes, start + len);
@@ -1013,6 +1010,17 @@ fn revision_end(bytes: &[u8], after: usize, at: usize) -> Option<usize> {
 /// One direct object, enough for cross-reference dictionaries: numbers, names (with
 /// `#xx` escapes), references, arrays, dictionaries. Strings are kept empty.
 fn read_object(lx: &mut Lexer, depth: usize) -> Option<Object> {
+    object(lx, depth, true)
+}
+
+/// Whether one direct object reads as [`read_object`] reads it, without building it.
+fn skip_object(lx: &mut Lexer) -> bool {
+    object(lx, 0, false).is_some()
+}
+
+/// [`read_object`], keeping what arrays and dictionaries hold only when `keep`: otherwise
+/// they read as null.
+fn object(lx: &mut Lexer, depth: usize, keep: bool) -> Option<Object> {
     if depth > 32 {
         return None;
     }
@@ -1024,13 +1032,20 @@ fn read_object(lx: &mut Lexer, depth: usize) -> Option<Object> {
                 match lx.next()? {
                     (_, Tok::DictClose, _) => break,
                     (_, Tok::Name(k), _) => {
-                        let v = read_object(lx, depth + 1)?;
-                        d.set(decode_name(k)?, v);
+                        let v = object(lx, depth + 1, keep)?;
+                        let k = decode_name(k)?;
+                        if keep {
+                            d.set(k, v);
+                        }
                     }
                     _ => return None,
                 }
             }
-            Object::Dictionary(d)
+            if keep {
+                Object::Dictionary(d)
+            } else {
+                Object::Null
+            }
         }
         Tok::ArrayOpen => {
             let mut a = Vec::new();
@@ -1040,45 +1055,82 @@ fn read_object(lx: &mut Lexer, depth: usize) -> Option<Object> {
                     *lx = look;
                     break;
                 }
-                a.push(read_object(lx, depth + 1)?);
+                let o = object(lx, depth + 1, keep)?;
+                if keep {
+                    a.push(o);
+                }
             }
-            Object::Array(a)
+            if keep {
+                Object::Array(a)
+            } else {
+                Object::Null
+            }
         }
         Tok::Name(n) => Object::Name(decode_name(n)?),
         Tok::Hex | Tok::Literal => Object::String(Vec::new(), StringFormat::Literal),
         Tok::Word(b"true") => Object::Boolean(true),
         Tok::Word(b"false") => Object::Boolean(false),
         Tok::Word(b"null") => Object::Null,
-        Tok::Word(w) => {
-            let s = std::str::from_utf8(w).ok()?;
-            match s.parse::<i64>() {
-                Ok(n) => {
-                    // Perhaps `N G R`.
-                    let mut look = lx.clone();
-                    let gen: Option<u16> = word_num(look.next());
-                    let r = matches!(look.next(), Some((_, Tok::Word(b"R"), _)));
-                    match (gen, r, u32::try_from(n)) {
-                        (Some(g), true, Ok(num)) => {
-                            *lx = look;
-                            Object::Reference((num, g))
-                        }
-                        _ => Object::Integer(n),
+        Tok::Word(w) => match number(w)? {
+            Object::Integer(n) if w.iter().all(u8::is_ascii_digit) => {
+                // Perhaps `N G R`; lopdf takes one only after digits alone, where
+                // other readers take `+1 0 R` too.
+                let mut look = lx.clone();
+                let gen: Option<u16> = word_num(look.next());
+                let r = matches!(look.next(), Some((_, Tok::Word(b"R"), _)));
+                match (gen, r, u32::try_from(n)) {
+                    (Some(g), true, Ok(num)) => {
+                        *lx = look;
+                        Object::Reference((num, g))
                     }
+                    _ => Object::Integer(n),
                 }
-                Err(_) => Object::Real(s.parse().ok()?),
             }
-        }
+            n => n,
+        },
         Tok::DictClose | Tok::ArrayClose => return None,
     })
 }
 
+/// A number as lopdf reads it: an integer, a sign and digits, or a real, a sign, digits, a
+/// point and digits, with a digit on one side of the point. lopdf, Poppler and pdf.js skip
+/// minus signs after the point (`0.00-4142502`). Not a minus inside the whole part, which
+/// pdf.js skips and the others start a number at, nor what Rust reads besides (`1e5`,
+/// `inf`), which PDF readers take as other tokens.
+fn number(w: &[u8]) -> Option<Object> {
+    let s = std::str::from_utf8(w).ok()?;
+    let unsigned = s.strip_prefix(['+', '-']).unwrap_or(s);
+    if !unsigned.is_empty() && unsigned.bytes().all(|c| c.is_ascii_digit()) {
+        return s.parse().ok().map(Object::Integer);
+    }
+    let (whole, part) = unsigned.split_once('.')?;
+    let digit = |c: char| c.is_ascii_digit();
+    if !whole.chars().all(digit)
+        || !part.chars().all(|c| digit(c) || c == '-')
+        || (whole.is_empty() && !part.starts_with(digit))
+    {
+        return None;
+    }
+    let sign = &s[..s.len() - unsigned.len()];
+    let part: String = part.chars().filter(|&c| c != '-').collect();
+    format!("{sign}{whole}.{part}")
+        .parse()
+        .ok()
+        .map(Object::Real)
+}
+
+/// A name's bytes: lopdf reads `#` and two hexadecimal digits as one byte and ends the name
+/// at any other `#`, where Poppler and pdf.js keep it, so such a name doesn't read alike.
 fn decode_name(n: &[u8]) -> Option<Vec<u8>> {
     let mut out = Vec::with_capacity(n.len());
     let mut i = 0;
     while i < n.len() {
         if n[i] == b'#' {
-            let h = std::str::from_utf8(n.get(i + 1..i + 3)?).ok()?;
-            out.push(u8::from_str_radix(h, 16).ok()?);
+            let h = n.get(i + 1..i + 3)?;
+            if !h.iter().all(u8::is_ascii_hexdigit) {
+                return None;
+            }
+            out.push(u8::from_str_radix(std::str::from_utf8(h).ok()?, 16).ok()?);
             i += 3;
         } else {
             out.push(n[i]);
@@ -1095,13 +1147,68 @@ fn header_at(bytes: &[u8], offset: usize, id: ObjectId) -> bool {
 
 /// The object whose header (`N G obj`) starts at `offset`, perhaps after white space.
 fn header_id(bytes: &[u8], offset: usize) -> Option<ObjectId> {
+    header(bytes, offset).map(|(id, _)| id)
+}
+
+/// [`header_id`], and a lexer past the header.
+fn header(bytes: &[u8], offset: usize) -> Option<(ObjectId, Lexer<'_>)> {
     let mut lx = Lexer::new(bytes, offset);
     let first = lx.next();
     if !first.is_some_and(|(s, _, _)| bytes[offset..s].iter().all(|&c| is_white(c))) {
         return None;
     }
     let id = (word_num(first)?, word_num(lx.next())?);
-    matches!(lx.next(), Some((_, Tok::Word(b"obj"), _))).then_some(id)
+    matches!(lx.next(), Some((_, Tok::Word(b"obj"), _))).then_some((id, lx))
+}
+
+/// Where stream data starts, `at` just past the `stream` keyword: lopdf, like pdf.js, takes
+/// spaces and tabs, then a line end.
+fn data_start(bytes: &[u8], mut at: usize) -> Option<usize> {
+    while matches!(bytes.get(at), Some(b' ' | b'\t')) {
+        at += 1;
+    }
+    Some(match bytes.get(at..)? {
+        [b'\r', b'\n', ..] => at + 2,
+        [b'\r' | b'\n', ..] => at + 1,
+        _ => return None,
+    })
+}
+
+/// Where the data of the stream whose object starts at `at` lies, as other apps take it: as
+/// long as its `/Length`, a whole number written in the stream's dictionary or in an object
+/// `spec` lists, then `endstream` and `endobj`.
+fn stream_data(bytes: &[u8], at: usize, spec: &HashMap<u32, Entry>) -> Option<Range<usize>> {
+    let (_, mut lx) = header(bytes, at)?;
+    let Object::Dictionary(dict) = read_object(&mut lx, 0)? else {
+        return None;
+    };
+    let (_, Tok::Word(b"stream"), keyword) = lx.next()? else {
+        return None;
+    };
+    let start = data_start(bytes, keyword)?;
+    let len = match dict.get(b"Length").ok()? {
+        Object::Integer(n) => *n,
+        Object::Reference(id) => match spec.get(&id.0) {
+            Some(&Entry::InUse { offset, gen }) if gen == id.1 => {
+                let (found, mut lx) = header(bytes, offset)?;
+                let Object::Integer(n) = read_object(&mut lx, 0)? else {
+                    return None;
+                };
+                if found != *id || !matches!(lx.next()?, (_, Tok::Word(b"endobj"), _)) {
+                    return None;
+                }
+                n
+            }
+            _ => return None,
+        },
+        _ => return None,
+    };
+    let end = start.checked_add(usize::try_from(len).ok()?)?;
+    let mut tail = Lexer::new(bytes, end);
+    (end <= bytes.len()
+        && matches!(tail.next()?, (_, Tok::Word(b"endstream"), _))
+        && matches!(tail.next()?, (_, Tok::Word(b"endobj"), _)))
+    .then_some(start..end)
 }
 
 /// Whether the newest cross-reference section of `bytes` is a hybrid one (a table whose
@@ -1174,6 +1281,21 @@ pub(crate) struct Reading {
     /// Whether the file ends with its cross-reference pointer. Readers find a pointer
     /// followed by other data in different ways.
     pub(crate) ends_cleanly: bool,
+    /// The objects streams take their `/Length` from. lopdf writes the length it read in
+    /// their place, so its reading no longer uses them, while other apps' does.
+    pub(crate) lengths: HashSet<ObjectId>,
+    /// The entry each object number has for other apps.
+    spec: HashMap<u32, Entry>,
+}
+
+impl Reading {
+    /// Whether other apps find object `id`, which lopdf doesn't hold, in an object stream:
+    /// they take an object from one whatever generation a reference to it gives, lopdf only
+    /// under generation 0.
+    pub(crate) fn others_find(&self, id: ObjectId) -> bool {
+        matches!(self.spec.get(&id.0), Some(Entry::Compressed { container, .. })
+            if matches!(self.spec.get(container), Some(Entry::InUse { .. })))
+    }
 }
 
 /// Compares lopdf's reading `doc` of `bytes` (the bytes it read) with the
@@ -1233,13 +1355,23 @@ pub(crate) fn compare_reading(bytes: &[u8], doc: &Document) -> Result<Reading, S
         }
     }
     // lopdf keeps an object under the number its header gives, whichever entry led to it.
+    // Other apps read the object as LimarePDF does when it is one whole object, followed by
+    // `endobj` or a stream's data.
+    let mut lengths = HashSet::new();
     for (&num, e) in table {
         if let XrefEntry::Normal { offset, generation } = *e {
-            let found = header_id(bytes, offset as usize);
-            if found != Some((num, generation)) {
-                unsure.insert(num);
-                if let Some((other, _)) = found {
-                    unsure.insert(other);
+            let id = (num, generation);
+            match header(bytes, offset as usize) {
+                Some((found, lx)) if found == id => {
+                    if doc.objects.contains_key(&id) && !whole_object(lx, &mut lengths) {
+                        unsure.insert(num);
+                    }
+                }
+                found => {
+                    unsure.insert(num);
+                    if let Some(((other, _), _)) = found {
+                        unsure.insert(other);
+                    }
                 }
             }
         }
@@ -1247,31 +1379,58 @@ pub(crate) fn compare_reading(bytes: &[u8], doc: &Document) -> Result<Reading, S
 
     // Object streams: each holds the objects its index lists, and a reader takes an object
     // from the stream at the place its entry gives. lopdf takes any object a stream holds
-    // that has no entry of its own, and one whose own object it couldn't read.
+    // that has no entry of its own, and one whose own object it couldn't read. lopdf,
+    // Poppler and pdf.js open any stream an entry names as an object stream, typed or not.
     let mut copies: Vec<(u32, ObjectId)> = Vec::new();
-    // The objects listed in each object stream, gathered for the first that other apps may
-    // decode differently.
-    let mut listed_in: Option<HashMap<u32, Vec<u32>>> = None;
+    let mut listed_in: HashMap<u32, Vec<u32>> = HashMap::new();
+    for (&n, e) in &spec {
+        if let Entry::Compressed { container, .. } = e {
+            listed_in.entry(*container).or_default().push(n);
+        }
+    }
     for (&(c, g), o) in &doc.objects {
         let Object::Stream(s) = o else { continue };
-        if !s.dict.has_type(b"ObjStm") {
+        let typed = s.dict.has_type(b"ObjStm");
+        if !typed && !listed_in.contains_key(&c) {
             continue;
         }
-        let members =
-            objstm_members(s).ok_or_else(|| format!("its object stream {c} can't be read"))?;
-        // Other apps may read none of the objects listed in it. lopdf's stray copies of
-        // others are checked below.
-        if !decodes_alike(s, MAX_OBJECT_STREAM) {
-            let listed_in = listed_in.get_or_insert_with(|| {
-                let mut m: HashMap<u32, Vec<u32>> = HashMap::new();
-                for (&n, e) in &spec {
-                    if let Entry::Compressed { container, .. } = e {
-                        m.entry(*container).or_default().push(n);
-                    }
-                }
-                m
-            });
-            unsure.extend(listed_in.get(&c).into_iter().flatten());
+        // lopdf must have read the data other apps read: as it is in the file, or, decrypted,
+        // read before a line end and `endstream`.
+        let data = match spec.get(&c) {
+            Some(&Entry::InUse { offset, gen }) if gen == g => stream_data(bytes, offset, &spec),
+            _ => None,
+        };
+        let framed = data.filter(|r| match encrypt {
+            None => bytes[r.clone()] == s.content[..],
+            Some(_) => {
+                let rest = &bytes[r.end..];
+                let rest = (rest.strip_prefix(b"\r\n"))
+                    .or_else(|| rest.strip_prefix(b"\n"))
+                    .or_else(|| rest.strip_prefix(b"\r"))
+                    .unwrap_or(rest);
+                rest.starts_with(b"endstream")
+            }
+        });
+        // pdf.js reads the last object on past the content: into the file after plain data,
+        // and into the zeros filling its buffer after data it decrypts or decodes.
+        let plain = encrypt.is_none() && matches!(s.dict.get(b"Filter"), Err(_) | Ok(Object::Null));
+        let after = match &framed {
+            _ if !plain => Some(&[0][..]),
+            Some(r) => Some(&bytes[r.end..]),
+            None => None,
+        };
+        let Some((members, alike)) = objstm_members(s, after) else {
+            if typed {
+                return Err(format!("its object stream {c} can't be read"));
+            }
+            unsure.insert(c);
+            continue;
+        };
+        // Other apps may read none of the objects listed in it (see below), when they may
+        // read it, decode it or find its objects differently. lopdf's stray copies of others
+        // are checked below.
+        if framed.is_none() || !alike || !decodes_alike(s, MAX_OBJECT_STREAM) {
+            unsure.insert(c);
         }
         let mut seen = HashSet::new();
         for (i, &n) in members.iter().enumerate() {
@@ -1283,6 +1442,11 @@ pub(crate) fn compare_reading(bytes: &[u8], doc: &Document) -> Result<Reading, S
                     if usize::try_from(*index).ok() != Some(i) {
                         unsure.insert(n);
                     }
+                }
+                // pdf.js takes the object from the stream, and keeps it, when the stream's
+                // number is the offset the object's own entry gives.
+                Some(Entry::InUse { offset, .. }) if *offset == c as usize => {
+                    unsure.insert(n);
                 }
                 Some(Entry::InUse { gen: 0, .. }) if doc.objects.contains_key(&(n, 0)) => {
                     copies.push((n, (c, g)));
@@ -1332,11 +1496,45 @@ pub(crate) fn compare_reading(bytes: &[u8], doc: &Document) -> Result<Reading, S
         }
     }
 
-    // lopdf no longer holds the encryption dictionary (see `references`), and below it
-    // would count as one lopdf doesn't hold; but it must have found it where other apps do.
-    if let Ok(Object::Reference((n, _))) = trailer.get(b"Encrypt") {
-        if unsure.contains(n) {
-            return Err("they may decrypt it with another encryption dictionary".into());
+    // pdf.js reads the encryption dictionary, and the objects it names, before it can decrypt:
+    // as written, where lopdf decrypts their strings and data, and when one is in an object
+    // stream, every object in that stream.
+    let encrypt_num = match trailer.get(b"Encrypt") {
+        Ok(Object::Reference(id)) => Some(id.0),
+        _ => None,
+    };
+    let mut named_first: Vec<Object> = trailer.get(b"Encrypt").ok().cloned().into_iter().collect();
+    let mut looked = HashSet::new();
+    while let Some(o) = named_first.pop() {
+        match o {
+            Object::Reference(id) if looked.insert(id) => match spec.get(&id.0) {
+                Some(&Entry::InUse { offset, gen }) if gen == id.1 => {
+                    let read = header(bytes, offset)
+                        .filter(|(found, _)| *found == id)
+                        .and_then(|(_, mut lx)| {
+                            let o = read_object(&mut lx, 0)?;
+                            Some((o, matches!(lx.next(), Some((_, Tok::Word(b"stream"), _)))))
+                        });
+                    match read {
+                        Some((o, stream)) => {
+                            if Some(id.0) != encrypt_num && (stream || holds_string(&o)) {
+                                unsure.insert(id.0);
+                            }
+                            named_first.push(o);
+                        }
+                        None => {
+                            unsure.insert(id.0);
+                        }
+                    }
+                }
+                Some(&Entry::Compressed { container, .. }) => {
+                    unsure.extend([container, id.0]);
+                }
+                _ => {}
+            },
+            Object::Array(a) => named_first.extend(a),
+            Object::Dictionary(d) => named_first.extend(d.into_iter().map(|(_, o)| o)),
+            _ => {}
         }
     }
     for &(n, g) in doc.objects.keys() {
@@ -1356,9 +1554,11 @@ pub(crate) fn compare_reading(bytes: &[u8], doc: &Document) -> Result<Reading, S
         Entry::InUse { gen, .. } => (n, gen),
         _ => (n, 0),
     }));
-    // Objects a reader finds that lopdf doesn't hold.
+    // Objects a reader finds that lopdf doesn't hold. lopdf no longer holds the encryption
+    // dictionary (see `references`).
     for (&n, &e) in &spec {
         let id = match e {
+            _ if Some(n) == encrypt_num => continue,
             Entry::Free => continue,
             Entry::InUse { gen, .. } => (n, gen),
             Entry::Compressed { container, .. } => {
@@ -1380,11 +1580,81 @@ pub(crate) fn compare_reading(bytes: &[u8], doc: &Document) -> Result<Reading, S
             }
         }
     }
+    // Other apps may read none of the objects an object stream holds as lopdf does when they
+    // may read the stream otherwise.
+    let streams: Vec<u32> = (listed_in.keys())
+        .filter(|c| unsure.contains(c))
+        .copied()
+        .collect();
+    for c in streams {
+        unsure.extend(&listed_in[&c]);
+    }
+    // lopdf must have found the encryption dictionary where other apps do.
+    if encrypt_num.is_some_and(|n| unsure.contains(&n)) {
+        return Err("they may decrypt it with another encryption dictionary".into());
+    }
     Ok(Reading {
         hidden,
         unsure,
         ends_cleanly: pointer.is_some(),
+        lengths,
+        spec,
     })
+}
+
+/// Whether `o` holds a string, at any depth.
+fn holds_string(o: &Object) -> bool {
+    match o {
+        Object::String(..) => true,
+        Object::Array(a) => a.iter().any(holds_string),
+        Object::Dictionary(d) => d.iter().any(|(_, v)| holds_string(v)),
+        _ => false,
+    }
+}
+
+/// Whether one whole object follows `lx`, then `endobj` or a stream's data, as lopdf, Poppler
+/// and pdf.js all read it. A number may be glued to `endobj`: they end it at the `e`. A
+/// dictionary, array, string or name, which ends itself, may instead be followed by the next
+/// object's header, `xref`, `trailer`, `startxref` or the end of the file, where they all stop
+/// without `endobj`; not a number or a keyword, which lopdf may read on into a reference.
+/// Adds the object a stream takes its `/Length` from to `lengths`.
+fn whole_object(mut lx: Lexer, lengths: &mut HashSet<ObjectId>) -> bool {
+    let mut dict = lx.clone();
+    let first = lx.clone().next();
+    if let Some((_, Tok::Word(w), _)) = first {
+        if let Some(n) = w.strip_suffix(b"endobj") {
+            return number(n).is_some();
+        }
+    }
+    if !skip_object(&mut lx) {
+        return false;
+    }
+    let ends_itself = first.is_some_and(|(_, t, _)| {
+        matches!(
+            t,
+            Tok::DictOpen | Tok::ArrayOpen | Tok::Name(_) | Tok::Hex | Tok::Literal
+        )
+    });
+    let next = lx.next();
+    match next {
+        Some((_, Tok::Word(b"endobj"), _)) => true,
+        Some((_, Tok::Word(b"stream"), _)) => {
+            if let Some(Object::Dictionary(d)) = read_object(&mut dict, 0) {
+                if let Ok(Object::Reference(id)) = d.get(b"Length") {
+                    lengths.insert(*id);
+                }
+            }
+            true
+        }
+        _ if !ends_itself => false,
+        Some((_, Tok::Word(b"xref" | b"trailer" | b"startxref"), _)) => true,
+        None => lx.at_end(),
+        _ => {
+            word_num::<u32>(next).is_some()
+                && word_num::<u16>(lx.next()).is_some()
+                && matches!(lx.next(), Some((_, Tok::Word(b"obj"), _)))
+        }
+    }
 }
 
 /// The cross-reference information a reader following the specification takes.
@@ -1445,25 +1715,159 @@ fn whole_xref(bytes: &[u8], mut at: usize) -> Result<WholeXref, String> {
 
 /// The object numbers an object stream holds, in order, when its index reads cleanly:
 /// `/N` pairs of whole numbers before `/First`. lopdf reads every pair it finds, whatever
-/// `/N` says, and other readers stop at `/N`.
-fn objstm_members(s: &Stream) -> Option<Vec<u32>> {
-    let content = s.get_plain_content_with_limit(MAX_OBJECT_STREAM).ok()?;
+/// `/N` says, and other readers stop at `/N`. Also whether other readers find its objects
+/// where lopdf does ([`laid_out_alike`]), given what pdf.js reads `after` the content; not
+/// when that isn't known, nor when the index holds other white space than PDF's, which
+/// lopdf takes between numbers too, or runs into the data, or Poppler can't take it.
+fn objstm_members(s: &Stream, after: Option<&[u8]>) -> Option<(Vec<u32>, bool)> {
+    let mut content = s.get_plain_content_with_limit(MAX_OBJECT_STREAM).ok()?;
     if content.is_empty() {
-        return Some(Vec::new());
+        return Some((Vec::new(), true));
     }
     let int = |key: &[u8]| usize::try_from(s.dict.get(key).ok()?.as_i64().ok()?).ok();
     let (first, n) = (int(b"First")?, int(b"N")?);
-    let words: Vec<&str> = std::str::from_utf8(content.get(..first)?)
+    let index = content.get(..first)?;
+    let plain_index = index
+        .iter()
+        .all(|&c| c.is_ascii_digit() || c == b'+' || is_white(c));
+    let words: Vec<&str> = std::str::from_utf8(index)
         .ok()?
         .split_whitespace()
         .collect();
     if words.len() != n.checked_mul(2)? {
         return None;
     }
-    words
+    let (members, offsets): (Vec<u32>, Vec<usize>) = words
         .chunks(2)
-        .map(|p| p[1].parse::<u32>().ok().and(p[0].parse().ok()))
-        .collect()
+        .map(|p| {
+            Some((
+                p[0].parse::<u32>().ok()?,
+                p[1].parse::<u32>().ok()? as usize,
+            ))
+        })
+        .collect::<Option<Vec<_>>>()?
+        .into_iter()
+        .unzip();
+    // Poppler drops the whole stream past a million objects or a number past its `int`, and
+    // pdf.js reads the last offset on into the data when nothing parts them.
+    let parted = index.last().is_none_or(|&c| is_white(c))
+        || !matches!(content.get(first), Some(b'0'..=b'9' | b'.' | b'-'));
+    let len = content.len();
+    let alike = plain_index
+        && parted
+        && n <= 1_000_000
+        && members.iter().all(|&m| i32::try_from(m).is_ok())
+        && after.is_some_and(|after| {
+            // pdf.js ends a number glued to what follows where the content ends, as the
+            // others do, and reads a name or a keyword on into it.
+            let regular = |c: u8| !is_white(c) && !is_delim(c);
+            let word = content
+                .iter()
+                .rposition(|&c| !regular(c))
+                .map_or(0, |k| k + 1);
+            let glued = content.get(word.wrapping_sub(1)) != Some(&b'/')
+                && number(&content[word..]).is_some();
+            content.extend((after.first()).map(|&c| if glued && regular(c) { b' ' } else { c }));
+            laid_out_alike(&content, len, first, &offsets)
+        });
+    Some((members, alike))
+}
+
+/// Whether other readers find an object stream's objects where lopdf does, its `len` bytes
+/// of content in `read` followed by the byte pdf.js reads after them, if any. lopdf reads
+/// one object at `/First` plus each offset, and pdf.js too, but only up to the next offset,
+/// on past the content for the last, and taking a `stream` after a dictionary as its data.
+/// Poppler reads each in a window as long as from its offset to the next one, but starts
+/// the first window at `/First` unless the first offset is past `/First`, so all its windows
+/// sit that much earlier. pdf.js also lexes on from `/First` past the index. They agree when
+/// the offsets increase, each object starts on the same token from all these places and
+/// ends in Poppler's window, only whole objects, `endobj` and signs pdf.js reads as 0 follow
+/// it before the next offset, and the content doesn't end in a comment that runs on into
+/// what pdf.js reads after it.
+fn laid_out_alike(read: &[u8], len: usize, first: usize, offsets: &[usize]) -> bool {
+    let start = |at| Lexer::new(read, at).next().map(|(s, _, _)| s);
+    let shift = offsets.first().map_or(0, |&o| o.min(first));
+    for (i, &offset) in offsets.iter().enumerate() {
+        let end = match offsets.get(i + 1) {
+            Some(&next) if next > offset => first.checked_add(next),
+            Some(_) => return false,
+            None => Some(len),
+        };
+        let (Some(at), Some(end)) = (first.checked_add(offset), end) else {
+            return false;
+        };
+        // Poppler's last window runs to the end.
+        let window = if i + 1 < offsets.len() {
+            end - shift
+        } else {
+            end
+        };
+        let mut lx = Lexer::new(read, at);
+        if start(at - shift) != start(at)
+            || (i == 0 && start(first) != start(at))
+            || !skip_object(&mut lx)
+            || lx.pos() > window
+        {
+            return false;
+        }
+        // Every reader ignores what follows when it is whole objects, `endobj` or signs pdf.js
+        // reads as 0: pdf.js fails on some other tokens, and takes `stream` as the data's.
+        // pdf.js and Poppler stop at the next offset, but lopdf reads on past an object to look
+        // for `N G R`, so the next object must start where reading on finds it. A comment
+        // hiding that start is refused, though the readers agree on what it hides so far.
+        loop {
+            let mut look = lx.clone();
+            match look.next() {
+                Some((s, _, _)) if s >= end => {
+                    if i + 1 < offsets.len() && start(end) != Some(s) {
+                        return false;
+                    }
+                    break;
+                }
+                Some((_, Tok::Word(b"endobj"), _)) => lx = look,
+                Some((_, Tok::Word(w), e)) if pdfjs_reads_zero(read, w, e) => lx = look,
+                Some(_) => {
+                    if !skip_object(&mut lx) {
+                        return false;
+                    }
+                }
+                None if look.pos() < end || i + 1 < offsets.len() => return false,
+                None => break,
+            }
+            if lx.pos() > end {
+                return false;
+            }
+        }
+        // A comment ending the content runs on into what follows, past a line end in the
+        // file. After decoded data pdf.js reads zeros there, which is fine, but that byte
+        // can't tell the two apart.
+        let tail = &read[lx.pos().min(len)..len];
+        let eol = |c: &u8| matches!(c, b'\r' | b'\n');
+        if i + 1 == offsets.len()
+            && !read.get(len).is_none_or(eol)
+            && tail.iter().rposition(|&c| c == b'%') > tail.iter().rposition(eol)
+        {
+            return false;
+        }
+    }
+    true
+}
+
+/// Whether pdf.js lexes `word`, ending at `end` in `read`, as a number without digits, which
+/// it takes as 0 rather than failing: `-`, `--` or `+`, then `.`, each optional, before a
+/// space, a tab, a line end, `(`, `<` or the end, but not a zero byte. After a sign it reads
+/// on past line ends, so those count only after the point.
+fn pdfjs_reads_zero(read: &[u8], word: &[u8], end: usize) -> bool {
+    let unsigned = [&b"--"[..], b"-", b"+"]
+        .iter()
+        .find_map(|sign| word.strip_prefix(*sign))
+        .unwrap_or(word);
+    matches!(unsigned, b"" | b".")
+        && match read.get(end) {
+            None | Some(b' ' | b'\t' | b'(' | b'<') => true,
+            Some(b'\r' | b'\n') => unsigned == b".",
+            Some(_) => false,
+        }
 }
 
 /// A lopdf load filter that leaves object streams out, so lopdf neither keeps nor opens
@@ -5073,6 +5477,521 @@ mod tests {
         assert!(!alike(Some(flate()), &big.finish().unwrap()));
         // No filter, as the spec reads a null value.
         assert!(alike(Some(Object::Null), b"1 0 2 0"));
+    }
+
+    /// Readers find an object stream's objects alike only when each offset holds one object,
+    /// found from Poppler's earlier windows and from `/First` too, with nothing but whole
+    /// objects, `endobj` and signs pdf.js reads as 0 after it, also as pdf.js reads on past
+    /// the content.
+    #[test]
+    fn objects_are_found_alike_only_one_at_each_offset() {
+        // The index ends at `/First` (4); the offsets count from there. pdf.js reads `next`
+        // after the content: a line end before `endstream` unless given.
+        let before = |next: &str, data: &str, offsets: &[usize]| {
+            let read = format!("9 0 {data}{next}");
+            laid_out_alike(read.as_bytes(), read.len() - next.len(), 4, offsets)
+        };
+        let alike = |data: &str, offsets: &[usize]| before("\n", data, offsets);
+        assert!(alike("<< /A 1 >> null", &[0, 11]));
+        assert!(alike("[1 (x)] 2 0 R", &[0, 8]));
+        // Poppler reads each 4 bytes early, from the comment and its line end on.
+        assert!(alike("% a\n<</A[1]>>\n%b\n  -.5", &[4, 17]));
+        assert!(alike("% a\n<</A[1]>>", &[4]));
+        // An offset before the object's white space, as lopdf skips it.
+        assert!(alike("1  2", &[0, 2]));
+        assert!(alike("", &[]));
+        // Every reader stops at the end of the object.
+        assert!(alike("1 endobj 2", &[0, 9]));
+        assert!(alike("<< /A 1 >>\nendobj\n", &[0]));
+        assert!(alike("1 2 3", &[0, 4]));
+        assert!(alike("1 (x) [2] 3 0 R", &[0]));
+        // pdf.js reads a sign or point without digits as 0 before white space or the end.
+        assert!(alike("1 - 2", &[0]));
+        assert!(alike("1 -.", &[0]));
+        assert!(before("", "<< /A 1 >>\n-", &[0]));
+        // Nothing runs into what follows the content.
+        assert!(before("endstream", "1 (x)", &[0]));
+        assert!(before("endstream", "1 null\n", &[0]));
+        // A comment at the end, before a line end or the end of the file.
+        assert!(alike("1 %c", &[0]));
+        assert!(before("", "1 %c", &[0]));
+        // White space from `/First` to an offset past it.
+        assert!(alike("      1", &[6]));
+        // Something before the first object, also where Poppler skips it but pdf.js lexes it.
+        assert!(!alike("1 2", &[2]));
+        assert!(!alike(")     1", &[6]));
+        // After one: pdf.js reads a stream, and Poppler an error; pdf.js can't lex the next
+        // ones. Other words are refused too, though some every reader ignores (`obj`).
+        assert!(!alike("<< /A 1 >> stream\nx\nendstream", &[0]));
+        assert!(!alike("1 -x", &[0]));
+        assert!(!alike("1 )", &[0]));
+        assert!(!alike("1 obj", &[0]));
+        assert!(!alike("1 ---", &[0]));
+        // lopdf reads `+1` alone, other readers a reference.
+        assert!(!alike("+1 0 R", &[0]));
+        // A comment at the end, which pdf.js reads on past into what follows the content;
+        // after decoded data, into zeros, which would be fine.
+        assert!(!before("e", "1 %c", &[0]));
+        assert!(!before("\0", "1 %c", &[0]));
+        // A sign before what follows the content, where pdf.js fails: a line end and
+        // `endstream`, or a zero filling its buffer after decoded data.
+        assert!(!alike("<< /A 1 >>\n-", &[0]));
+        assert!(!before("\0", "<< /A 1 >>\n-", &[0]));
+        // pdf.js reads on into what follows the content.
+        assert!(!before("endstream", "null", &[0]));
+        assert!(!before("endstream", "1 null", &[0]));
+        assert!(!before("e", "/A", &[0]));
+        // Or something running into the next object, or past Poppler's earlier window.
+        assert!(!alike("1 (x 2)", &[0, 4]));
+        assert!(!alike("    (a%b)\n2", &[4, 10]));
+        // Or a comment hiding the next object's start from reading on past the one before, as
+        // lopdf does looking for `N G R` (pdf.js and Poppler stop at the next offset): a
+        // precaution, as the readers agree here.
+        assert!(alike("90 (\n)", &[0, 3]));
+        assert!(!alike("90 %(\n)", &[0, 4]));
+        // Also with a number hidden there, which lopdf could take as a generation.
+        assert!(!alike("90 %(\n7)", &[0, 4]));
+        // Poppler, reading 4 bytes early, starts in the comment.
+        assert!(!alike("% a\n<</A[1]>>\n%b\n  -.5", &[4, 19]));
+        // Out of order, the same twice, inside the object before, or past the end.
+        assert!(!alike("1 2", &[2, 0]));
+        assert!(!alike("1 2", &[0, 0]));
+        assert!(!alike("<< /A 1 >> 2", &[0, 3]));
+        assert!(!alike("1", &[0, 5]));
+        assert!(!alike("1", &[usize::MAX]));
+        assert!(!before("1", "1 ", &[0, 2]));
+        // An offset inside a comment, and what isn't one object.
+        assert!(!alike("% a 1\n2", &[4]));
+        assert!(!alike("endobj", &[0]));
+        assert!(!alike("<< /A >>", &[0]));
+        assert!(!alike("[1 2", &[0]));
+        assert!(!alike("1e5", &[0]));
+        assert!(!alike("inf", &[0]));
+    }
+
+    /// An object stream's index reads alike only with PDF's white space between its
+    /// numbers: lopdf splits it at any Unicode white space, other readers fail. Nor when
+    /// pdf.js reads its last number on into the data, or Poppler can't take it.
+    #[test]
+    fn an_index_reads_alike_only_with_pdf_white_space() {
+        let read = |index: &str, data: &str| {
+            let n = i64::try_from(index.split_whitespace().count() / 2).unwrap();
+            let first = i64::try_from(index.len()).unwrap();
+            let d = dictionary! { "Type" => "ObjStm", "N" => n, "First" => first };
+            objstm_members(
+                &Stream::new(d, format!("{index}{data}").into_bytes()),
+                Some(b"\n"),
+            )
+        };
+        let members = |index: &str| read(index, "1 2");
+        assert_eq!(members("3 0 6 2 "), Some((vec![3, 6], true)));
+        assert_eq!(members("+3 0\r\n6\t+2\x0c"), Some((vec![3, 6], true)));
+        assert_eq!(members("3 0\x0b6 2 "), Some((vec![3, 6], false)));
+        assert_eq!(members("3 0\u{a0}6 2 "), Some((vec![3, 6], false)));
+        // pdf.js reads offsets 0 and 21.
+        assert_eq!(members("3 0 6 2"), Some((vec![3, 6], false)));
+        assert_eq!(read("3 0 6 2", "+1 +2"), Some((vec![3, 6], true)));
+        assert_eq!(read("3 0", "<<>>"), Some((vec![3], true)));
+        assert_eq!(read("3 0", "-1"), Some((vec![3], false)));
+        assert_eq!(read("3 0", ".5"), Some((vec![3], false)));
+        // Poppler takes numbers up to its `int`, and a million objects.
+        assert_eq!(
+            members("2147483647 0 6 2 "),
+            Some((vec![2_147_483_647, 6], true))
+        );
+        assert_eq!(
+            members("2147483648 0 6 2 "),
+            Some((vec![2_147_483_648, 6], false))
+        );
+        let many = |n: usize| {
+            let index: String = (0..n).map(|i| format!("{} {} ", i + 1, 2 * i)).collect();
+            read(&index, &"1 ".repeat(n)).map(|(m, alike)| (m.len(), alike))
+        };
+        assert_eq!(many(1_000_000), Some((1_000_000, true)));
+        assert_eq!(many(1_000_001), Some((1_000_001, false)));
+    }
+
+    /// Other apps read an object as LimarePDF does only when it is one whole object, followed by
+    /// `endobj` or its stream data. Poppler reads `134 +0 R` as a reference, and lopdf doesn't.
+    /// An object nested deeper than LimarePDF reads, which lopdf holds, is unsure too.
+    #[test]
+    fn an_object_written_otherwise_is_unsure() {
+        let unsure = |o: &str| {
+            let b = table_file(&[
+                "<< /Type /Catalog /Pages 2 0 R >>\nendobj",
+                "<< /Type /Pages /Kids [] /Count 0 >>\nendobj",
+                o,
+            ]);
+            let d = Document::load_mem(&b).unwrap();
+            compare_reading(&b, &d).unwrap().unsure.contains(&3)
+        };
+        for ok in [
+            "<< /A 1 /B [1 0 R (x) <00>] >>\nendobj",
+            "%x\n[ 1 ]  % y\nendobj",
+            "<< /Length 2 >>\nstream\nab\nendstream\nendobj",
+            "58endobj",
+            "<< /A 1 >>\n4 0 obj\n<< >>\nendobj",
+            "<< /A 1 >>",
+        ] {
+            assert!(!unsure(ok), "{ok}");
+        }
+        for bad in [
+            "[134 +0 R]\nendobj",
+            "[1 65536 R]\nendobj",
+            "<< /A 1 >> 5\nendobj",
+            "<< /A 1 >> >>\nendobj",
+            "[1 0 R\nendobj",
+            &format!("{}{}\nendobj", "[".repeat(40), "]".repeat(40)),
+            "5\n4 0 obj\n<< >>\nendobj",
+        ] {
+            assert!(unsure(bad), "{bad}");
+        }
+    }
+
+    /// lopdf, Poppler and pdf.js end a number glued to `endobj` at the `e`, and an object that
+    /// ends itself where the next object's header, the cross-reference information or the end
+    /// of the file follows it without `endobj`; not a number or a keyword so followed, which
+    /// lopdf may read on into a reference.
+    #[test]
+    fn an_object_ends_where_every_reader_ends_it() {
+        let whole = |s: &str| whole_object(Lexer::new(s.as_bytes(), 0), &mut HashSet::new());
+        for ok in [
+            "5 endobj",
+            "58endobj",
+            "-2.5endobj",
+            "0.00-4endobj",
+            "<< /A 1 >>\n4 0 obj",
+            "[1 2] xref",
+            "(x)\ntrailer",
+            "<00> startxref",
+            "/N",
+            "/Aendobj",
+            "<< /A 1 >> % x\n",
+        ] {
+            assert!(whole(ok), "{ok}");
+        }
+        for bad in [
+            "endobj",
+            "nullendobj",
+            "/Aendobj 5",
+            "5endstream",
+            "58e5endobj",
+            "1 0 Rendobj",
+            "5\n4 0 obj",
+            "true xref",
+            "5",
+            "<< /A 1 >>\n4 0",
+            "<< /A 1 >>\n4 0 R",
+            "<< /A 1 >> 5",
+            "[1 2] xrefs",
+            "<< /A 1 >> <zz>",
+        ] {
+            assert!(!whole(bad), "{bad}");
+        }
+    }
+
+    /// A file of `objects`, numbered from 1, the first the catalog, each written as given
+    /// after its header, listed by a table.
+    fn table_file(objects: &[&str]) -> Vec<u8> {
+        let mut b = b"%PDF-1.7\n".to_vec();
+        let mut at = Vec::new();
+        for (i, o) in objects.iter().enumerate() {
+            at.push(b.len());
+            b.extend_from_slice(format!("{} 0 obj\n{o}\n", i + 1).as_bytes());
+        }
+        let (x, size) = (b.len(), objects.len() + 1);
+        b.extend_from_slice(format!("xref\n0 {size}\n0000000000 65535 f\r\n").as_bytes());
+        for a in at {
+            b.extend_from_slice(format!("{a:010} 00000 n\r\n").as_bytes());
+        }
+        let tail = format!("trailer\n<< /Size {size} /Root 1 0 R >>\nstartxref\n{x}\n%%EOF\n");
+        b.extend_from_slice(tail.as_bytes());
+        b
+    }
+
+    /// pdf.js ends a number glued to `endstream` where the content ends, as lopdf and Poppler
+    /// do, but reads a name or a keyword on into it.
+    #[test]
+    fn a_number_glued_to_endstream_ends_with_the_content() {
+        let glued = |data: &str| {
+            let d = dictionary! { "Type" => "ObjStm", "N" => 2, "First" => 8 };
+            let content = format!("3 0 6 2 1 {data}").into_bytes();
+            objstm_members(&Stream::new(d, content), Some(b"endstream")).map(|(_, a)| a)
+        };
+        assert_eq!(glued("23"), Some(true));
+        assert_eq!(glued("-2.5"), Some(true));
+        assert_eq!(glued("null"), Some(false));
+        assert_eq!(glued("/A"), Some(false));
+        assert_eq!(glued("/23"), Some(false));
+        assert_eq!(glued("1 %23"), Some(false));
+    }
+
+    /// lopdf reads `#` and two hexadecimal digits in a name as one byte, and ends the name at
+    /// any other `#`, where Poppler and pdf.js keep it: such a name doesn't read alike.
+    #[test]
+    fn a_name_reads_alike_only_with_two_hexadecimal_digits_after_each_number_sign() {
+        assert_eq!(decode_name(b"A#41#0a"), Some(b"AA\n".to_vec()));
+        assert_eq!(decode_name(b"A"), Some(b"A".to_vec()));
+        for n in [&b"V#+A"[..], b"V#zz", b"V#4", b"V#", b"V#-1", b"V# A"] {
+            assert_eq!(decode_name(n), None, "{}", String::from_utf8_lossy(n));
+        }
+    }
+
+    /// Numbers read as lopdf reads them, which Poppler and pdf.js agree with: a real may have
+    /// minus signs after its point, which they all skip. Others are refused: a minus inside
+    /// the whole part (pdf.js skips it, the others start a number there), and what lopdf
+    /// can't read.
+    #[test]
+    fn numbers_read_alike_as_lopdf_reads_them() {
+        let read = |w: &str| read_object(&mut Lexer::new(w.as_bytes(), 0), 0);
+        assert_eq!(read("12"), Some(Object::Integer(12)));
+        assert_eq!(read("+12"), Some(Object::Integer(12)));
+        assert_eq!(read("-12"), Some(Object::Integer(-12)));
+        assert_eq!(
+            read("-9223372036854775808"),
+            Some(Object::Integer(i64::MIN))
+        );
+        assert_eq!(read("0.00-4142502"), Some(Object::Real(0.004_142_502)));
+        assert_eq!(read("841.8-9"), Some(Object::Real(841.89)));
+        assert_eq!(read("-1.-5"), Some(Object::Real(-1.5)));
+        assert_eq!(read("-.5"), Some(Object::Real(-0.5)));
+        assert_eq!(read(".5-1"), Some(Object::Real(0.51)));
+        assert_eq!(read("5."), Some(Object::Real(5.0)));
+        for w in [
+            "12-3",
+            ".-5",
+            "--1.5",
+            "+-1",
+            "1.2.3",
+            ".",
+            "-",
+            "1e5",
+            "inf",
+            "NaN",
+            "9223372036854775808",
+            "99999999999999999999",
+        ] {
+            assert_eq!(read(w), None, "{w}");
+        }
+    }
+
+    /// Other apps take a stream's data as long as its `/Length`, written in its dictionary or
+    /// in an object of its own, when `endstream` and `endobj` follow.
+    #[test]
+    fn stream_data_is_as_long_as_its_length() {
+        let none = HashMap::new();
+        let data = |length: &str, tail: &str| {
+            let file = format!("%x\n4 0 obj\n<< /Length {length} >>\nstream \t\r\nab{tail}");
+            stream_data(file.as_bytes(), 3, &none)
+        };
+        let at = "%x\n4 0 obj\n<< /Length 2 >>\nstream \t\r\n".len();
+        assert_eq!(data("2", "\nendstream\nendobj"), Some(at..at + 2));
+        assert_eq!(data("3", "\nendstream endobj"), Some(at..at + 3));
+        assert_eq!(data("2", " % x\nendstream\nendobj"), Some(at..at + 2));
+        // Running into the data, past the end of the file, or a length that isn't a whole
+        // number.
+        assert_eq!(data("1", "\nendstream\nendobj"), None);
+        assert_eq!(data("40", "\nendstream\nendobj"), None);
+        assert_eq!(data("2.0", "\nendstream\nendobj"), None);
+        assert_eq!(data("-1", "\nendstream\nendobj"), None);
+        // Not followed by `endstream` and `endobj`.
+        assert_eq!(data("2", "\nendstreamX\nendobj"), None);
+        assert_eq!(data("2", "\nendstream\n5 0 obj"), None);
+        assert_eq!(data("2", "\nendstream"), None);
+        // Not at an object's header, or no line end after `stream`.
+        let file = b"%x\n4 0 obj\n<< /Length 2 >>\nstream\nab\nendstream\nendobj";
+        assert_eq!(stream_data(file, 3, &none), Some(at - 3..at - 1));
+        assert_eq!(stream_data(file, 5, &none), None);
+        let file = b"4 0 obj <</Length 2>> stream x\nab\nendstream\nendobj";
+        assert_eq!(stream_data(file, 0, &none), None);
+        // The length in an object of its own, where its entry says.
+        let held = |length: &str, entry: Entry| {
+            let head = "4 0 obj\n<< /Length 5 0 R >>\nstream\nab\nendstream\nendobj\n";
+            let file = format!("{head}5 0 obj {length}");
+            let entry = match entry {
+                Entry::InUse { offset: 0, gen } => Entry::InUse {
+                    offset: head.len(),
+                    gen,
+                },
+                e => e,
+            };
+            stream_data(file.as_bytes(), 0, &HashMap::from([(5, entry)]))
+        };
+        let at = "4 0 obj\n<< /Length 5 0 R >>\nstream\n".len();
+        let listed = Entry::InUse { offset: 0, gen: 0 };
+        assert_eq!(held("2 endobj", listed), Some(at..at + 2));
+        assert_eq!(held("2", listed), None);
+        assert_eq!(held("2.0 endobj", listed), None);
+        assert_eq!(held("2 endobj", Entry::InUse { offset: 0, gen: 1 }), None);
+        assert_eq!(held("2 endobj", Entry::InUse { offset: 1, gen: 0 }), None);
+        let compressed = Entry::Compressed {
+            container: 6,
+            index: 0,
+        };
+        assert_eq!(held("2 endobj", compressed), None);
+    }
+
+    /// pdf.js reads on past the data it decrypts into the zeros filling its buffer, also
+    /// through the Identity crypt filter, which leaves the data as it is in the file: there
+    /// `-.` at the end of an object stream fails, where before a line end it reads as 0.
+    #[test]
+    fn data_decrypted_unchanged_is_not_read_on_into_the_file() {
+        let unsure = encrypted_page_in_a_stream(false);
+        assert!(!unsure("", "\n", true));
+        assert!(unsure(" -.", "\n", true));
+    }
+
+    /// In an encrypted file lopdf, Poppler and pdf.js open any stream an entry names as an
+    /// object stream, with or without `/Type /ObjStm`; LimarePDF checked typed ones only.
+    #[test]
+    fn an_encrypted_files_object_stream_without_its_type_is_checked() {
+        let unsure = encrypted_page_in_a_stream(false);
+        assert!(!unsure("", "\n", false));
+        assert!(unsure(" -.", "\n", false));
+    }
+
+    /// pdf.js reads the objects the encryption dictionary names before it can decrypt, so an
+    /// object stream holding one is read as it is in the file, on past its data, and every
+    /// object in it is kept as read so.
+    #[test]
+    fn an_object_stream_read_before_decrypting_is_unsure() {
+        let unsure = encrypted_page_in_a_stream(true);
+        assert!(unsure("", "\n", true));
+    }
+
+    /// lopdf reads an object stream's data as long as its `/Length` only when a line end, at
+    /// most, comes before `endstream`; otherwise it takes the data on to an `endstream` of its
+    /// own finding, which other apps don't. What it decrypted can't show which it took.
+    #[test]
+    fn an_encrypted_object_stream_framed_otherwise_is_unsure() {
+        let unsure = encrypted_page_in_a_stream(false);
+        for framed in ["\n", "\r\n", "\r", ""] {
+            assert!(!unsure("", framed, true), "{framed:?}");
+        }
+        for otherwise in [" ", " %x\n", "\n\n", "\t\n"] {
+            assert!(unsure("", otherwise, true), "{otherwise:?}");
+        }
+    }
+
+    /// pdf.js reads the objects the encryption dictionary names as they are in the file, where
+    /// lopdf decrypts them, so one is unsure when decrypting may change it: when it holds a
+    /// string or is a stream. One of names and numbers only, as a crypt filter is, reads alike.
+    #[test]
+    fn an_object_the_encryption_dictionary_names_is_unsure_when_decrypting_may_change_it() {
+        let unsure = |o: Object| {
+            let mut d = Document::with_version("1.7");
+            let kids = Vec::<Object>::new();
+            let pages =
+                d.add_object(dictionary! { "Type" => "Pages", "Kids" => kids, "Count" => 0 });
+            let root = d.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages });
+            d.trailer.set("Root", root);
+            let named = d.add_object(o);
+            let encrypt = encrypt_with_identity(&mut d);
+            let e = d.get_object_mut(encrypt).unwrap().as_dict_mut().unwrap();
+            e.set("X", named);
+            let mut b = Vec::new();
+            d.save_to(&mut b).unwrap();
+            let read = Document::load_mem(&b).unwrap();
+            assert!(read.encryption_state.is_some());
+            let reading = compare_reading(&b, &read).unwrap();
+            reading.unsure.contains(&named.0)
+        };
+        let filter = dictionary! { "CFM" => "AESV3", "Length" => 32, "A" => vec![1.into()] };
+        assert!(!unsure(filter.into()));
+        let string = dictionary! { "A" => vec![Object::string_literal("x")] };
+        assert!(unsure(string.into()));
+        assert!(unsure(Stream::new(dictionary! {}, b"x".to_vec()).into()));
+    }
+
+    /// Encrypts `d`, which has no `/ID` yet, with the Identity crypt filter, which leaves strings
+    /// and data as they are. The encryption dictionary.
+    fn encrypt_with_identity(d: &mut Document) -> ObjectId {
+        use lopdf::encryption::crypt_filters::CryptFilter;
+        let id = Object::String(vec![7; 16], lopdf::StringFormat::Hexadecimal);
+        d.trailer.set("ID", vec![id.clone(), id]);
+        let state = lopdf::EncryptionState::try_from(lopdf::EncryptionVersion::V4 {
+            document: d,
+            encrypt_metadata: true,
+            crypt_filters: BTreeMap::<Vec<u8>, std::sync::Arc<dyn CryptFilter>>::new(),
+            stream_filter: b"Identity".to_vec(),
+            string_filter: b"Identity".to_vec(),
+            owner_password: "owner",
+            user_password: "",
+            permissions: lopdf::Permissions::all(),
+        })
+        .unwrap();
+        d.encrypt(&state).unwrap();
+        d.trailer.get(b"Encrypt").unwrap().as_reference().unwrap()
+    }
+
+    /// An encrypted file (Identity crypt filter) and a revision taking its page, then `end`,
+    /// from an unfiltered object stream, typed `/ObjStm` or not, `framing` between its data and
+    /// `endstream`; the encryption dictionary names the page when `named`. Whether the page is
+    /// unsure.
+    fn encrypted_page_in_a_stream(named: bool) -> impl Fn(&str, &str, bool) -> bool {
+        let mut d = Document::with_version("1.7");
+        let pages = d.new_object_id();
+        let page = d.add_object(dictionary! { "Type" => "Page", "Parent" => pages });
+        let kids = dictionary! { "Type" => "Pages", "Kids" => vec![page.into()], "Count" => 1 };
+        d.objects.insert(pages, Object::Dictionary(kids));
+        let root = d.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages });
+        d.trailer.set("Root", root);
+        let encrypt = encrypt_with_identity(&mut d);
+        if named {
+            let e = d.get_object_mut(encrypt).unwrap().as_dict_mut().unwrap();
+            e.set("X", Object::Array(vec![page.into()]));
+        }
+        let mut base = Vec::new();
+        d.save_to(&mut base).unwrap();
+        let prev = Document::load_mem(&base).unwrap().xref_start;
+        move |end: &str, framing: &str, typed: bool| {
+            let (n, x) = (d.max_id + 1, d.max_id + 2);
+            let index = format!("{} 0\n", page.0);
+            let body = format!("<< /Type /Page /Parent {} 0 R >>{end}", pages.0);
+            let mut b = [&base[..], b"\n"].concat();
+            let at_c = b.len();
+            let kind = if typed { "/Type /ObjStm " } else { "" };
+            b.extend_from_slice(
+                format!(
+                    "{n} 0 obj\n<< {kind}/N 1 /First {} /Length {} >>\nstream\n\
+                     {index}{body}{framing}endstream\nendobj\n",
+                    index.len(),
+                    index.len() + body.len()
+                )
+                .as_bytes(),
+            );
+            let at = b.len();
+            let row = |kind: u8, f1: usize| {
+                [
+                    &[kind][..],
+                    &u32::try_from(f1).unwrap().to_be_bytes(),
+                    &[0, 0],
+                ]
+                .concat()
+            };
+            let rows = [row(2, n as usize), row(1, at_c), row(1, at)].concat();
+            b.extend_from_slice(
+                format!(
+                    "{x} 0 obj\n<< /Type /XRef /W [1 4 2] /Index [{} 1 {n} 2] /Size {} \
+                     /Root {} 0 R /Encrypt {} 0 R /ID [<{id}> <{id}>] /Prev {prev} \
+                     /Length {} >>\nstream\n",
+                    page.0,
+                    x + 1,
+                    root.0,
+                    encrypt.0,
+                    rows.len(),
+                    id = "07".repeat(16)
+                )
+                .as_bytes(),
+            );
+            b.extend_from_slice(&rows);
+            b.extend_from_slice(
+                format!("\nendstream\nendobj\nstartxref\n{at}\n%%EOF\n").as_bytes(),
+            );
+            let read = Document::load_mem(&b).unwrap();
+            assert!(read.encryption_state.is_some());
+            compare_reading(&b, &read).unwrap().unsure.contains(&page.0)
+        }
     }
 
     /// Flate data decodes alike only with predictor values every app takes the same way,
