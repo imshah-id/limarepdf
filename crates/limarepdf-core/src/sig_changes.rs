@@ -1258,8 +1258,9 @@ fn header(bytes: &[u8], offset: usize) -> Option<(ObjectId, Lexer<'_>)> {
     matches!(lx.next_word(), Some((_, Tok::Word(b"obj"), _))).then_some((id, lx))
 }
 
-/// Where stream data starts, `at` just past the `stream` keyword: lopdf, like pdf.js, takes
-/// spaces and tabs, then a line end.
+/// Where stream data starts, `at` just past the `stream` keyword, as lopdf takes it: spaces
+/// and tabs, then a line end. pdf.js skips any bytes to the line end, so starts there too;
+/// where this finds no start, the stream isn't taken as read alike.
 fn data_start(bytes: &[u8], mut at: usize) -> Option<usize> {
     while matches!(bytes.get(at), Some(b' ' | b'\t')) {
         at += 1;
@@ -1486,11 +1487,13 @@ impl Reading {
             if matches!(self.spec.get(container), Some(Entry::InUse { .. })))
     }
 
-    /// Whether other apps read the whole file again when they follow a reference to object
+    /// Whether other apps may read the whole file again when they follow a reference to object
     /// `id`, which lopdf doesn't hold, so may then read any object otherwise. pdf.js does when
-    /// the object's entry gives another generation. Poppler does when it can't read the object
-    /// and the newest section is a table: it scans the file for objects and reads every object
-    /// from what it found from then on.
+    /// it can't take the object at its entry, such as one giving another generation, while
+    /// opening the first or last page; which objects those reach isn't followed here, so any
+    /// with an entry in use counts. Poppler does when it can't read the object and the newest
+    /// section is a table: it scans the file for objects and reads every object from what it
+    /// found from then on.
     pub(crate) fn read_again(&self, id: ObjectId) -> bool {
         match self.spec.get(&id.0) {
             Some(Entry::InUse { .. }) => true,
@@ -1602,8 +1605,10 @@ pub(crate) fn compare_reading(bytes: &[u8], doc: &Document) -> Result<Reading, S
 
     // Object streams: each holds the objects its index lists, and a reader takes an object
     // from the stream at the place its entry gives. lopdf takes any object a stream holds
-    // that has no entry of its own, and one whose own object it couldn't read. lopdf,
-    // Poppler and pdf.js open any stream an entry names as an object stream, typed or not.
+    // that has no entry of its own, and one whose own object it couldn't read. Poppler and
+    // pdf.js open any stream an entry names as an object stream, typed or not; lopdf does in
+    // an encrypted file, and otherwise only `/Type /ObjStm` ones (objects in others it doesn't
+    // hold, which are unsure below).
     let mut copies: Vec<(u32, ObjectId)> = Vec::new();
     let mut listed_in: HashMap<u32, Vec<u32>> = HashMap::new();
     for (&n, e) in &spec {
