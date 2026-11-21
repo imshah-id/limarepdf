@@ -4252,6 +4252,41 @@ fn filling_in_a_missing_object_is_refused() {
     );
 }
 
+/// An object only the data of what is drawn refers to, which Poppler follows where its drawing
+/// looks in a dictionary (marked content's, an inline image's settings), is part of that
+/// drawing: changed later, it changes the page's content, or the comment's appearance. One
+/// nothing refers to changes nothing (review round 4).
+#[test]
+fn an_object_drawn_data_refers_to_is_part_of_the_drawing() {
+    let mut ids = [(0, 0); 3];
+    let base = edit(&base_pdf(), |prev, new| {
+        let text = |s: &str| Object::string_literal(s);
+        ids = ["Pay one hundred", "Approved", "Unused"].map(|s| new.add_object(text(s)));
+        let marked = |id: ObjectId| format!("/Span <</ActualText {} 0 R>> BDC EMC", id.0);
+        let p = dict(prev, page(prev));
+        let c = p.get(b"Contents").unwrap().as_reference().unwrap();
+        let content = Stream::new(Dictionary::new(), marked(ids[0]).into_bytes());
+        new.set_object(c, content);
+        let ap = appearance(new, &marked(ids[1]));
+        let note = new.add_object(dictionary! {
+            "Type" => "Annot", "Subtype" => "Square", "P" => page(prev),
+            "Rect" => vec![0.into(), 0.into(), 9.into(), 9.into()],
+            "AP" => dictionary! { "N" => ap },
+        });
+        add_annot(prev, new, note);
+    });
+    let b = approve(&base);
+    let [text, said, lone] = ids;
+    let changed = |id: ObjectId| {
+        let more = Object::string_literal("Pay one million");
+        edit(&b, |_, new| new.set_object(id, more))
+    };
+    assert_refused(&changed(text), &ChangeKind::PageContent);
+    let comment = [(ChangeKind::CommentChanged, None)];
+    assert_eq!(changes(&changed(said)), comment);
+    assert_eq!(changes(&changed(lone)), []);
+}
+
 /// Truncated or damaged appended data never panics and never passes as unchanged.
 #[test]
 fn damaged_appended_data_is_never_clean() {

@@ -587,7 +587,9 @@ Every object that differs is judged by each part it plays in the newer version: 
 field's value or appearance, a signature, the document's structure. A change is allowed only when every one of
 those parts allows it. So an object that is both page content and, say, a comment's appearance can't be changed
 as "just a comment". Pointers from one structure to another (a bookmark to a page, a tag to an annotation) don't
-count as parts. A signature field added with an action on it or on its widget (one run when its page opens, say)
+count as parts. An object the data of what is drawn refers to (marked content's text, which Poppler reads, say) is
+part of that drawing: changing it changes the page's content, or the comment's appearance. A signature field
+added with an action on it or on its widget (one run when its page opens, say)
 is refused for the action, even where adding the field is allowed: the field is listed as added beside the refused
 action. Signing in a field counts as signing only when LimarePDF lists that signature, since nothing else checks it:
 one it doesn't list (in a field nested more than 32 levels deep, say, or on one of a field's widgets rather than the

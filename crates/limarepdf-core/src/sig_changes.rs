@@ -2139,12 +2139,17 @@ pub(crate) struct Reached {
     /// all taken as followed: it follows those in a dictionary there (an inline image's
     /// settings, marked content's).
     pub(crate) drawn: HashSet<ObjectId>,
+    /// Those references by the drawing they are read in, under its first stream.
+    pub(crate) drawings: Drawings,
     /// What they draw that LimarePDF can't decode, or past what [`DRAWN`] reads: what its
     /// data refers to isn't known.
     pub(crate) unread: BTreeSet<ObjectId>,
     /// The references kept from the drawings, as [`Within::refs`] counts them.
     kept: usize,
 }
+
+/// References read in the data of what is drawn, by drawing ([`Reached::drawings`]).
+pub(crate) type Drawings = HashMap<ObjectId, Vec<ObjectId>>;
 
 /// The references other apps may follow in `doc`: from its trailer's catalog and document
 /// information, on through every object they lead to, and on from the data of what they
@@ -2286,6 +2291,9 @@ fn draw(
     if data_references(&data, &breaks, &mut found, within.refs - out.kept) {
         out.kept += found.len();
         ids.extend(&found);
+        if let Some(first) = drawing.first().filter(|_| !found.is_empty()) {
+            out.drawings.entry(*first).or_default().extend(&found);
+        }
         out.drawn.extend(found);
     } else {
         out.unread.extend(&drawing);
@@ -2590,6 +2598,8 @@ struct Version<'a> {
     freed: &'a HashSet<u32>,
     /// The entries a later revision changes, which come first.
     newer: Option<&'a BTreeMap<u32, Entry>>,
+    /// The references in the data of what it draws, by drawing.
+    drawings: &'a Drawings,
 }
 
 impl Version<'_> {
@@ -2711,11 +2721,15 @@ fn compare_versions(
         return malformed("LimarePDF can't read object 0 reliably".into());
     }
     let newest = effective(between);
-    versions.load(a);
-    versions.load(b);
+    for end in [a, b] {
+        versions.load(end);
+        versions.read_drawings(end);
+    }
     // Only a later signed version can be missing, as a signature's own was read to check it
     // and the whole file is open; one not opened for the limits is past them.
-    let (Some(old_pdf), Some(new_pdf)) = (versions.peek(a), versions.peek(b)) else {
+    let (Some((old_pdf, old_drawings)), Some((new_pdf, new_drawings))) =
+        (versions.peek_drawn(a), versions.peek_drawn(b))
+    else {
         return malformed(if versions.allowed(a) && versions.allowed(b) {
             "LimarePDF can't read a later signed version".into()
         } else {
@@ -2727,11 +2741,13 @@ fn compare_versions(
         pdf: old_pdf,
         freed,
         newer: None,
+        drawings: old_drawings,
     };
     let new = Version {
         pdf: new_pdf,
         freed,
         newer: Some(&newest),
+        drawings: new_drawings,
     };
 
     // lopdf must read the same objects LimarePDF's reader finds.
@@ -3568,6 +3584,10 @@ impl Walker<'_, '_> {
                         None => {
                             let mut found = Vec::new();
                             self.refs(obj, kind, None, &mut found);
+                            // What the data of a drawing it starts refers to is part of it.
+                            for &r in v.drawings.get(&id).into_iter().flatten() {
+                                self.refs(&Object::Reference(r), kind, None, &mut found);
+                            }
                             (found, false)
                         }
                     };
@@ -5366,6 +5386,7 @@ mod tests {
             pdf: &p,
             freed: &HashSet::new(),
             newer: None,
+            drawings: &Drawings::new(),
         };
         let roles = Roles::build(&v).unwrap();
         assert_eq!(roles.fields[&g].name, "F1.F2.Y.G");
@@ -5380,6 +5401,7 @@ mod tests {
             pdf: p,
             freed: &HashSet::new(),
             newer: None,
+            drawings: &Drawings::new(),
         };
         let roles = Roles::build(&v).unwrap();
         let read = p.form_nodes();
@@ -5523,6 +5545,7 @@ mod tests {
             pdf: &p,
             freed: &HashSet::new(),
             newer: None,
+            drawings: &Drawings::new(),
         };
         let roles = Roles::build(&v).unwrap();
         let shows = [a, b, c].map(|id| roles.fields[&id].visible);

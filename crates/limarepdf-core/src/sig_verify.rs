@@ -8,7 +8,7 @@
 
 use crate::cms_check::{self, oid, Cert, CertInfo, DigestAlg, Fail, SignedData};
 use crate::forms::FieldKind;
-use crate::sig_changes::{self, Change};
+use crate::sig_changes::{self, Change, Drawings};
 use crate::trust::{self, Purpose, Trust, TrustList};
 use crate::{Pdf, Result};
 use chrono::{DateTime, FixedOffset, NaiveDate, Utc};
@@ -617,6 +617,8 @@ pub(crate) struct Versions<'a> {
     /// The whole file, already open.
     whole: &'a Pdf,
     cache: HashMap<usize, Option<Pdf>>,
+    /// The references in the data of what each open version draws, by drawing, once read.
+    drawings: HashMap<usize, Drawings>,
 }
 
 /// The most earlier versions opened while checking one file, and their combined size, so a
@@ -632,6 +634,7 @@ impl<'a> Versions<'a> {
             password,
             whole,
             cache: HashMap::new(),
+            drawings: HashMap::new(),
         }
     }
 
@@ -659,6 +662,23 @@ impl<'a> Versions<'a> {
             return Some(self.whole);
         }
         self.cache.get(&end)?.as_ref()
+    }
+
+    /// Reads the references in the data of what the version ending at `end` draws, if it is
+    /// open and they aren't read yet.
+    pub(crate) fn read_drawings(&mut self, end: usize) {
+        if !self.drawings.contains_key(&end) {
+            if let Some(pdf) = self.peek(end) {
+                let drawings = sig_changes::reached(&pdf.doc).drawings;
+                self.drawings.insert(end, drawings);
+            }
+        }
+    }
+
+    /// The version ending at `end` and the references in the data of what it draws, by
+    /// drawing, if it is open and they are read.
+    pub(crate) fn peek_drawn(&self, end: usize) -> Option<(&Pdf, &Drawings)> {
+        Some((self.peek(end)?, self.drawings.get(&end)?))
     }
 
     fn get(&mut self, end: usize) -> Option<&Pdf> {
