@@ -1359,11 +1359,12 @@ fn form_fill(io: &Io, set: &[String], values: &Option<PathBuf>, flatten: bool) -
         bail!("{XFA_ONLY}");
     }
     let fields = pdf.every_form_field();
-    let field = |name: &str| -> Result<&Field> {
-        fields
-            .iter()
-            .find(|f| f.name == name)
-            .with_context(|| format!("no form field named \"{name}\""))
+    let field = |name: &str| -> Result<Field> {
+        match fields.iter().find(|f| f.name == name) {
+            Some(f) => Ok(f.clone()),
+            // Says whether it may be past what is read of the form.
+            None => pdf.form_field(name),
+        }
     };
     let mut todo: Vec<(String, FieldValue)> = Vec::new();
     if let Some(path) = values {
@@ -1379,14 +1380,14 @@ fn form_fill(io: &Io, set: &[String], values: &Option<PathBuf>, flatten: bool) -
             );
         };
         for (name, v) in &map {
-            todo.push((name.clone(), value_from_json(field(name)?, v)?));
+            todo.push((name.clone(), value_from_json(&field(name)?, v)?));
         }
     }
     for s in set {
         let Some((name, v)) = s.split_once('=') else {
             bail!("--set takes NAME=VALUE, not \"{s}\"");
         };
-        todo.push((name.to_string(), value_from_text(field(name)?, v)?));
+        todo.push((name.to_string(), value_from_text(&field(name)?, v)?));
     }
     if todo.is_empty() {
         bail!("nothing to fill in: give --set NAME=VALUE or --values FILE");

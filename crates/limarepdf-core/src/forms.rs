@@ -280,6 +280,26 @@ impl Pdf {
         self.form_nodes().into_iter().map(|(f, _)| f).collect()
     }
 
+    /// The field named `name`, among every field of the form. When it isn't among them and
+    /// the walk took all its steps before the end, it may be among the fields after: refused
+    /// ([`crate::TooComplex`]).
+    pub fn form_field(&self, name: &str) -> anyhow::Result<Field> {
+        self.named_node(name).map(|(f, _)| f)
+    }
+
+    /// The field named `name` and its node, as [`Pdf::form_field`] finds it.
+    pub(crate) fn named_node(&self, name: &str) -> anyhow::Result<(Field, Node)> {
+        let (all, left_out) = self.field_nodes(Reach::Every);
+        let Some(found) = all.into_iter().find(|(f, _)| f.name == name) else {
+            // It may be among those left out.
+            if left_out == Some(LeftOut::Large) {
+                return Err(too_large().into());
+            }
+            anyhow::bail!("no form field named \"{name}\"");
+        };
+        Ok(found)
+    }
+
     /// How many signature fields hold a signature, those past what a walk of the form reads
     /// too. Any full rewrite, such as [`Pdf::save`], makes those signatures invalid.
     pub fn signature_count(&self) -> usize {

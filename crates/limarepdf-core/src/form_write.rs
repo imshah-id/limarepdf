@@ -100,14 +100,7 @@ impl Pdf {
     /// shaped scripts, emoji of several characters, characters no installed font has) is
     /// refused rather than saved wrongly.
     pub fn set_field(&mut self, name: &str, value: FieldValue) -> Result<()> {
-        let (all, left_out) = self.field_nodes(Reach::Every);
-        let Some((field, node)) = all.into_iter().find(|(f, _)| f.name == name) else {
-            // It may be among those left out.
-            if left_out == Some(LeftOut::Large) {
-                return Err(forms::too_large().into());
-            }
-            bail!("no form field named \"{name}\"");
-        };
+        let (field, node) = self.named_node(name)?;
         if field.read_only {
             bail!("the field \"{name}\" is read-only");
         }
