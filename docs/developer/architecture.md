@@ -80,8 +80,10 @@ hold their parents' names and inherit what they give (`Inherited` borrows it fro
 option list given once was held by every kid: 700 kids of one `/DV` held 129 MB, and a title stream decoding to 256
 MiB was held by each. Once the steps are taken the walk stops, the fields after are left out (`LeftOut::Large`,
 over `LeftOut::Deep`), and flattening, reset, removing values (and so `check_remove_hidden` and `find_hidden`),
-redaction (its report looks in every field) and setting or finding a field the walk may have left out (`named_node`:
-`set_field`, and `form_field`, which `form fill` asks for a name it didn't list) refuse with a `TooComplex`.
+redaction (its report looks in every field), setting or finding a field the walk may have left out (`named_node`:
+`set_field`, and `form_field`, which `form fill` asks for a name it didn't list), and checking signatures and
+signing, where signatures may be among the fields left out (`whole_form`: `verify_signatures`, so saving on top of a
+signed file too, and signing's own walks), refuse with a `TooComplex`.
 Flattening and reset refuse fields left out for being nested too deep (`LeftOut::Deep`) too, and removing values
 stops at them (`value_nodes`). Telling a signed file apart (`signature_count`, `has_signature_fields`: whether
 `limarepdf-cli` may save it whole, whether the app keeps its bytes) looks past a walk cut short for signature

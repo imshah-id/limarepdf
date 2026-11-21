@@ -364,6 +364,16 @@ impl Pdf {
         self.field_nodes(Reach::Every).0
     }
 
+    /// Every field with where it is in the file, for what must see every one, such as
+    /// signatures: refused ([`crate::TooComplex`]) when the walk took all its steps before
+    /// the end, where the fields after are left out.
+    pub(crate) fn whole_form(&self) -> anyhow::Result<Vec<(Field, Node)>> {
+        match self.field_nodes(Reach::Every) {
+            (_, Some(LeftOut::Large)) => Err(too_large().into()),
+            (all, _) => Ok(all),
+        }
+    }
+
     /// The fields LimarePDF lists ([`Pdf::form_fields`]) with where each is in the file:
     /// for showing them.
     pub(crate) fn listed_nodes(&self) -> Vec<(Field, Node)> {

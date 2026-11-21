@@ -764,6 +764,10 @@ The full record, with the files used, is in [Testing](developer/testing.md#digit
   sharing 500 of them of ten objects each is enough there; an object shared by many pages costs each page after the
   first a step for each of its references that page reached already, so a hundred pages sharing resources of 100
   objects that each refer to the same 500 others is enough as well. Ordinary documents come nowhere near these.
+- A form whose fields hold more than LimarePDF reads of a form (their names, values and options taking tens of
+  megabytes, as no real form's do) may have signatures among the fields not read, so its signatures can't be
+  checked ("reading the form's fields would take more than 67108864 steps"), and it can't be signed, or saved
+  without writing the whole file.
 - Files that PDF apps read differently (something uses a part the file deletes or doesn't list, or the file is
   damaged) are shown as the PDF standard says, which other apps may not do. Their signatures show *can't check*
   even where another app calls them valid, and LimarePDF signs such a file only by writing it out in full first, which it

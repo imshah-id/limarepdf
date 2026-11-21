@@ -7,7 +7,7 @@
 //! value must sit inside that version's signature dictionary.
 
 use crate::cms_check::{self, oid, Cert, CertInfo, DigestAlg, Fail, SignedData};
-use crate::forms::FieldKind;
+use crate::forms::{FieldKind, Node};
 use crate::sig_changes::{self, Change, Drawings};
 use crate::trust::{self, Purpose, Trust, TrustList};
 use crate::{Pdf, Result};
@@ -480,17 +480,19 @@ impl fmt::Display for Permissions {
 
 /// Checks every digital signature in `bytes` (a whole PDF file), and whether `trust`
 /// vouches for each signer. `password` opens an encrypted file. Fails only when the file
-/// can't be opened at all; each signature's problems are in its
-/// [`DigitalSignature::status`].
+/// can't be opened at all, or its form holds more than is read of one, where signatures may
+/// be among the fields left out ([`crate::TooComplex`]); each signature's problems are in
+/// its [`DigitalSignature::status`].
 pub fn verify_signatures(
     bytes: &[u8],
     password: Option<&str>,
     trust: &TrustList,
 ) -> Result<SignatureReport> {
     let pdf = Pdf::from_bytes(bytes, password)?;
+    let nodes = pdf.whole_form()?;
     let mut groups: Vec<(Place, Vec<(crate::Field, ObjectId)>)> = Vec::new();
     let mut empty_fields = Vec::new();
-    for (field, node) in pdf.form_nodes() {
+    for (field, node) in &nodes {
         if field.kind != FieldKind::Signature {
             continue;
         }
@@ -504,7 +506,7 @@ pub fn verify_signatures(
                         .and_then(|l| field_lock(&pdf, l)),
                     page: w.map(|w| w.page),
                     bbox: w.map(|w| w.bbox),
-                    name: field.name,
+                    name: field.name.clone(),
                 });
                 continue;
             }
@@ -512,9 +514,10 @@ pub fn verify_signatures(
             Some(Object::Dictionary(_)) => Place::Direct(node.id),
             Some(_) => Place::NotADictionary(node.id),
         };
+        let field = (field.clone(), node.id);
         match groups.iter_mut().find(|(p, _)| *p == place) {
-            Some((_, fields)) => fields.push((field, node.id)),
-            None => groups.push((place, vec![(field, node.id)])),
+            Some((_, fields)) => fields.push(field),
+            None => groups.push((place, vec![field])),
         }
     }
     // A field signed after a signature counts as signing only if it's listed here.
@@ -530,7 +533,7 @@ pub fn verify_signatures(
         Some([_, _, c, d]) => (false, c + d),
         None => (true, 0),
     });
-    certification_rules(&pdf, &mut signatures);
+    certification_rules(&pdf, &nodes, &mut signatures);
 
     // What changed after each signature. Any certification limits every signature's
     // later changes; when more than one claims to certify, the strictest counts.
@@ -1417,8 +1420,8 @@ fn lock_from(pdf: &Pdf, d: &Dictionary) -> Option<FieldLock> {
 }
 
 /// Certification rules across signatures: it must be the first signature, and the
-/// document's `/Perms /DocMDP` must point to it.
-fn certification_rules(pdf: &Pdf, sigs: &mut [DigitalSignature]) {
+/// document's `/Perms /DocMDP` must point to it. `nodes` are the form's fields.
+fn certification_rules(pdf: &Pdf, nodes: &[(crate::Field, Node)], sigs: &mut [DigitalSignature]) {
     let registered = pdf
         .doc
         .catalog()
@@ -1430,8 +1433,8 @@ fn certification_rules(pdf: &Pdf, sigs: &mut [DigitalSignature]) {
         .and_then(|o| o.as_reference().ok());
     let registered_fields: Vec<String> = registered
         .map(|id| {
-            pdf.form_nodes()
-                .into_iter()
+            nodes
+                .iter()
                 .filter(|(_, n)| {
                     pdf.doc
                         .get_dictionary(n.id)
@@ -1440,7 +1443,7 @@ fn certification_rules(pdf: &Pdf, sigs: &mut [DigitalSignature]) {
                         .and_then(|v| v.as_reference().ok())
                         == Some(id)
                 })
-                .map(|(f, _)| f.name)
+                .map(|(f, _)| f.name.clone())
                 .collect()
         })
         .unwrap_or_default();
