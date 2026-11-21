@@ -5,6 +5,7 @@
 
 use crate::budget::{self, TooComplex, Work};
 use crate::fonts::FontCtx;
+use crate::forms::{self, LeftOut, Reach};
 use crate::inline::Inline;
 use crate::reach;
 use crate::retained::{unread_said, Removed, Retained};
@@ -826,7 +827,8 @@ type Read = std::result::Result<(Vec<u8>, bool), Unread>;
 impl Pdf {
     /// What [`Pdf::remove_hidden`] would remove of every kind, worked out on a copy. Hidden
     /// layers and content outside the crop box are counted even when their removal would be
-    /// refused.
+    /// refused. Fails when a form's values can't all be found: its fields nested too deep, or
+    /// holding more than LimarePDF reads of a form ([`crate::TooComplex`]).
     pub fn find_hidden(&self) -> Result<HiddenReport> {
         self.clone().remove_kinds(&Hidden::ALL, false)
     }
@@ -836,7 +838,8 @@ impl Pdf {
     /// Refuses, with nothing changed, when it couldn't remove all of a kind: hidden layers
     /// in drawings it can't read or too complex to follow, a layer rule it can't read, something
     /// only hidden layers drew that the file still keeps another way (the tag tree, say), a
-    /// form nested too deep, content outside the crop box redaction's check finds left.
+    /// form nested too deep or holding more than LimarePDF reads of a form
+    /// ([`crate::TooComplex`]), content outside the crop box redaction's check finds left.
     pub fn remove_hidden(&mut self, what: &[Hidden]) -> Result<HiddenReport> {
         self.atomically(|p| p.remove_kinds(what, true))
     }
@@ -857,6 +860,9 @@ impl Pdf {
         }
         if what.contains(&Hidden::FormValues) {
             self.orphan_widgets(&self.value_nodes()?)?;
+            if self.field_nodes(Reach::Every).1 == Some(LeftOut::Large) {
+                return Err(forms::too_large().into());
+            }
         }
         Ok(())
     }

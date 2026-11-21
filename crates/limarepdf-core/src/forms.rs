@@ -1,16 +1,29 @@
 //! Interactive forms (AcroForm): the fields, their values and where their widgets are.
 
-use crate::doc::{decode_shown_text, decode_text};
+use crate::budget::{TooComplex, Work};
+use crate::doc::decode_text;
 use crate::form_write::parse_da;
 use crate::matrix::{self as mx, M};
 use crate::{Align, FontChoice, Pdf};
 use lopdf::{Dictionary, Object, ObjectId};
 use std::collections::{HashMap, HashSet};
+use std::convert::Infallible;
 use std::rc::Rc;
 
 /// Limits that keep a malformed or hostile file from running away.
 const MAX_FIELDS: usize = 10_000;
 pub(crate) const MAX_DEPTH: usize = 32;
+
+/// What reading the form's fields is called when its budget refuses it.
+const READING: &str = "reading the form's fields";
+/// The steps a walk of the field tree may take ([`Pdf::field_nodes`]): one for each node,
+/// kid, widget and option looked at, and one for each byte read and each byte the fields it
+/// gives hold (names, values, options, tooltips and what writing values needs). Kids hold
+/// what their parents give them and can share what they refer to, which each holds again, so
+/// the steps count everything held, however often. 2²⁶: 532 times the most the corpus's
+/// forms take (126,118, `pdfjs/issue16081.pdf`, 240 fields), walked to the limit in at most
+/// 0.07 s (architecture.md, "Forms").
+const READ_STEPS: u64 = 1 << 26;
 
 // Field flags (`/Ff`), as bit masks.
 const READ_ONLY: i64 = 1;
@@ -121,16 +134,16 @@ impl Widget {
     }
 }
 
-/// Values inherited from parent fields.
-#[derive(Clone, Default)]
-struct Inherited {
-    ft: Option<Vec<u8>>,
+/// Values inherited from parent fields, as the file has them.
+#[derive(Clone, Copy, Default)]
+struct Inherited<'a> {
+    ft: Option<&'a [u8]>,
     ff: i64,
-    v: Option<Object>,
-    dv: Option<Object>,
+    v: Option<&'a Object>,
+    dv: Option<&'a Object>,
     max_len: Option<usize>,
-    opt: Option<Object>,
-    da: Option<Vec<u8>>,
+    opt: Option<&'a Object>,
+    da: Option<&'a [u8]>,
     q: Option<i64>,
 }
 
@@ -138,7 +151,7 @@ struct Inherited {
 /// is no field.
 fn field_kind(inh: &Inherited) -> Option<FieldKind> {
     let ff = inh.ff;
-    Some(match inh.ft.as_deref()? {
+    Some(match inh.ft? {
         b"Tx" => FieldKind::Text {
             multiline: ff & MULTILINE != 0,
             password: ff & PASSWORD != 0,
@@ -180,6 +193,24 @@ pub(crate) struct Node {
     pub opt: Vec<(String, String)>,
 }
 
+/// Why a walk left fields out; the second when both.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub(crate) enum LeftOut {
+    /// They are nested more than [`MAX_DEPTH`] deep.
+    Deep,
+    /// The walk took all its steps ([`READ_STEPS`]) before them, and stopped.
+    Large,
+}
+
+/// The refusal for an operation that would miss fields left out past what a walk may read
+/// ([`LeftOut::Large`]).
+pub(crate) fn too_large() -> TooComplex {
+    TooComplex {
+        what: READING,
+        limit: READ_STEPS,
+    }
+}
+
 /// How much of the field tree a walk takes.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Reach {
@@ -203,12 +234,20 @@ struct Walk {
     out: Vec<(Field, Node)>,
     /// How many fields the walk takes.
     limit: usize,
-    /// Whether a field was left out for being nested more than [`MAX_DEPTH`] deep.
-    too_deep: bool,
+    /// Why fields were left out, if any were.
+    left_out: Option<LeftOut>,
+    /// The steps the walk may still take.
+    work: Work,
     /// Each `/Kids` array object reached, by its object.
     kids: HashMap<ObjectId, Kids>,
     /// The widgets fields have taken.
     claimed: HashSet<ObjectId>,
+}
+
+impl Walk {
+    fn leave_out(&mut self, why: LeftOut) {
+        self.left_out = self.left_out.max(Some(why));
+    }
 }
 
 /// A node's kids, told apart.
@@ -234,7 +273,9 @@ impl Pdf {
     }
 
     /// Every field of the form, without [`Pdf::form_fields`]' limit: for finding a field by
-    /// name and for what has to know of each one.
+    /// name and for what has to know of each one. Those after the walk took the steps it
+    /// has for reading a form are left out (2²⁶, more than any real form takes), as are
+    /// fields nested more than 32 deep.
     pub fn every_form_field(&self) -> Vec<Field> {
         self.form_nodes().into_iter().map(|(f, _)| f).collect()
     }
@@ -286,14 +327,24 @@ impl Pdf {
         self.field_nodes(Reach::Listed).0
     }
 
-    /// The fields with where each is in the file, as far as `reach` goes, and whether some
-    /// were left out for being nested more than [`MAX_DEPTH`] deep.
-    pub(crate) fn field_nodes(&self, reach: Reach) -> (Vec<(Field, Node)>, bool) {
+    /// The fields with where each is in the file, as far as `reach` goes, and why some were
+    /// left out, if any were: for being nested more than [`MAX_DEPTH`] deep, or for coming
+    /// after the walk took all its steps ([`READ_STEPS`]), where it stops.
+    pub(crate) fn field_nodes(&self, reach: Reach) -> (Vec<(Field, Node)>, Option<LeftOut>) {
+        self.field_nodes_within(reach, READ_STEPS)
+    }
+
+    /// [`Pdf::field_nodes`], walked within `steps`.
+    fn field_nodes_within(
+        &self,
+        reach: Reach,
+        steps: u64,
+    ) -> (Vec<(Field, Node)>, Option<LeftOut>) {
         let Some(form) = self.acro_form() else {
-            return (Vec::new(), false);
+            return (Vec::new(), None);
         };
         let top = Inherited {
-            da: form.get(b"DA").ok().and_then(|o| self.string_bytes(o)),
+            da: form.get(b"DA").ok().and_then(|o| self.string_slice(o)),
             q: form.get(b"Q").ok().and_then(|o| self.int_value(o)),
             ..Inherited::default()
         };
@@ -303,7 +354,7 @@ impl Pdf {
             .and_then(|o| self.doc.dereference(o).ok())
             .and_then(|(_, o)| o.as_array().ok())
         else {
-            return (Vec::new(), false);
+            return (Vec::new(), None);
         };
         let mut walk = Walk {
             pages: self.annot_pages(),
@@ -315,16 +366,24 @@ impl Pdf {
                 Reach::Listed => MAX_FIELDS,
                 Reach::Every => usize::MAX,
             },
-            too_deep: false,
+            left_out: None,
+            // Many operations walk the fields on their way; a test's limit for theirs
+            // leaves the walk's out.
+            work: Work::unkept(READING, steps),
             kids: HashMap::new(),
             claimed: HashSet::new(),
         };
         for f in fields {
             if let Ok(id) = f.as_reference() {
-                self.walk_field(id, "", &top, 0, &mut walk);
+                if self.walk_field(id, "", &top, 0, &mut walk).is_err() {
+                    walk.leave_out(LeftOut::Large);
+                    break;
+                }
             }
         }
-        (walk.out, walk.too_deep)
+        #[cfg(test)]
+        tests::TOOK.set(walk.work.taken());
+        (walk.out, walk.left_out)
     }
 
     /// Every node of the field tree, fields and widgets, each once, with whether it belongs to
@@ -450,47 +509,62 @@ impl Pdf {
             .collect()
     }
 
-    fn walk_field(&self, id: ObjectId, parent: &str, inh: &Inherited, depth: usize, w: &mut Walk) {
+    /// Walk node `id` of the field tree, `depth` below the top, and the nodes it lists,
+    /// naming them after `parent` and with what they inherit from `inh`. Refused, the walk
+    /// to stop, once its steps are taken.
+    fn walk_field<'a>(
+        &'a self,
+        id: ObjectId,
+        parent: &str,
+        inh: &Inherited<'a>,
+        depth: usize,
+        w: &mut Walk,
+    ) -> Result<(), TooComplex> {
         #[cfg(test)]
         tests::LOOKED.set(tests::LOOKED.get() + 1);
+        w.work.take(1)?;
         if depth > MAX_DEPTH {
-            w.too_deep |= self.doc.get_dictionary(id).is_ok();
-            return;
+            if self.doc.get_dictionary(id).is_ok() {
+                w.leave_out(LeftOut::Deep);
+            }
+            return Ok(());
         }
         if w.out.len() >= w.limit || w.seen.contains(&id) {
-            return;
+            return Ok(());
         }
         let Ok(d) = self.doc.get_dictionary(id) else {
-            return;
+            return Ok(());
         };
         // A node reached first with no kind, as a kid of a node of no kind, is walked again
         // should a node with a kind list it: its kid fields are then that node's.
         let ft = d.get(b"FT").ok().and_then(|o| self.name_value(o));
-        let typed = of_a_kind(ft.or(inh.ft.as_deref()));
+        let typed = of_a_kind(ft.or(inh.ft));
         if typed {
             w.seen.insert(id);
         } else if !w.untyped.insert(id) {
-            return;
+            return Ok(());
         }
-        let name = match d.get(b"T").ok().and_then(|o| self.text_value(o)) {
+        // Each kid holds its parents' names, and what they give it below.
+        let name = match self.text_charged(d.get(b"T").ok(), false, &mut w.work)? {
             Some(t) if parent.is_empty() => t,
             Some(t) => format!("{parent}.{t}"),
             None => parent.to_string(),
         };
-        let mut inh = inh.clone();
-        if let Some(ft) = ft {
-            inh.ft = Some(ft.to_vec());
+        w.work.take(name.len() as u64)?;
+        let mut inh = *inh;
+        if ft.is_some() {
+            inh.ft = ft;
         }
         if let Some(ff) = d.get(b"Ff").ok().and_then(|o| self.int_value(o)) {
             inh.ff = ff;
         }
         if let Ok(v) = d.get(b"V") {
-            inh.v = Some(v.clone());
+            inh.v = Some(v);
         }
         if let Ok(dv) = d.get(b"DV") {
-            inh.dv = Some(dv.clone());
+            inh.dv = Some(dv);
         }
-        if let Some(da) = d.get(b"DA").ok().and_then(|o| self.string_bytes(o)) {
+        if let Some(da) = d.get(b"DA").ok().and_then(|o| self.string_slice(o)) {
             inh.da = Some(da);
         }
         if let Some(q) = d.get(b"Q").ok().and_then(|o| self.int_value(o)) {
@@ -500,7 +574,7 @@ impl Pdf {
             inh.max_len = usize::try_from(n).ok();
         }
         if let Ok(opt) = d.get(b"Opt") {
-            inh.opt = Some(opt.clone());
+            inh.opt = Some(opt);
         }
 
         // A `/Kids` array object that more than one node lists, as no well-made form has, is
@@ -513,7 +587,11 @@ impl Pdf {
         let list = d.get(b"Kids").and_then(|o| o.as_reference()).ok();
         let kids = match list.and_then(|l| w.kids.get(&l)) {
             Some(k) => k.clone(),
-            None => self.kids_of(d),
+            None => {
+                let k = self.kids_of(d);
+                w.work.take((k.fields.len() + k.widgets.len()) as u64)?;
+                k
+            }
         };
         let taken = kids.taken.is_some_and(|t| t <= depth)
             || !typed && kids.looked.is_some_and(|t| t <= depth);
@@ -529,10 +607,12 @@ impl Pdf {
         if !kids.fields.is_empty() {
             if taken {
                 // Each was walked, or left out as too deep, from there.
-                w.too_deep |= depth + 1 > MAX_DEPTH;
+                if depth + 1 > MAX_DEPTH {
+                    w.leave_out(LeftOut::Deep);
+                }
             } else {
                 for &k in kids.fields.iter() {
-                    self.walk_field(k, &name, &inh, depth + 1, w);
+                    self.walk_field(k, &name, &inh, depth + 1, w)?;
                 }
                 if typed {
                     take(w);
@@ -540,7 +620,7 @@ impl Pdf {
                     w.kids.entry(l).or_insert(kids).looked = Some(depth);
                 }
             }
-            return;
+            return Ok(());
         }
         // A node of no kind is no field: it takes neither its list nor its widgets, but keeps
         // the list told apart for the next node listing it.
@@ -548,7 +628,7 @@ impl Pdf {
             if let Some(l) = list {
                 w.kids.entry(l).or_insert(kids);
             }
-            return;
+            return Ok(());
         };
         take(w);
         // A widget that more than one field lists, as no well-made form has, goes to the
@@ -566,16 +646,25 @@ impl Pdf {
             });
             ws
         };
-        let field = self.make_field(name, d, kind, &inh, &widgets, w);
+        let opt = match inh.opt {
+            Some(o) => self.options_charged(o, &mut w.work)?,
+            None => Vec::new(),
+        };
+        // `/DA` is kept, and read again for the field's text size and font.
+        let da = inh.da.map_or(0, <[u8]>::len) as u64;
+        let dv = inh.dv.map_or(0, crate::repair::copy_size) as u64;
+        w.work.take(3 * da + dv)?;
+        let field = self.make_field(name, d, kind, &inh, &opt, &widgets, w)?;
         let node = Node {
             id,
             widgets,
-            da: inh.da,
+            da: inh.da.map(<[u8]>::to_vec),
             q: inh.q.unwrap_or(0),
-            dv: inh.dv,
-            opt: inh.opt.map(|o| self.options(&o)).unwrap_or_default(),
+            dv: inh.dv.cloned(),
+            opt,
         };
         w.out.push((field, node));
+        Ok(())
     }
 
     /// The kids a field tree node `d` lists: those with a name, or with no `/Rect`, are
@@ -603,57 +692,77 @@ impl Pdf {
         }
     }
 
-    /// A terminal field of `kind` from its dictionary, what it inherits and its widgets.
+    /// A terminal field of `kind` from its dictionary, what it inherits, its options and its
+    /// widgets, charged to the walk `w`.
+    #[allow(clippy::too_many_arguments)]
     fn make_field(
         &self,
         name: String,
         d: &Dictionary,
         kind: FieldKind,
         inh: &Inherited,
+        opt: &[(String, String)],
         widgets: &[ObjectId],
         w: &mut Walk,
-    ) -> Field {
+    ) -> Result<Field, TooComplex> {
         let ff = inh.ff;
-        let opt = inh
-            .opt
-            .as_ref()
-            .map(|o| self.options(o))
-            .unwrap_or_default();
+        // Each widget's "on" state is kept, and read again for the value and options.
+        for &id in widgets {
+            let on = self.on_state_name(id).map_or(0, <[u8]>::len);
+            w.work.take(1 + 3 * on as u64)?;
+        }
         let mut ws: Vec<Widget> = widgets
             .iter()
             .filter_map(|&id| self.widget(id, w))
             .collect();
         for wd in &mut ws {
-            wd.export = wd.on_state.as_deref().map(|s| button_export(s, &opt));
+            wd.export = wd.on_state.as_deref().map(|s| button_export(s, opt));
+            let export = wd.export.as_ref().map_or(0, String::len);
+            w.work.take(export as u64)?;
             wd.align = Align::of_q(self.widget_q(wd.id, inh.q.unwrap_or(0)));
         }
-        let value = self.value_of(&kind, inh.v.as_ref(), &opt, widgets);
+        let text = &mut |o: &Object| self.text_charged(Some(o), false, &mut w.work);
+        let value = self.value_with(&kind, inh.v, opt, widgets, text)?;
+        w.work.take(match &value {
+            FieldValue::Text(t) => t.len() as u64,
+            FieldValue::Choice(c) => c.iter().map(|c| c.len() as u64).sum(),
+            FieldValue::Check(_) | FieldValue::None => 0,
+        })?;
         let options = match &kind {
             FieldKind::Check | FieldKind::Radio => {
                 let mut options: Vec<(String, String)> = Vec::new();
                 for s in widgets.iter().filter_map(|&id| self.on_state(id)) {
-                    let e = button_export(&s, &opt);
+                    let e = button_export(&s, opt);
+                    w.work.take((options.len() + e.len()) as u64)?;
                     if !options.iter().any(|o| o.0 == e) {
+                        w.work.take(e.len() as u64)?;
                         options.push((e.clone(), e));
                     }
                 }
                 options
             }
-            FieldKind::Choice { .. } => opt,
+            FieldKind::Choice { .. } => {
+                let pairs = opt.iter().map(|(e, t)| e.len() + t.len()).sum::<usize>();
+                w.work.take(pairs as u64)?;
+                opt.to_vec()
+            }
             _ => Vec::new(),
         };
-        Field {
+        let tooltip = self.text_charged(d.get(b"TU").ok(), true, &mut w.work)?;
+        let shown = tooltip.as_ref().map_or(0, String::len);
+        w.work.take(shown as u64)?;
+        Ok(Field {
             name,
             kind,
             value,
             options,
             read_only: ff & READ_ONLY != 0,
             required: ff & REQUIRED != 0,
-            tooltip: d.get(b"TU").ok().and_then(|o| self.shown_text_value(o)),
-            text_size: inh.da.as_deref().map_or(0.0, |da| parse_da(da).1),
-            font: self.da_font(inh.da.as_deref()),
+            tooltip,
+            text_size: inh.da.map_or(0.0, |da| parse_da(da).1),
+            font: self.da_font(inh.da),
             widgets: ws,
-        }
+        })
     }
 
     /// The font a value is set in for the `/DA` `da` when the font it names can't be used
@@ -705,16 +814,35 @@ impl Pdf {
         opt: &[(String, String)],
         widgets: &[ObjectId],
     ) -> FieldValue {
-        match kind {
+        let text = &mut |o: &Object| Ok::<_, Infallible>(self.text_value(o));
+        let Ok(value) = self.value_with(kind, v, opt, widgets, text);
+        value
+    }
+
+    /// [`Pdf::value_of`], with `text` reading each text in the value as [`Pdf::text_value`]
+    /// does (and names too), or refusing to.
+    fn value_with<E>(
+        &self,
+        kind: &FieldKind,
+        v: Option<&Object>,
+        opt: &[(String, String)],
+        widgets: &[ObjectId],
+        text: &mut impl FnMut(&Object) -> Result<Option<String>, E>,
+    ) -> Result<FieldValue, E> {
+        Ok(match kind {
             FieldKind::Text { .. } => {
-                FieldValue::Text(v.and_then(|o| self.text_value(o)).unwrap_or_default())
+                let t = match v {
+                    Some(o) => text(o)?,
+                    None => None,
+                };
+                FieldValue::Text(t.unwrap_or_default())
             }
             FieldKind::Check | FieldKind::Radio => {
-                let on = v
-                    .and_then(|o| self.doc.dereference(o).ok())
-                    .and_then(|(_, o)| o.as_name().ok())
-                    .map(|n| String::from_utf8_lossy(n).into_owned())
-                    .filter(|n| n != "Off");
+                let on = match v.and_then(|o| self.doc.dereference(o).ok()) {
+                    Some((_, o @ Object::Name(_))) => text(o)?,
+                    _ => None,
+                };
+                let on = on.filter(|n| n != "Off");
                 // A checkbox is ticked only when its value is one of its widgets' states
                 // (or, when they have no drawings to name states, when it isn't Off).
                 if *kind == FieldKind::Check {
@@ -729,20 +857,27 @@ impl Pdf {
             FieldKind::Choice { .. } => {
                 let chosen = match v.map(|o| self.doc.dereference(o).map(|x| x.1)) {
                     Some(Ok(Object::Array(a))) => {
-                        a.iter().filter_map(|o| self.text_value(o)).collect()
+                        let each = a.iter().filter_map(|o| text(o).transpose());
+                        each.collect::<Result<_, _>>()?
                     }
-                    Some(Ok(o)) => self.text_value(o).into_iter().collect(),
+                    Some(Ok(o)) => text(o)?.into_iter().collect(),
                     _ => Vec::new(),
                 };
                 FieldValue::Choice(chosen)
             }
             FieldKind::Button | FieldKind::Signature => FieldValue::None,
-        }
+        })
     }
 
     /// A checkbox or radio widget's "on" state: the name in its normal appearance other
     /// than `Off`.
     pub(crate) fn on_state(&self, widget: ObjectId) -> Option<String> {
+        let name = self.on_state_name(widget)?;
+        Some(String::from_utf8_lossy(name).into_owned())
+    }
+
+    /// [`Pdf::on_state`], as the file has it.
+    fn on_state_name(&self, widget: ObjectId) -> Option<&[u8]> {
         self.doc
             .get_dictionary(widget)
             .ok()?
@@ -753,37 +888,55 @@ impl Pdf {
             .and_then(|ap| ap.get(b"N").ok())
             .and_then(|o| self.doc.dereference(o).ok())
             .and_then(|(_, o)| o.as_dict().ok())
-            .and_then(|n| {
-                n.iter()
-                    .map(|(k, _)| k)
-                    .find(|k| k.as_slice() != b"Off")
-                    .map(|k| String::from_utf8_lossy(k).into_owned())
-            })
+            .and_then(|n| n.iter().map(|(k, _)| k.as_slice()).find(|&k| k != b"Off"))
     }
 
     /// A choice field's `/Opt`: each entry a string, or an [export value, text shown]
-    /// pair.
-    fn options(&self, opt: &Object) -> Vec<(String, String)> {
+    /// pair; the first [`MAX_FIELDS`]. Charged to `work` a step for each entry looked at and
+    /// each byte read ([`Pdf::text_charged`]) and kept.
+    fn options_charged(
+        &self,
+        opt: &Object,
+        work: &mut Work,
+    ) -> Result<Vec<(String, String)>, TooComplex> {
         let Some(a) = self
             .doc
             .dereference(opt)
             .ok()
             .and_then(|(_, o)| o.as_array().ok())
         else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
-        a.iter()
-            .filter_map(|o| match self.doc.dereference(o).ok()?.1 {
+        let mut out = Vec::new();
+        for o in a {
+            if out.len() == MAX_FIELDS {
+                break;
+            }
+            work.take(1)?;
+            let Ok((_, o)) = self.doc.dereference(o) else {
+                continue;
+            };
+            let pair = match o {
                 Object::Array(pair) if pair.len() >= 2 => {
-                    Some((self.text_value(&pair[0])?, self.text_value(&pair[1])?))
+                    let Some(e) = self.text_charged(Some(&pair[0]), false, work)? else {
+                        continue;
+                    };
+                    let Some(t) = self.text_charged(Some(&pair[1]), false, work)? else {
+                        continue;
+                    };
+                    (e, t)
                 }
                 o => {
-                    let t = self.text_value(o)?;
-                    Some((t.clone(), t))
+                    let Some(t) = self.text_charged(Some(o), false, work)? else {
+                        continue;
+                    };
+                    (t.clone(), t)
                 }
-            })
-            .take(MAX_FIELDS)
-            .collect()
+            };
+            work.take((pair.0.len() + pair.1.len()) as u64)?;
+            out.push(pair);
+        }
+        Ok(out)
     }
 
     /// A text string (or a name, as some files write), decoded.
@@ -799,15 +952,6 @@ impl Pdf {
         }
     }
 
-    /// [`Pdf::text_value`] for text that is only shown, never used to find something
-    /// ([`decode_shown_text`]).
-    pub(crate) fn shown_text_value(&self, o: &Object) -> Option<String> {
-        match self.doc.dereference(o).ok()?.1 {
-            Object::String(s, _) => Some(decode_shown_text(s)),
-            _ => self.text_value(o),
-        }
-    }
-
     pub(crate) fn int_value(&self, o: &Object) -> Option<i64> {
         self.doc.dereference(o).ok()?.1.as_i64().ok()
     }
@@ -818,8 +962,13 @@ impl Pdf {
 
     /// A string's raw bytes.
     pub(crate) fn string_bytes(&self, o: &Object) -> Option<Vec<u8>> {
+        self.string_slice(o).map(<[u8]>::to_vec)
+    }
+
+    /// [`Pdf::string_bytes`], as the file has them.
+    fn string_slice<'a>(&'a self, o: &'a Object) -> Option<&'a [u8]> {
         match self.doc.dereference(o).ok()?.1 {
-            Object::String(s, _) => Some(s.clone()),
+            Object::String(s, _) => Some(s),
             _ => None,
         }
     }
@@ -838,13 +987,69 @@ pub(crate) fn button_export(state: &str, opt: &[(String, String)]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use lopdf::dictionary;
+    use lopdf::{dictionary, Stream};
     use std::cell::Cell;
 
     thread_local! {
         /// Field tree entries looked at on this thread: nodes walked, kids told apart and
         /// widgets read.
         pub(super) static LOOKED: Cell<usize> = const { Cell::new(0) };
+        /// The steps the last walk on this thread took.
+        pub(super) static TOOK: Cell<u64> = const { Cell::new(0) };
+    }
+
+    #[test]
+    fn a_walk_takes_the_steps_it_charges_and_stops_past_them() {
+        // p (a text field, /DA "/Helv 0 Tf") lists a, a text field with a value and a
+        // tooltip; b, a choice with options and a default value; and c, a checkbox with two
+        // widgets on the page.
+        let mut p = Pdf::new();
+        p.insert_blank(0, 300.0, 200.0).unwrap();
+        let on = || -> Dictionary {
+            let n = dictionary! { "Off" => Object::Null, "On" => Object::Null };
+            let mut w = widget();
+            w.set("AP", dictionary! { "N" => n });
+            w
+        };
+        let ws = [p.doc.add_object(on()), p.doc.add_object(on())];
+        let annots: Vec<Object> = ws.iter().map(|&w| w.into()).collect();
+        let page = p.doc.get_dictionary_mut(p.page_ids()[0]).unwrap();
+        page.set("Annots", annots.clone());
+        let s = Object::string_literal;
+        let a = dictionary! { "T" => s("a"), "V" => s("va"), "TU" => s("tip") };
+        let opt = vec![s("x"), vec![s("e"), s("shown")].into()];
+        let b = dictionary! {
+            "FT" => "Ch", "T" => s("b"), "Opt" => opt, "DV" => s("x"), "V" => s("e"),
+        };
+        let c = dictionary! { "FT" => "Btn", "T" => s("c"), "V" => "On", "Kids" => annots };
+        let kids: Vec<Object> = [a, b, c].map(|k| p.doc.add_object(k).into()).into();
+        let top =
+            dictionary! { "FT" => "Tx", "T" => s("p"), "DA" => s("/Helv 0 Tf"), "Kids" => kids };
+        let top = p.doc.add_object(top);
+        let form = dictionary! { "Fields" => vec![top.into()] };
+        p.doc.catalog_mut().unwrap().set("AcroForm", form);
+
+        let (out, left_out) = p.field_nodes(Reach::Every);
+        assert_eq!(out.len(), 3);
+        assert_eq!(left_out, None);
+        // p: its node, title and name, and its three kids. a: its node, title and name, /DA
+        // kept and read twice, its value read and kept, and its tooltip read and kept. b:
+        // its node, title and name, its options (each looked at, read and kept), /DA, its
+        // default value kept, its value read and kept, and its options kept again. c: its
+        // node, title and name, its two kids, /DA, each widget and its state (kept and read
+        // twice), each export kept, its value read, and its options (each widget's looked
+        // for among them, the first kept).
+        let p_steps = 1 + 1 + 1 + 3;
+        let a_steps = 1 + 1 + 3 + 3 * 10 + 2 + 2 + 3 + 3;
+        let dv = crate::repair::copy_size(&s("x")) as u64;
+        let b_steps = 1 + 1 + 3 + (1 + 1 + 2) + (1 + 1 + 5 + 6) + 3 * 10 + dv + 1 + 1 + 8;
+        let c_steps = 1 + 1 + 3 + 2 + 3 * 10 + 2 * (1 + 3 * 2) + 2 * 2 + 2 + (2 + 2) + 3;
+        let took = TOOK.get();
+        assert_eq!(took, p_steps + a_steps + b_steps + c_steps);
+        let (within, left_out) = p.field_nodes_within(Reach::Every, took);
+        assert_eq!((within.len(), left_out), (3, None));
+        let (short, left_out) = p.field_nodes_within(Reach::Every, took - 1);
+        assert_eq!((short.len(), left_out), (2, Some(LeftOut::Large)));
     }
 
     /// A form of `n` fields, `field(i)` each, listed in `/Fields` and each with the same
@@ -921,7 +1126,7 @@ mod tests {
             |_, ids| ids.iter().map(|&id| id.into()).collect(),
         );
         LOOKED.set(0);
-        assert!(p.field_nodes(Reach::Every).1);
+        assert_eq!(p.field_nodes(Reach::Every).1, Some(LeftOut::Deep));
         let most = 4 * (MAX_DEPTH + 2) * n;
         assert!(LOOKED.get() < most, "looked at {} entries", LOOKED.get());
     }
@@ -1067,5 +1272,116 @@ mod tests {
         assert_eq!(p.value_nodes().unwrap().len(), 2 * layers + 2);
         let looked = LOOKED.get();
         assert!(looked < 10 * layers, "looked at {looked} entries");
+    }
+
+    /// A form of one node, `parent`, listing `n` kids, `kid(i)` each.
+    fn parent_of(
+        n: usize,
+        parent: impl FnOnce(&mut Pdf) -> Dictionary,
+        kid: impl Fn(&mut Pdf, usize) -> Dictionary,
+    ) -> Pdf {
+        let mut p = Pdf::new();
+        p.insert_blank(0, 300.0, 200.0).unwrap();
+        let kids: Vec<Object> = (0..n)
+            .map(|i| {
+                let k = kid(&mut p, i);
+                p.doc.add_object(k).into()
+            })
+            .collect();
+        let mut parent = parent(&mut p);
+        parent.set("Kids", kids);
+        let top = p.doc.add_object(parent);
+        let form = dictionary! { "Fields" => vec![top.into()] };
+        p.doc.catalog_mut().unwrap().set("AcroForm", form);
+        p
+    }
+
+    /// What a walk's fields hold, in bytes: their names, values, options and tooltips, and
+    /// what writing their values needs.
+    fn held(out: &[(Field, Node)]) -> usize {
+        fn pairs(o: &[(String, String)]) -> usize {
+            o.iter().map(|(a, b)| a.len() + b.len()).sum()
+        }
+        let each = |(f, n): &(Field, Node)| {
+            let value = match &f.value {
+                FieldValue::Text(t) => t.len(),
+                FieldValue::Choice(c) => c.iter().map(String::len).sum(),
+                _ => 0,
+            };
+            f.name.len()
+                + value
+                + pairs(&f.options)
+                + f.tooltip.as_ref().map_or(0, String::len)
+                + n.da.as_ref().map_or(0, Vec::len)
+                + n.dv.as_ref().map_or(0, crate::repair::copy_size)
+                + pairs(&n.opt)
+        };
+        out.iter().map(each).sum()
+    }
+
+    #[test]
+    fn what_kids_share_is_held_within_the_budget() {
+        // Each kid copied what its parent gave it, or what it refers to with others, so a
+        // small file made a walk hold far more than any form needs.
+        let big = || Object::string_literal("a".repeat(64 << 10));
+        let strings = |n: usize| -> Vec<Object> {
+            let each = |i| Object::string_literal(format!("{i:064}"));
+            (0..n).map(each).collect()
+        };
+        let mut title = Stream::new(dictionary! {}, vec![b'a'; 4 << 20]);
+        title.compress().unwrap();
+        let tooltip = Cell::new(None);
+        let shared_tooltip = |p: &mut Pdf, i| {
+            let tu = tooltip.get().unwrap_or_else(|| p.doc.add_object(big()));
+            tooltip.set(Some(tu));
+            dictionary! { "FT" => "Tx", "T" => name(i), "TU" => tu }
+        };
+        let kid = |_: &mut Pdf, i| dictionary! { "T" => name(i) };
+        let field = |_: &mut Pdf, i| text_field(i);
+        let forms = [
+            ("a title", {
+                parent_of(1_100, |_| dictionary! { "T" => big() }, field)
+            }),
+            ("a title stream", {
+                let top = |p: &mut Pdf| dictionary! { "T" => p.doc.add_object(title) };
+                parent_of(20, top, field)
+            }),
+            ("a value", {
+                let top = |_: &mut Pdf| dictionary! { "FT" => "Tx", "T" => "t", "V" => big() };
+                parent_of(1_100, top, kid)
+            }),
+            ("options", {
+                let top = |_: &mut Pdf| {
+                    dictionary! { "FT" => "Ch", "T" => "t", "Opt" => strings(1_000) }
+                };
+                parent_of(300, top, kid)
+            }),
+            ("a default value", {
+                let top = |_: &mut Pdf| {
+                    dictionary! { "FT" => "Ch", "T" => "t", "DV" => strings(1_000) }
+                };
+                parent_of(700, top, kid)
+            }),
+            ("a /DA", {
+                let top = |_: &mut Pdf| dictionary! { "FT" => "Tx", "T" => "t", "DA" => big() };
+                parent_of(1_100, top, kid)
+            }),
+            ("a tooltip", {
+                parent_of(1_100, |_| dictionary! { "T" => "t" }, shared_tooltip)
+            }),
+        ];
+        let mut over = Vec::new();
+        for (what, p) in forms {
+            for reach in [Reach::Every, Reach::Listed] {
+                let (out, left_out) = p.field_nodes(reach);
+                let held = held(&out);
+                if held as u64 > READ_STEPS || left_out != Some(LeftOut::Large) {
+                    let n = out.len();
+                    let why = format!("{n} fields hold {held} bytes, {left_out:?}");
+                    over.push(format!("{what} ({reach:?}): {why}"));
+                }
+            }
+        }
+        assert!(over.is_empty(), "{over:#?}");
     }
 }

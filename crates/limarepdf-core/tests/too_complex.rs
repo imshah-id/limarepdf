@@ -6,7 +6,8 @@
 //! their own `/Rect`. So does reading their points and text: a listing lists those past
 //! it unread, and removing information is refused past it. A text is charged what decoding
 //! it takes, a failure too. Changing one reads it alone, and
-//! is refused past the points it is drawn with rather than write them back cut.
+//! is refused past the points it is drawn with rather than write them back cut. Reading a
+//! form's fields has a budget too, and what relies on reading them all is refused past it.
 
 mod common;
 
@@ -1161,4 +1162,64 @@ fn moving_an_annotation_past_its_points_is_refused() {
     let mut p = zebras(1);
     let id = polygon(&mut p, 100_000);
     p.move_annotation(0, id, to).unwrap();
+}
+
+/// A page with a form of one field titled with 64 KiB, which `kids` text fields "k0", "k1"
+/// and on share: each kid's name holds it. Returns the title.
+fn titled_form(p: &mut Pdf, kids: usize) -> String {
+    let title = "a".repeat(65_536);
+    let parent = p.doc.new_object_id();
+    let kids: Vec<Object> = (0..kids)
+        .map(|i| {
+            let t = Object::string_literal(format!("k{i}"));
+            let kid = dictionary! { "FT" => "Tx", "T" => t, "V" => "v", "Parent" => parent };
+            p.doc.add_object(kid).into()
+        })
+        .collect();
+    let field = dictionary! { "T" => Object::string_literal(title.as_str()), "Kids" => kids };
+    p.doc.objects.insert(parent, field.into());
+    let form = dictionary! { "Fields" => vec![parent.into()] };
+    p.doc.catalog_mut().unwrap().set("AcroForm", form);
+    title
+}
+
+/// Reading a form's fields has a budget of 2²⁶ steps, the bytes of their names among them:
+/// past it, flattening, resetting, removing the values (and listing what removing hidden
+/// information would remove), setting a field it didn't reach and redacting, which looks
+/// for the removed text in every field, are refused with a typed reason, with nothing
+/// changed. Before, a walk held what the fields did: each of 1,100 kids
+/// a copy of the 64 KiB title, 72 MB. 1,000 are read whole.
+#[test]
+fn a_form_holding_more_than_is_read_of_one_is_refused() {
+    use limarepdf_core::{FieldValue, Hidden, TooComplex};
+    let x = || FieldValue::Text("x".into());
+    let page = [0.0, 0.0, 612.0, 792.0];
+    let mut p = zebras(1);
+    let title = titled_form(&mut p, 1_100);
+    let before = p.state_before();
+    let refused = [
+        p.flatten_form(None).err(),
+        p.reset_form().err(),
+        p.set_field(&format!("{title}.k1099"), x()).err(),
+        p.check_remove_hidden(&[Hidden::FormValues]).err(),
+        p.remove_hidden(&[Hidden::FormValues]).err(),
+        p.find_hidden().err(),
+        p.redact(&[(0, page)]).err(),
+    ];
+    let reading = ("reading the form's fields", 1 << 26);
+    for (n, e) in refused.into_iter().enumerate() {
+        let e = e.unwrap_or_else(|| panic!("{n} not refused"));
+        let too = e.downcast_ref::<TooComplex>().expect("too complex");
+        assert_eq!((too.what, too.limit), reading, "{n}");
+    }
+    assert_eq!(p.state_since(&before), []);
+    let mut p = zebras(1);
+    let title = titled_form(&mut p, 1_000);
+    p.set_field(&format!("{title}.k999"), x()).unwrap();
+    p.reset_form().unwrap();
+    p.check_remove_hidden(&[Hidden::FormValues]).unwrap();
+    p.find_hidden().unwrap();
+    p.remove_hidden(&[Hidden::FormValues]).unwrap();
+    p.redact(&[(0, page)]).unwrap();
+    p.flatten_form(None).unwrap();
 }

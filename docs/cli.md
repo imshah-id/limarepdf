@@ -86,6 +86,11 @@ Forms made only for Adobe Reader (XFA forms, whose pages say "Please wait..." el
 reach: `form list` says so (with `--json` it prints `{}` and the reason on standard error), and `form fill` stops
 with that reason. Hybrid forms, which carry ordinary fields alongside the XFA, are filled as usual.
 
+A form whose fields hold more than LimarePDF reads of a form (their names, values and options taking tens of
+megabytes, as no real form's do) is read only that far: `form list` lists the fields read, and `form flatten`,
+`form reset`, `sanitise --also form-values` and `redact` stop, changing nothing ("reading the form's fields would
+take more than 67108864 steps").
+
 ## Annotations
 
 | Command | What it does |

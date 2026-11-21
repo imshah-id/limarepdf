@@ -5,7 +5,7 @@ use crate::edit::numbered;
 use crate::embed::{cant_write, unwritable};
 use crate::fonts::{FontChoice, FontCtx};
 use crate::form_ap::{self, Body, Border, BoxSetting, Look, Metrics, OwnFont};
-use crate::forms::{button_export, Node, Reach, MAX_DEPTH};
+use crate::forms::{self, button_export, LeftOut, Node, Reach, MAX_DEPTH};
 use crate::layout::SetIn;
 use crate::{std14, Field, FieldKind, FieldValue, Pdf, Result};
 use anyhow::{anyhow, bail};
@@ -100,11 +100,14 @@ impl Pdf {
     /// shaped scripts, emoji of several characters, characters no installed font has) is
     /// refused rather than saved wrongly.
     pub fn set_field(&mut self, name: &str, value: FieldValue) -> Result<()> {
-        let (field, node) = self
-            .form_nodes()
-            .into_iter()
-            .find(|(f, _)| f.name == name)
-            .ok_or_else(|| anyhow!("no form field named \"{name}\""))?;
+        let (all, left_out) = self.field_nodes(Reach::Every);
+        let Some((field, node)) = all.into_iter().find(|(f, _)| f.name == name) else {
+            // It may be among those left out.
+            if left_out == Some(LeftOut::Large) {
+                return Err(forms::too_large().into());
+            }
+            bail!("no form field named \"{name}\"");
+        };
         if field.read_only {
             bail!("the field \"{name}\" is read-only");
         }
@@ -116,10 +119,15 @@ impl Pdf {
     }
 
     /// Put every field back to its default value (`/DV`), or empty when it has none.
-    /// Read-only fields are left as they are. When a field can't be reset, none is.
+    /// Read-only fields are left as they are. When a field can't be reset, none is, nor when
+    /// the fields hold more than LimarePDF reads of a form ([`crate::TooComplex`]).
     pub fn reset_form(&mut self) -> Result<()> {
+        let (all, left_out) = self.field_nodes(Reach::Every);
+        if left_out == Some(LeftOut::Large) {
+            return Err(forms::too_large().into());
+        }
         let mut staged = Vec::new();
-        for (field, node) in self.form_nodes() {
+        for (field, node) in all {
             if field.read_only || matches!(field.kind, FieldKind::Button | FieldKind::Signature) {
                 continue;
             }
@@ -142,7 +150,11 @@ impl Pdf {
     pub(crate) fn clear_form_values(&mut self) -> Result<usize> {
         let nodes = self.value_nodes()?;
         let orphans = self.orphan_widgets(&nodes)?;
-        let all = self.form_nodes();
+        // A field left out would keep its drawing, value and all.
+        let (all, left_out) = self.field_nodes(Reach::Every);
+        if left_out == Some(LeftOut::Large) {
+            return Err(forms::too_large().into());
+        }
         // The widgets of every field read, buttons and signatures included.
         let reached: std::collections::HashSet<ObjectId> = all
             .iter()

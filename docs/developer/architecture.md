@@ -56,7 +56,7 @@ text strips control characters anyway (`display.rs`). `doc::encode_text` writes 
 breaks as they are and anything else as UTF-16BE, so every string reads back unchanged. lopdf's own
 `decode_text_string` isn't used: its table drops tabs and line breaks. Text that is only shown (document
 properties, bookmark titles, comments' contents, authors and subjects, field descriptions) goes through
-`doc::decode_shown_text` instead (`Pdf::shown_text_value`; PB-18): unmarked bytes that are valid UTF-8 with a
+`doc::decode_shown_text` instead (`Pdf::text_charged` with `shown`; PB-18): unmarked bytes that are valid UTF-8 with a
 character of more than one byte read as UTF-8, as the program that wrote them meant; in PDFDocEncoding those would
 be runs like "Ã©". Field names, values and options, page labels and signature details stay on `decode_text`, so a
 field is found by the name every reader finds. Windows-1252 can't be told from PDFDocEncoding (both define 0x80 to
@@ -72,7 +72,18 @@ and `form list`; everything else takes every field
 (`Pdf::every_form_field`, `form_nodes`, `Reach::Every`): finding a field by name (setting, signing, `form fill`),
 reset, removing values, counting and checking signatures, field locks, new signature field names, redaction's
 report, flattening, printing, the pages' pictures (`render_snapshot`, `unshown_fields`), drawing fields before
-signing and telling XFA-only forms apart.
+signing and telling XFA-only forms apart. A walk of the field tree (`field_nodes`) reads within a budget of its own,
+`READ_STEPS` (2²⁶, unrecorded by `budget_seam`, as many operations walk on their way): a step for each node, kid,
+widget and option looked at, and for each byte read and each byte the fields hold, names, values, options,
+tooltips, `/DA` (three times: kept, and read for the text size and font) and `/DV` (`repair::copy_size`). Kids
+hold their parents' names and inherit what they give (`Inherited` borrows it from the file), so a title, value or
+option list given once was held by every kid: 700 kids of one `/DV` held 129 MB, and a title stream decoding to 256
+MiB was held by each. Once the steps are taken the walk stops, the fields after are left out (`LeftOut::Large`,
+over `LeftOut::Deep`), and flattening, reset, removing values (and so `check_remove_hidden` and `find_hidden`),
+redaction (its report looks in every field) and setting a field the walk may have left out refuse with a
+`TooComplex`. The render corpus's dearest form takes 126,118 steps (`pdfjs/issue16081.pdf`, 240 fields; 1,197
+files, measured 2026-11-20); walks cut at the limit take at most 0.07 s in an optimised build (the `ci-test`
+profile).
 
 Every dialog in the desktop app is built from the same parts in `crates/limarepdf-gui/src/dialogs.rs`, so they all
 look like Print: `Shell` (the window over the dimmed app, its title and file, and the dialogs' look from

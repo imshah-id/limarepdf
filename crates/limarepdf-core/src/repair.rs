@@ -282,7 +282,7 @@ fn is_written_page_node(o: &Object) -> bool {
 
 /// Roughly how much memory a copy of `o` takes, in bytes: the object, and what it holds on
 /// the heap.
-fn copy_size(o: &Object) -> usize {
+pub(crate) fn copy_size(o: &Object) -> usize {
     size_of::<Object>() + held(o)
 }
 

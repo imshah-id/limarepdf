@@ -13,6 +13,9 @@ pub(crate) struct Work {
     left: u64,
     what: &'static str,
     limit: u64,
+    /// Whether a test's [`budget_seam`] keeps what it took.
+    #[cfg(any(test, feature = "test-seams"))]
+    kept: bool,
 }
 
 /// An operation's limit, `normal` steps; a test can set another through [`budget_seam`].
@@ -58,6 +61,20 @@ impl Work {
             left: limit,
             what,
             limit,
+            #[cfg(any(test, feature = "test-seams"))]
+            kept: true,
+        }
+    }
+
+    /// A budget like [`Work::new`]'s that a test's [`budget_seam`] doesn't keep: for a walk
+    /// many operations make on their way, whose own steps leave it out.
+    pub(crate) fn unkept(what: &'static str, limit: u64) -> Work {
+        Work {
+            left: limit,
+            what,
+            limit,
+            #[cfg(any(test, feature = "test-seams"))]
+            kept: false,
         }
     }
 
@@ -141,7 +158,9 @@ impl Work {
 #[cfg(any(test, feature = "test-seams"))]
 impl Drop for Work {
     fn drop(&mut self) {
-        budget_seam::record(self.taken());
+        if self.kept {
+            budget_seam::record(self.taken());
+        }
     }
 }
 
