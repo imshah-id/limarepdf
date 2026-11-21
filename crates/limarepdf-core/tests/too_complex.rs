@@ -1223,3 +1223,41 @@ fn a_form_holding_more_than_is_read_of_one_is_refused() {
     p.redact(&[(0, page)]).unwrap();
     p.flatten_form(None).unwrap();
 }
+
+/// Lists `field` after the fields of the form `titled_form` made.
+fn list_after(p: &mut Pdf, field: Dictionary) {
+    let id = p.doc.add_object(field);
+    let form = p.doc.catalog_mut().unwrap().get_mut(b"AcroForm").unwrap();
+    let fields = form.as_dict_mut().unwrap().get_mut(b"Fields").unwrap();
+    fields.as_array_mut().unwrap().push(id.into());
+}
+
+/// A signature field listed after a form holding more than is read of one is still found, so
+/// a file signed there is taken for signed (the app keeps its bytes, and `limarepdf-cli`
+/// doesn't save it whole without `--break-signatures`): `signature_count` and
+/// `has_signature_fields` look past the walk's steps for it. They missed it, and the file was
+/// taken for unsigned. An empty one is found, and not counted as signed.
+#[test]
+fn a_signature_past_what_is_read_of_a_form_is_found() {
+    let signature = |p: &mut Pdf, signed: bool| {
+        let mut field = dictionary! { "FT" => "Sig", "T" => Object::string_literal("s") };
+        if signed {
+            let sig = dictionary! { "Type" => "Sig", "Filter" => "Adobe.PPKLite" };
+            field.set("V", p.doc.add_object(sig));
+        }
+        list_after(p, field);
+    };
+    for kids in [1_000, 1_100] {
+        let mut p = zebras(1);
+        titled_form(&mut p, kids);
+        assert!(!p.has_signature_fields(), "{kids}");
+        signature(&mut p, true);
+        assert_eq!(p.signature_count(), 1, "{kids}");
+        assert!(p.has_signature_fields(), "{kids}");
+        let mut p = zebras(1);
+        titled_form(&mut p, kids);
+        signature(&mut p, false);
+        assert_eq!(p.signature_count(), 0, "{kids}");
+        assert!(p.has_signature_fields(), "{kids}");
+    }
+}

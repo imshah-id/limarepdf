@@ -1192,11 +1192,7 @@ impl App {
                     disk::read(&path).with_context(|| format!("reading {}", path.display()))?;
                 let pdf = Pdf::from_bytes(&bytes, password.as_deref())?;
                 // Signed files keep their bytes, to check and for View signed version.
-                let fields = pdf.every_form_field();
-                let signed = fields
-                    .iter()
-                    .any(|f| f.kind == limarepdf_core::FieldKind::Signature)
-                    .then(|| Arc::from(bytes));
+                let signed = pdf.has_signature_fields().then(|| Arc::from(bytes));
                 Ok((pdf, signed, version))
             };
             let read = crate::guard(open);

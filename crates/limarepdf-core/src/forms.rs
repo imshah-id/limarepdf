@@ -280,16 +280,39 @@ impl Pdf {
         self.form_nodes().into_iter().map(|(f, _)| f).collect()
     }
 
-    /// How many signature fields hold a signature. Any full rewrite, such as
-    /// [`Pdf::save`], makes those signatures invalid.
+    /// How many signature fields hold a signature, those past what a walk of the form reads
+    /// too. Any full rewrite, such as [`Pdf::save`], makes those signatures invalid.
     pub fn signature_count(&self) -> usize {
-        self.form_nodes()
-            .iter()
-            .filter(|(f, n)| {
-                f.kind == FieldKind::Signature
-                    && self.doc.get_dictionary(n.id).is_ok_and(|d| d.has(b"V"))
-            })
+        (self.signature_nodes().into_iter())
+            .filter(|&id| self.doc.get_dictionary(id).is_ok_and(|d| d.has(b"V")))
             .count()
+    }
+
+    /// Whether the form has a signature field, signed or not, past what a walk of the form
+    /// reads too.
+    pub fn has_signature_fields(&self) -> bool {
+        !self.signature_nodes().is_empty()
+    }
+
+    /// The signature fields' nodes, as a walk of every field reads them. When the walk
+    /// stopped short of the end ([`LeftOut::Large`]), where the fields after may be signature
+    /// fields, every node of a signature field, as [`Pdf::value_nodes`] reads them, without
+    /// their names and values (the walk's, when they are nested too deep for that).
+    fn signature_nodes(&self) -> Vec<ObjectId> {
+        let (nodes, left_out) = self.field_nodes(Reach::Every);
+        let all = (left_out == Some(LeftOut::Large))
+            .then(|| self.value_nodes().ok())
+            .flatten();
+        match all {
+            Some(all) => (all.into_iter())
+                .filter(|&(_, sig)| sig)
+                .map(|(id, _)| id)
+                .collect(),
+            None => (nodes.into_iter())
+                .filter(|(f, _)| f.kind == FieldKind::Signature)
+                .map(|(_, n)| n.id)
+                .collect(),
+        }
     }
 
     /// The signature fields among those [`Pdf::form_fields`] lists that hold no digital
