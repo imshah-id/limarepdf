@@ -500,6 +500,8 @@ impl Pdf {
     /// pages and fields are built from XML that only Adobe software lays out. The PDF's
     /// own pages are then usually a "Please wait..." placeholder. Hybrid forms, which
     /// also carry ordinary fields, are not XFA-only: those fields are what LimarePDF fills.
+    /// Nor is a form holding more than LimarePDF reads of one: the fields it didn't read may
+    /// be ordinary ones.
     pub fn xfa_only(&self) -> bool {
         let Some(form) = self.acro_form() else {
             return false;
@@ -514,7 +516,9 @@ impl Pdf {
             .and_then(|c| c.get(b"NeedsRendering").ok())
             .and_then(|o| o.as_bool().ok())
             .unwrap_or(false);
-        needs_rendering || !self.form_nodes().iter().any(|(f, _)| !f.widgets.is_empty())
+        let (nodes, left_out) = self.field_nodes(Reach::Every);
+        needs_rendering
+            || left_out != Some(LeftOut::Large) && !nodes.iter().any(|(f, _)| !f.widgets.is_empty())
     }
 
     /// The catalog's `/AcroForm` dictionary.

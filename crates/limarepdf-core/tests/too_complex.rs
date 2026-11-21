@@ -1261,3 +1261,23 @@ fn a_signature_past_what_is_read_of_a_form_is_found() {
         assert!(p.has_signature_fields(), "{kids}");
     }
 }
+
+/// A form with an XFA part (fields in XML, for Adobe Reader) holding more than is read of
+/// one isn't taken for XFA-only when none of the fields read has a widget: the fields after
+/// may have them. It was, and removing scripts kept the XFA part's, as it does an XFA-only
+/// form's, which would be left with nothing. Read whole, with no widget, it is XFA-only.
+#[test]
+fn a_form_holding_more_than_is_read_of_one_is_not_taken_for_xfa_only() {
+    use limarepdf_core::Hidden;
+    for (kids, xfa_only) in [(1_000, true), (1_100, false)] {
+        let mut p = zebras(1);
+        titled_form(&mut p, kids);
+        let form = p.doc.catalog_mut().unwrap().get_mut(b"AcroForm").unwrap();
+        let xfa = Object::string_literal("<xdp:xdp><script/></xdp:xdp>");
+        form.as_dict_mut().unwrap().set("XFA", xfa);
+        assert_eq!(p.xfa_only(), xfa_only, "{kids}");
+        p.remove_hidden(&[Hidden::Scripts]).unwrap();
+        let form = p.doc.catalog().unwrap().get(b"AcroForm").unwrap();
+        assert_eq!(form.as_dict().unwrap().has(b"XFA"), xfa_only, "{kids}");
+    }
+}

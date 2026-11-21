@@ -84,7 +84,8 @@ redaction (its report looks in every field) and setting a field the walk may hav
 `TooComplex`. Flattening and reset refuse fields left out for being nested too deep (`LeftOut::Deep`) too, and
 removing values stops at them (`value_nodes`). Telling a signed file apart (`signature_count`,
 `has_signature_fields`: whether `limarepdf-cli` may save it whole, whether the app keeps its bytes) looks past a
-walk cut short for signature fields, among every node `value_nodes` reads (`signature_nodes`). The render
+walk cut short for signature fields, among every node `value_nodes` reads (`signature_nodes`). A form whose walk
+was cut short isn't taken for XFA-only (`xfa_only`), so removing scripts takes its XFA part too. The render
 corpus's dearest form takes 126,118 steps (`pdfjs/issue16081.pdf`, 240 fields; 1,197 files, measured 2026-11-20);
 walks cut at the limit take at most 0.07 s in an optimised build (the `ci-test` profile).
 
