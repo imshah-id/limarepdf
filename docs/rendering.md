@@ -61,8 +61,10 @@ them at the places in the index, others in stretches of the lengths it gives) or
 just before `endstream`, a part in use not written as one whole object or holding a dictionary of 32 entries or
 more that gives a key twice (some apps then take another of its values), or one other apps reach where LimarePDF's
 PDF library doesn't (a reference under another generation, an object stream numbered as another part's place in
-the file), or an encryption dictionary, or a part it names, in an object stream (some apps read those before they
-can decrypt).
+the file), a reference from the catalog or the document information to a part LimarePDF's PDF library doesn't
+have, under another generation than its entry gives or when the newest cross-reference section is a table (some
+apps then read the whole file again and may find any part elsewhere), or an encryption dictionary, or a part it
+names, in an object stream (some apps read those before they can decrypt).
 LimarePDF shows such a file as the PDF standard says (the parts it deletes stay deleted). Since a crafted file can use this to show
 one thing in LimarePDF and another elsewhere, the app shows a notice saying other apps may show the file
 differently, with a Save as… button: the saved copy is written the way LimarePDF shows it, without the parts other

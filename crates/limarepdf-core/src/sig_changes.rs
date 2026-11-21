@@ -1296,6 +1296,8 @@ pub(crate) struct Reading {
     pub(crate) lengths: HashSet<ObjectId>,
     /// The entry each object number has for other apps.
     spec: HashMap<u32, Entry>,
+    /// Whether the newest cross-reference section is a table (a hybrid one too).
+    table: bool,
 }
 
 impl Reading {
@@ -1305,6 +1307,18 @@ impl Reading {
     pub(crate) fn others_find(&self, id: ObjectId) -> bool {
         matches!(self.spec.get(&id.0), Some(Entry::Compressed { container, .. })
             if matches!(self.spec.get(container), Some(Entry::InUse { .. })))
+    }
+
+    /// Whether other apps read the whole file again when they follow a reference to object
+    /// `id`, which lopdf doesn't hold, so may then read any object otherwise. pdf.js does when
+    /// the object's entry gives another generation. Poppler does when it can't read the object
+    /// and the newest section is a table: it scans the file for objects and reads every object
+    /// from what it found from then on.
+    pub(crate) fn read_again(&self, id: ObjectId) -> bool {
+        match self.spec.get(&id.0) {
+            Some(Entry::InUse { .. }) => true,
+            _ => self.table,
+        }
     }
 }
 
@@ -1320,6 +1334,7 @@ pub(crate) fn compare_reading(bytes: &[u8], doc: &Document) -> Result<Reading, S
         spec,
         deleted,
         trailer,
+        table: newest_table,
     } = whole_xref(bytes, pointer.unwrap_or(doc.xref_start))?;
     // lopdf must take the newest trailer too: its catalog, and its encryption dictionary,
     // which lopdf drops from the trailer once it has decrypted the file with it.
@@ -1609,6 +1624,7 @@ pub(crate) fn compare_reading(bytes: &[u8], doc: &Document) -> Result<Reading, S
         ends_cleanly: pointer.is_some(),
         lengths,
         spec,
+        table: newest_table,
     })
 }
 
@@ -1675,6 +1691,8 @@ struct WholeXref {
     deleted: HashMap<u32, Entry>,
     /// The newest section's trailer.
     trailer: Dictionary,
+    /// Whether the newest section is a table (a hybrid one too).
+    table: bool,
 }
 
 /// The cross-reference entry each object number has for a reader following the
@@ -1686,6 +1704,7 @@ fn whole_xref(bytes: &[u8], mut at: usize) -> Result<WholeXref, String> {
     let mut spec = HashMap::new();
     let mut deleted = HashMap::new();
     let mut trailer = Dictionary::new();
+    let mut table = false;
     let mut seen = HashSet::new();
     loop {
         if !seen.insert(at) || seen.len() > MAX_SECTIONS {
@@ -1695,6 +1714,7 @@ fn whole_xref(bytes: &[u8], mut at: usize) -> Result<WholeXref, String> {
         decoded_alike(&read, at)?;
         if seen.len() == 1 {
             trailer = read.trailer;
+            table = read.kind == SectionKind::Table;
         }
         let mut entries = read.entries;
         if let Some(stm) = read.xref_stm {
@@ -1717,6 +1737,7 @@ fn whole_xref(bytes: &[u8], mut at: usize) -> Result<WholeXref, String> {
                     spec,
                     deleted,
                     trailer,
+                    table,
                 })
             }
         }
@@ -1909,6 +1930,31 @@ pub(crate) fn references(doc: &Document) -> HashSet<ObjectId> {
             Object::Stream(s) if s.dict.has_type(b"XRef") => {
                 stack.extend(content(&s.dict).map(|(_, o)| o))
             }
+            Object::Stream(s) => stack.extend(s.dict.iter().map(|(_, o)| o)),
+            _ => {}
+        }
+    }
+    out
+}
+
+/// The references other apps may follow in `doc`: from its trailer's catalog and document
+/// information, and on through every object they lead to. They read no other key of the
+/// trailer.
+pub(crate) fn reached(doc: &Document) -> HashSet<ObjectId> {
+    let mut out = HashSet::new();
+    let mut stack: Vec<&Object> = [&b"Root"[..], b"Info"]
+        .into_iter()
+        .filter_map(|k| doc.trailer.get(k).ok())
+        .collect();
+    while let Some(o) = stack.pop() {
+        match o {
+            Object::Reference(id) => {
+                if out.insert(*id) {
+                    stack.extend(doc.objects.get(id));
+                }
+            }
+            Object::Array(a) => stack.extend(a),
+            Object::Dictionary(d) => stack.extend(d.iter().map(|(_, o)| o)),
             Object::Stream(s) => stack.extend(s.dict.iter().map(|(_, o)| o)),
             _ => {}
         }

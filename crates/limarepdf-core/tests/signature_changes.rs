@@ -1852,6 +1852,43 @@ fn by_hand(b: &[u8], objects: &[(u32, Vec<u8>)], compressed: &[(u32, u32, u16)])
     out
 }
 
+/// A revision written by hand with a cross-reference table: `objects`, each listed under its
+/// number where it starts, then `unlisted`, text no entry leads to; `free` listed free; `more`
+/// added to the trailer.
+fn in_table(
+    b: &[u8],
+    objects: &[(u32, Vec<u8>)],
+    free: &[u32],
+    unlisted: &[u8],
+    more: &str,
+) -> Vec<u8> {
+    let d = Document::load_mem(b).unwrap();
+    let r = root(&d);
+    let prev = last_startxref(b);
+    let mut out = [b, b"\n"].concat();
+    let mut rows = String::new();
+    for (n, text) in objects {
+        rows.push_str(&format!("{n} 1\n{:010} 00000 n\r\n", out.len()));
+        out.extend_from_slice(text);
+    }
+    out.extend_from_slice(unlisted);
+    for n in free {
+        rows.push_str(&format!("{n} 1\n0000000000 00001 f\r\n"));
+    }
+    let numbers = objects.iter().map(|(n, _)| n).chain(free);
+    let size = numbers.copied().max().unwrap_or(0).max(d.max_id) + 1;
+    let at = out.len();
+    out.extend_from_slice(
+        format!(
+            "xref\n{rows}trailer\n<< /Size {size} /Root {} {} R /Prev {prev}{more} >>\n\
+             startxref\n{at}\n%%EOF\n",
+            r.0, r.1
+        )
+        .as_bytes(),
+    );
+    out
+}
+
 /// What [`by_hand`] writes for an object: its header, `body` and `endobj`.
 fn written(n: u32, body: &str) -> Vec<u8> {
     format!("{n} 0 obj\n{body}\nendobj\n").into_bytes()
@@ -2053,6 +2090,74 @@ fn a_dictionary_of_32_entries_with_a_key_repeated_is_refused() {
     let (ok, _) = trailer(31);
     assert_eq!(changes(&ok), []);
     assert!(!differs(&ok));
+}
+
+/// Poppler, when it can't read the object a reference names and the newest cross-reference
+/// section is a table, rebuilds its list of objects by scanning the file and reads every object
+/// from that list; pdf.js reads the whole file again when a reference gives an object another
+/// generation than its own. After signing, a revision whose table left a reference with nothing
+/// to read, with a turned copy of the page after it that no entry lists, passed as nothing, and
+/// Poppler showed the page turned. They follow references from the catalog and the document
+/// information only, not from other keys of the trailer.
+#[test]
+fn a_reference_other_apps_read_the_file_again_for_is_refused() {
+    let b = approve(&base_pdf());
+    let d = Document::load_mem(&b).unwrap();
+    let (p, signed, turned) = page_texts(&b);
+    let n = d.max_id + 1;
+    let (user, gone, freed) = (n, n + 1, n + 2);
+    let dead = written(p.0, &turned);
+    // The page as signed, referring to `num` under `gen` too.
+    let page = |num: u32, gen: u16| {
+        let rest = signed.strip_prefix("<<").unwrap();
+        (p.0, written(p.0, &format!("<< /X [{num} {gen} R]{rest}")))
+    };
+    // Why the reading differs, if it does. The page changed is refused as such, which leaves
+    // the reading's own refusal out.
+    let differs = |b: &[u8]| {
+        let pdf = Pdf::from_bytes(b, None).unwrap();
+        pdf.differs().map(str::to_owned)
+    };
+    let read_otherwise = |b: &[u8], n: u32| {
+        let why = format!("LimarePDF can't read its object {n} the way they do");
+        let refused = changes(b).iter().any(|c| c.1 == Some(Refusal::Never));
+        refused && differs(b) == Some(why)
+    };
+    let read_alike = |b: &[u8]| {
+        let malformed = |c: &(ChangeKind, _)| matches!(c.0, ChangeKind::Malformed(_));
+        differs(b).is_none() && !changes(b).iter().any(malformed)
+    };
+    // To a number nothing lists, or one listed free, in a table: refused, from the page or the
+    // document information.
+    let info = written(user, &format!("<< /Title (T) /X [{gone} 0 R] >>"));
+    let as_info = format!(" /Info {user} 0 R");
+    let bad = [
+        (gone, in_table(&b, &[page(gone, 0)], &[], &dead, "")),
+        (freed, in_table(&b, &[page(freed, 0)], &[freed], &dead, "")),
+        (gone, in_table(&b, &[(user, info)], &[], &dead, &as_info)),
+    ];
+    for (i, (to, bad)) in bad.iter().enumerate() {
+        assert!(read_otherwise(bad, *to), "{i}");
+    }
+    // In a cross-reference stream Poppler reads nothing there, as lopdf and pdf.js do.
+    assert!(read_alike(&by_hand(&b, &[page(gone, 0)], &[])));
+    // From another key of the trailer, or an object nothing refers to: nothing read.
+    let lone = (user, written(user, &format!("[{gone} 0 R]")));
+    let more = format!(" /AdditionalStreams [/x {gone} 0 R]");
+    let ok = in_table(&b, &[lone], &[], &dead, &more);
+    assert_eq!(changes(&ok), []);
+    assert!(differs(&ok).is_none());
+    // To the page under another generation than its own: refused in either.
+    let other = [page(p.0, p.1 + 1)];
+    let bad = [
+        in_table(&b, &other, &[], &dead, ""),
+        by_hand(&b, &other, &[]),
+    ];
+    for (i, bad) in bad.iter().enumerate() {
+        assert!(read_otherwise(bad, p.0), "{i}");
+    }
+    // To the page as listed: nothing to read again.
+    assert!(read_alike(&in_table(&b, &[page(p.0, p.1)], &[], &dead, "")));
 }
 
 #[test]

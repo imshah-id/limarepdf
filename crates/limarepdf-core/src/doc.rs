@@ -316,11 +316,14 @@ impl Pdf {
             ));
         }
         used.extend(&reading.lengths);
+        let reached = crate::sig_changes::reached(&self.doc);
         let unsure = used
             .iter()
             .filter(|id| {
+                let held = self.doc.objects.contains_key(id);
                 reading.unsure.contains(&id.0)
-                    || (!self.doc.objects.contains_key(id) && reading.others_find(**id))
+                    || (!held && reading.others_find(**id))
+                    || (!held && reached.contains(id) && reading.read_again(**id))
             })
             .min();
         unsure.map(|id| format!("LimarePDF can't read its object {} the way they do", id.0))

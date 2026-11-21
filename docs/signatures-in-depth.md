@@ -645,7 +645,13 @@ refuses as malformed:
   or can't be read as written, the whole revision is;
 - a dictionary of 32 entries or more giving a key twice, at any depth: LimarePDF's PDF library and pdf.js take its
   last value, and so does Poppler below 32 entries, but from 32 Poppler sorts them and may take another. The object
-  holding it is refused where it is used; in cross-reference information, the whole revision is.
+  holding it is refused where it is used; in cross-reference information, the whole revision is;
+- a reference, followed from the catalog or the document information, to an object LimarePDF's PDF library doesn't
+  have: when the newest cross-reference section is a table, Poppler can't read it, scans the whole file for objects
+  and from then on reads every object from what it found; when the reference gives another generation than the
+  object's entry, pdf.js reads the whole file again too. Either may then read any object otherwise, so the
+  reference is refused where it is used. A missing or free object reached through a cross-reference stream under
+  its own generation is read as null by every app, and other apps don't follow the trailer's other keys.
 
 An object deleted while still in use, and an object the signed version referred to but didn't have, are refused
 too. These are the shapes of the published shadow (hide, replace, hide-and-replace) and incremental-saving attacks.
