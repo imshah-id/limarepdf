@@ -2444,6 +2444,115 @@ fn a_reference_other_apps_read_the_file_again_for_is_refused() {
     assert!(read_alike(&in_table(&b, &[page(p.0, p.1)], &[], &dead, "")));
 }
 
+/// lopdf takes a stream's data as long as its `/Length` when a line end at most comes before
+/// `endstream`, and otherwise on to an `endstream` of its own finding; a `/Length` written as
+/// a real, `87.`, it takes whatever follows, and with no `/Length` it takes nothing. Poppler
+/// and pdf.js take the data as long as a whole number `/Length` when `endstream` follows,
+/// white space and comments aside, and otherwise look for `endstream` themselves: pdf.js for
+/// its first eight bytes anywhere in the data, Poppler for the word, skipping comments, past
+/// the first token at the end of the `/Length` it takes, 0 for a real. After signing, the
+/// page's content written again with its `/Length` as a real and a red rectangle before
+/// `endstream` passed as unchanged, and Poppler and pdf.js drew the rectangle (review round
+/// 4); so did the content with its `/Length` ending inside a string, the rest of the line a
+/// comment to them, and they left out the square drawn after it; and so did a `/Length` past
+/// the data. Data differing by white space at its end reads alike.
+#[test]
+fn a_stream_framed_otherwise_is_refused() {
+    let base = base_pdf();
+    let d = Document::load_mem(&base).unwrap();
+    let p = page(&d);
+    let c = d.max_id + 1;
+    // The content stream: `entries` in its dictionary, then `body`, its data and `endstream`.
+    let content =
+        |entries: &str, body: &str| written(c, &format!("<< {entries} >>\nstream\n{body}"));
+    // A blue square with a red one in it, the red marked with a string starting `%`.
+    let marked = "0 0 1 rg 10 10 50 50 re f /Span << /ActualText (";
+    let drawn = format!("{marked}%) >> BDC 1 0 0 rg 20 20 30 30 re f EMC");
+    let length = |n: usize| format!("/Length {n}");
+    let real = |n: usize| format!("/Length {n}.");
+    let l = drawn.len();
+    let mut on = dict(&d, p);
+    on.set("Contents", Object::Reference((c, 0)));
+    let page = written(p.0, &format!("{on:?}"));
+    let signed = content(&length(l), &format!("{drawn}\nendstream"));
+    let b = approve(&by_hand(&base, &[(p.0, page), (c, signed)], &[]));
+    let differs = |b: &[u8]| Pdf::from_bytes(b, None).unwrap().differs().is_some();
+    let red = " 1 0 0 rg 0 0 300 200 re f";
+    let span = |word: &str| format!("/Span << /ActualText ({word}\n) >> BDC{red} EMC");
+    // lopdf reads the squares, and the content as signed; or something else, a change.
+    let same = read_otherwise(c);
+    let changed = vec![(ChangeKind::PageContent, Some(Refusal::Never))];
+    for (i, (entries, body, read)) in [
+        (real(l), format!("{drawn}\n{red}\nendstream"), &same),
+        (length(marked.len()), format!("{drawn}\nendstream"), &same),
+        // Poppler reads on past `endstream`.
+        (length(l + 3), format!("{drawn}\nendstream"), &same),
+        // lopdf takes nothing, the others the squares.
+        (String::new(), format!("{drawn}\nendstream"), &changed),
+        // pdf.js stops in the string, the others draw the rectangle.
+        (
+            length(0),
+            format!("{drawn}\n{}\nendstream", span("endstrea")),
+            &changed,
+        ),
+        (
+            length(0),
+            format!("{drawn}\n{}\nendstream", span("endsteam")),
+            &changed,
+        ),
+        // Poppler takes the rest of the line for a comment, and draws the rectangle.
+        (
+            real(l + 3),
+            format!("{drawn} %c  endstream\n{red}\nendstream"),
+            &changed,
+        ),
+        // Poppler takes only the word `endstream`, and draws the rectangle.
+        (
+            real(l),
+            format!("{drawn}\nendstreamx\n{red}\nendstream"),
+            &same,
+        ),
+        // Poppler's first token, a string, runs past `endstream`; it draws the rectangle.
+        (
+            real(1),
+            format!("(\nendstream\n){red}\nendstream"),
+            &changed,
+        ),
+        // Poppler takes none of the data, a comment.
+        (real(2), "%c\nendstream".into(), &changed),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let bad = by_hand(&b, &[(c, content(entries, body))], &[]);
+        assert_eq!(&changes(&bad), *read, "{i}");
+        assert!(differs(&bad), "{i}");
+    }
+    // Others take the data as long as its `/Length`, lopdf the white space after it too.
+    let mut ok = vec![];
+    for (framing, read) in [("\n", &[]), ("\r\n", &[]), ("\r", &[]), ("", &[])] {
+        ok.push((length(l), format!("{drawn}{framing}endstream"), &read[..]));
+    }
+    for framing in ["\n\n", " \n", "\n\r"] {
+        ok.push((
+            length(l),
+            format!("{drawn}{framing}endstream"),
+            &changed[..],
+        ));
+    }
+    // All look for `endstream`, or take the data as long as a real that ends it; Poppler
+    // takes none of white space.
+    ok.push((length(0), format!("{drawn}\nendstream"), &[]));
+    ok.push((real(l), format!("{drawn}\nendstream"), &[]));
+    ok.push((real(l), format!("{drawn}\n%{red}\nendstream"), &[]));
+    ok.push((real(1), " \nendstream".into(), &changed));
+    for (i, (entries, body, read)) in ok.iter().enumerate() {
+        let ok = by_hand(&b, &[(c, content(entries, body))], &[]);
+        assert_eq!(changes(&ok), *read, "{i}");
+        assert!(!differs(&ok), "{i}");
+    }
+}
+
 #[test]
 fn filling_in_a_form_is_allowed() {
     let b = fill(&approve(&form(&["Name", "Date"])), "Name", "Jane");

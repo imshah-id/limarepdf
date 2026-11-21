@@ -1212,10 +1212,8 @@ fn data_start(bytes: &[u8], mut at: usize) -> Option<usize> {
     })
 }
 
-/// Where the data of the stream whose object starts at `at` lies, as other apps take it: as
-/// long as its `/Length`, a whole number written in the stream's dictionary or in an object
-/// `spec` lists, then `endstream` and `endobj`.
-fn stream_data(bytes: &[u8], at: usize, spec: &HashMap<u32, Entry>) -> Option<Range<usize>> {
+/// The dictionary of the stream whose object starts at `at`, and where its data starts.
+fn stream_head(bytes: &[u8], at: usize) -> Option<(Dictionary, usize)> {
     let (_, mut lx) = header(bytes, at)?;
     let Object::Dictionary(dict) = read_object(&mut lx, 0)? else {
         return None;
@@ -1223,30 +1221,122 @@ fn stream_data(bytes: &[u8], at: usize, spec: &HashMap<u32, Entry>) -> Option<Ra
     let (_, Tok::Word(b"stream"), keyword) = lx.next_word()? else {
         return None;
     };
-    let start = data_start(bytes, keyword)?;
-    let len = match dict.get(b"Length").ok()? {
-        Object::Integer(n) => *n,
+    Some((dict, data_start(bytes, keyword)?))
+}
+
+/// The `/Length` in a stream's dictionary `dict`, when it is a whole number written there or
+/// in an object `spec` lists, `endobj` perhaps glued to it. An object `spec` lists in an
+/// object stream is taken as `doc` holds it, given one; an object stream's own `/Length` may
+/// not be in one.
+fn stream_length(
+    bytes: &[u8],
+    dict: &Dictionary,
+    spec: &HashMap<u32, Entry>,
+    doc: Option<&Document>,
+) -> Option<i64> {
+    match dict.get(b"Length").ok()? {
+        Object::Integer(n) => Some(*n),
         Object::Reference(id) => match spec.get(&id.0) {
             Some(&Entry::InUse { offset, gen }) if gen == id.1 => {
                 let (found, mut lx) = header(bytes, offset)?;
+                if found != *id {
+                    return None;
+                }
+                if let Some((_, Tok::Word(w), _)) = lx.clone().next() {
+                    if let Some(n) = w.strip_suffix(b"endobj") {
+                        return number(n)?.as_i64().ok();
+                    }
+                }
                 let Object::Integer(n) = read_object(&mut lx, 0)? else {
                     return None;
                 };
-                if found != *id || !matches!(lx.next_word()?, (_, Tok::Word(b"endobj"), _)) {
-                    return None;
-                }
-                n
+                matches!(lx.next_word()?, (_, Tok::Word(b"endobj"), _)).then_some(n)
             }
-            _ => return None,
+            Some(Entry::Compressed { .. }) if id.1 == 0 => match doc?.objects.get(id)? {
+                Object::Integer(n) => Some(*n),
+                _ => None,
+            },
+            _ => None,
         },
-        _ => return None,
-    };
+        _ => None,
+    }
+}
+
+/// Where the data of the stream whose object starts at `at` lies, as other apps take it: as
+/// long as its `/Length` ([`stream_length`]), then `endstream` and `endobj`.
+fn stream_data(
+    bytes: &[u8],
+    at: usize,
+    spec: &HashMap<u32, Entry>,
+    doc: Option<&Document>,
+) -> Option<Range<usize>> {
+    let (dict, start) = stream_head(bytes, at)?;
+    let len = stream_length(bytes, &dict, spec, doc)?;
     let end = start.checked_add(usize::try_from(len).ok()?)?;
     let mut tail = Lexer::new(bytes, end);
     (end <= bytes.len()
         && matches!(tail.next_word()?, (_, Tok::Word(b"endstream"), _))
         && matches!(tail.next_word()?, (_, Tok::Word(b"endobj"), _)))
     .then_some(start..end)
+}
+
+/// Where in the file the data lopdf took for stream `s`, whose object starts at `at`, lies,
+/// when other apps take the same, white space at its end aside. Poppler and pdf.js take the
+/// data as long as a whole number `/Length` when `endstream` follows, white space and comments
+/// aside ([`stream_data`]). Otherwise both look for `endstream`: pdf.js for its first eight
+/// bytes from the start of the data, Poppler for the word past the first token at the end of
+/// the `/Length` it takes, 0 for anything but a whole number, skipping comments; Poppler
+/// takes `endstream` in too, which draws nothing. lopdf takes the data as long as its
+/// `/Length` when a line end at most comes before `endstream`, otherwise on to an `endstream`
+/// of its own finding, and of a `/Length` written as a real as many bytes, whatever follows;
+/// with none it takes nothing. What lopdf `decrypted` can't show which data it took: there
+/// the others' must be followed by a line end at most and `endstream`.
+fn framed_data(
+    bytes: &[u8],
+    at: usize,
+    s: &Stream,
+    spec: &HashMap<u32, Entry>,
+    doc: Option<&Document>,
+    decrypted: bool,
+) -> Option<Range<usize>> {
+    let theirs = stream_data(bytes, at, spec, doc);
+    if decrypted {
+        return theirs.filter(|r| {
+            let rest = &bytes[r.end..];
+            let rest = (rest.strip_prefix(b"\r\n"))
+                .or_else(|| rest.strip_prefix(b"\n"))
+                .or_else(|| rest.strip_prefix(b"\r"))
+                .unwrap_or(rest);
+            rest.starts_with(b"endstream")
+        });
+    }
+    let (dict, start) = stream_head(bytes, at)?;
+    let end = start.checked_add(s.content.len())?;
+    if bytes.get(start..end)? != s.content {
+        return None;
+    }
+    let white = |r: Range<usize>| bytes[r].iter().all(|&c| is_white(c));
+    if let Some(r) = theirs {
+        return white(r.end.min(end)..r.end.max(end)).then_some(start..end);
+    }
+    let from = match dict.get(b"Length") {
+        Ok(Object::Integer(_) | Object::Reference(_)) => {
+            let len = stream_length(bytes, &dict, spec, doc)?;
+            start.checked_add(usize::try_from(len).ok()?)?
+        }
+        _ => start,
+    };
+    let found = end + bytes[end..].iter().take_while(|&&c| is_white(c)).count();
+    let ended = Lexer::new(bytes, found).next();
+    // A comment in the data ends before `endstream`, and so does Poppler's first token, a
+    // string perhaps; when there is none, Poppler takes the data as long as its `/Length`.
+    let mut first = Lexer::new(&bytes[..found], from);
+    let ok = matches!(ended, Some((_, Tok::Word(b"endstream"), _)))
+        && bytes[end..found].iter().any(|c| matches!(c, b'\n' | b'\r'))
+        && from <= found
+        && !(bytes[start..end].windows(8)).any(|w| w == b"endstrea" || w == b"endsteam")
+        && (first.next().is_some() || white(from.min(end)..end));
+    ok.then_some(start..end)
 }
 
 /// Whether the newest cross-reference section of `bytes` is a hybrid one (a table whose
@@ -1409,7 +1499,8 @@ pub(crate) fn compare_reading(bytes: &[u8], doc: &Document) -> Result<Reading, S
     }
     // lopdf keeps an object under the number its header gives, whichever entry led to it.
     // Other apps read the object as LimarePDF does when it is one whole object, followed by
-    // `endobj` or a stream's data, and, in an encrypted file, lopdf doesn't cut it short.
+    // `endobj` or a stream's data, as long as its `/Length` as lopdf took it, and, in an
+    // encrypted file, lopdf doesn't cut it short.
     let endobjs: Option<Vec<usize>> = encrypt.is_some().then(|| {
         (bytes.windows(6).enumerate())
             .filter(|(_, w)| *w == b"endobj")
@@ -1422,10 +1513,19 @@ pub(crate) fn compare_reading(bytes: &[u8], doc: &Document) -> Result<Reading, S
             let id = (num, generation);
             match header(bytes, offset as usize) {
                 Some((found, lx)) if found == id => {
-                    if doc.objects.contains_key(&id)
+                    let at = offset as usize;
+                    let held = doc.objects.get(&id);
+                    if held.is_some()
                         && (!whole_object(lx.clone(), encrypt.is_some(), &mut lengths)
                             || endobjs.as_deref().is_some_and(|endobjs| {
-                                cut_short(bytes, offset as usize, lx, &spec, endobjs)
+                                cut_short(bytes, at, lx, &spec, doc, endobjs)
+                            })
+                            || held.is_some_and(|o| match o {
+                                Object::Stream(s) => {
+                                    let decrypted = encrypt.is_some();
+                                    framed_data(bytes, at, s, &spec, Some(doc), decrypted).is_none()
+                                }
+                                _ => false,
                             }))
                     {
                         unsure.insert(num);
@@ -1458,23 +1558,13 @@ pub(crate) fn compare_reading(bytes: &[u8], doc: &Document) -> Result<Reading, S
         if !typed && !listed_in.contains_key(&c) {
             continue;
         }
-        // lopdf must have read the data other apps read: as it is in the file, or, decrypted,
-        // read before a line end and `endstream`.
-        let data = match spec.get(&c) {
-            Some(&Entry::InUse { offset, gen }) if gen == g => stream_data(bytes, offset, &spec),
+        // lopdf must have read the data other apps read.
+        let framed = match spec.get(&c) {
+            Some(&Entry::InUse { offset, gen }) if gen == g => {
+                framed_data(bytes, offset, s, &spec, None, encrypt.is_some())
+            }
             _ => None,
         };
-        let framed = data.filter(|r| match encrypt {
-            None => bytes[r.clone()] == s.content[..],
-            Some(_) => {
-                let rest = &bytes[r.end..];
-                let rest = (rest.strip_prefix(b"\r\n"))
-                    .or_else(|| rest.strip_prefix(b"\n"))
-                    .or_else(|| rest.strip_prefix(b"\r"))
-                    .unwrap_or(rest);
-                rest.starts_with(b"endstream")
-            }
-        });
         // pdf.js reads the last object on past the content: into the file after plain data,
         // and into the zeros filling its buffer after data it decrypts or decodes.
         let plain = encrypt.is_none() && matches!(s.dict.get(b"Filter"), Err(_) | Ok(Object::Null));
@@ -1737,6 +1827,7 @@ fn cut_short(
     at: usize,
     mut lx: Lexer,
     spec: &HashMap<u32, Entry>,
+    doc: &Document,
     endobjs: &[usize],
 ) -> bool {
     let from = lx.pos();
@@ -1749,7 +1840,7 @@ fn cut_short(
         _ if !skip_object(&mut lx, true) => return true,
         _ => match lx.clone().next_word() {
             Some((_, Tok::Word(b"stream"), _)) if matches!(first, Some((_, Tok::DictOpen, _))) => {
-                let Some(data) = stream_data(bytes, at, spec) else {
+                let Some(data) = stream_data(bytes, at, spec, Some(doc)) else {
                     return true;
                 };
                 let mut tail = Lexer::new(bytes, data.end);
@@ -5991,13 +6082,14 @@ mod tests {
     }
 
     /// Other apps take a stream's data as long as its `/Length`, written in its dictionary or
-    /// in an object of its own, when `endstream` and `endobj` follow.
+    /// in an object of its own, `endobj` perhaps glued to it, when `endstream` and `endobj`
+    /// follow.
     #[test]
     fn stream_data_is_as_long_as_its_length() {
         let none = HashMap::new();
         let data = |length: &str, tail: &str| {
             let file = format!("%x\n4 0 obj\n<< /Length {length} >>\nstream \t\r\nab{tail}");
-            stream_data(file.as_bytes(), 3, &none)
+            stream_data(file.as_bytes(), 3, &none, None)
         };
         let at = "%x\n4 0 obj\n<< /Length 2 >>\nstream \t\r\n".len();
         assert_eq!(data("2", "\nendstream\nendobj"), Some(at..at + 2));
@@ -6015,10 +6107,10 @@ mod tests {
         assert_eq!(data("2", "\nendstream"), None);
         // Not at an object's header, or no line end after `stream`.
         let file = b"%x\n4 0 obj\n<< /Length 2 >>\nstream\nab\nendstream\nendobj";
-        assert_eq!(stream_data(file, 3, &none), Some(at - 3..at - 1));
-        assert_eq!(stream_data(file, 5, &none), None);
+        assert_eq!(stream_data(file, 3, &none, None), Some(at - 3..at - 1));
+        assert_eq!(stream_data(file, 5, &none, None), None);
         let file = b"4 0 obj <</Length 2>> stream x\nab\nendstream\nendobj";
-        assert_eq!(stream_data(file, 0, &none), None);
+        assert_eq!(stream_data(file, 0, &none, None), None);
         // The length in an object of its own, where its entry says.
         let held = |length: &str, entry: Entry| {
             let head = "4 0 obj\n<< /Length 5 0 R >>\nstream\nab\nendstream\nendobj\n";
@@ -6030,13 +6122,16 @@ mod tests {
                 },
                 e => e,
             };
-            stream_data(file.as_bytes(), 0, &HashMap::from([(5, entry)]))
+            stream_data(file.as_bytes(), 0, &HashMap::from([(5, entry)]), None)
         };
         let at = "4 0 obj\n<< /Length 5 0 R >>\nstream\n".len();
         let listed = Entry::InUse { offset: 0, gen: 0 };
         assert_eq!(held("2 endobj", listed), Some(at..at + 2));
+        assert_eq!(held("2endobj", listed), Some(at..at + 2));
         assert_eq!(held("2", listed), None);
         assert_eq!(held("2.0 endobj", listed), None);
+        assert_eq!(held("2.0endobj", listed), None);
+        assert_eq!(held("endobj", listed), None);
         assert_eq!(held("2 endobj", Entry::InUse { offset: 0, gen: 1 }), None);
         assert_eq!(held("2 endobj", Entry::InUse { offset: 1, gen: 0 }), None);
         let compressed = Entry::Compressed {
@@ -6044,6 +6139,17 @@ mod tests {
             index: 0,
         };
         assert_eq!(held("2 endobj", compressed), None);
+        // In an object stream, as lopdf holds it, under generation 0 only.
+        let packed = |reference: &str, length: Object| {
+            let file = format!("4 0 obj\n<< /Length {reference} >>\nstream\nab\nendstream\nendobj");
+            let mut doc = Document::new();
+            doc.objects.insert((5, 0), length);
+            let spec = HashMap::from([(5, compressed)]);
+            stream_data(file.as_bytes(), 0, &spec, Some(&doc))
+        };
+        assert_eq!(packed("5 0 R", Object::Integer(2)), Some(at..at + 2));
+        assert_eq!(packed("5 0 R", Object::Real(2.0)), None);
+        assert_eq!(packed("5 1 R", Object::Integer(2)), None);
     }
 
     /// pdf.js reads on past the data it decrypts into the zeros filling its buffer, also
@@ -6220,6 +6326,29 @@ mod tests {
             let (found, held) = unsure(once);
             assert!(!found, "{once}");
             assert!(held.is_some(), "{once}");
+        }
+    }
+
+    /// lopdf takes a stream's data as long as its `/Length` only when a line end, at most,
+    /// comes before `endstream`, and of a `/Length` written as a real as many bytes, whatever
+    /// follows; what it decrypted can't show which data it took. Such a stream is unsure.
+    #[test]
+    fn an_encrypted_stream_framed_otherwise_is_unsure() {
+        let unsure = object_added_to_an_encrypted_file();
+        for framed in ["\n", "\r\n", "\r", ""] {
+            let (found, held) = unsure(&format!("<< /Length 2 >>\nstream\nAB{framed}endstream"));
+            assert!(!found, "{framed:?}");
+            assert!(held.is_some(), "{framed:?}");
+        }
+        for otherwise in [
+            "<< /Length 2. >>\nstream\nAB\nendstream",
+            "<< /Length 2 >>\nstream\nAB %x\nendstream",
+            "<< /Length 2 >>\nstream\nAB\n\nendstream",
+            "<< /Length 1 >>\nstream\nAB\nendstream",
+        ] {
+            let (found, held) = unsure(otherwise);
+            assert!(found, "{otherwise:?}");
+            assert!(held.is_some(), "{otherwise:?}");
         }
     }
 

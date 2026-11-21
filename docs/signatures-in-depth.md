@@ -627,8 +627,7 @@ refuses as malformed:
   no line end after it (as after compressed data); a reference written with a sign; a name with a `#` not followed
   by two hexadecimal digits; a number with a sign inside it (but for minus signs after its point and a digit, which
   every app skips); an index with other white space than PDF's between its numbers or running into the objects
-  without a space; data where `/Length` doesn't end it just before `endstream`, a line end at most apart (some apps
-  then take the data as long as `/Length`, LimarePDF's PDF library on to an `endstream` of its own finding); or more
+  without a space; data other apps may take otherwise, as for any stream (below); or more
   than a million objects or an object number above 2,147,483,647 (some apps then read none of them) is refused. A
   stream any entry names as an object stream is checked so, with or without its type;
 - an object in use that other apps may find otherwise, also when it serves only as a stream's length: one listed in
@@ -637,7 +636,18 @@ refuses as malformed:
   LimarePDF's PDF library reads the dictionary alone and other apps a stream),
   or whose header gives another number (a number may run straight into `endobj`, and a dictionary, array, string or
   name may instead be followed by the next object, the cross-reference information or the end of the file, which
-  every app reads alike); one in an object stream numbered as the place in the file of an object
+  every app reads alike); a stream whose data other apps may take otherwise. With a whole-number `/Length`, written
+  there or in an object of its own, followed by `endstream` and `endobj`, other apps take that much, and LimarePDF's
+  PDF library must take the same, give or take white space at its end. With any other `/Length`, or none, other
+  apps look for `endstream` themselves: pdf.js for `endstrea` or `endsteam` anywhere in the data, Poppler for the
+  word, past comments, after the first token where a whole-number `/Length` ends or else where the data starts (when
+  that token is `endstream`, it takes the data as long as `/Length`). So the library's data (as long as a `/Length`
+  written with a decimal point, on to an `endstream` of its own finding, or none without a `/Length`) must be
+  followed by a line end and `endstream`, perhaps with other white space and comments between, must hold neither of
+  pdf.js's words, and must be what Poppler takes, give or take what is between. In an encrypted file, whose
+  decrypted data can't show where white space ends, only data as long as a whole-number `/Length`, then
+  `endstream` a line end at most apart, counts;
+  one in an object stream numbered as the place in the file of an object
   listed outside it (pdf.js then takes the stream's copy of that object); one in an object stream LimarePDF's PDF
   library can't open; one in an object stream reached by a reference under a generation other than 0, which
   other apps follow and LimarePDF's PDF library doesn't; and, in an encrypted file, one holding `endobj` before its
