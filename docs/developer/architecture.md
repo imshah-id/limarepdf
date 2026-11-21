@@ -1248,7 +1248,9 @@ such a list gives by reference once; each node takes its own copy of a list with
 has pages of its own, inheriting from it (sharing one copy left lopdf, which reads no more of a page list than the
 file has objects, short of pages), and a file whose copies would take more than `MAX_SHARED_KIDS_COPIES` (64 MiB) is
 refused: `copy_size` counts what a copy holds on the heap, a dictionary's room for its entries and index too, as
-indexmap and hashbrown keep it (`tests/shared_kids_memory.rs` checks it against a counting allocator). It
+indexmap and hashbrown keep it, each allocation as glibc's malloc takes it, and `kid_copy_size` adds for a page
+written in the list its place among the document's objects and the `/Parent` it is given, with the room its map
+grows to (`tests/shared_kids_memory.rs` checks it against a counting allocator counting as malloc does). It
 reads the bytes' object headers once (`object_lines`) for the kids that aren't page nodes
 (`fields_sharing_their_kids_are_walked_once`, `widgets_shared_by_fields_go_to_the_first`,
 `page_tree_nodes_sharing_their_kids_queue_them_once`,

@@ -204,7 +204,7 @@ pub(crate) fn mend_page_tree(doc: &mut Document, bytes: &[u8]) -> Result<bool, P
                     }
                     None => {
                         let size = if a.iter().any(is_written_page_node) {
-                            a.iter().map(copy_size).sum()
+                            a.iter().map(kid_copy_size).sum()
                         } else {
                             0
                         };
@@ -286,6 +286,30 @@ pub(crate) fn copy_size(o: &Object) -> usize {
     size_of::<Object>() + held(o)
 }
 
+/// Roughly how much memory a node's copy of the kid `o` in a list takes, in bytes. A page or
+/// node written in the list becomes an object of its own, given a `/Parent` (which can grow
+/// its map), and the list a reference to it.
+fn kid_copy_size(o: &Object) -> usize {
+    match o {
+        Object::Dictionary(d) if is_page_node(d) => {
+            size_of::<Object>()
+                + object_entry()
+                + map_room(d.len() + 1)
+                + allocation(b"Parent".len())
+                + entries_held(d)
+        }
+        _ => copy_size(o),
+    }
+}
+
+/// The most an object of its own takes in the document's map of objects: its number and the
+/// object, in a node holding 11 of them (and 12 links to the nodes below, in the tree's inner
+/// nodes) that holds at least 5.
+fn object_entry() -> usize {
+    let node = 11 * (size_of::<ObjectId>() + size_of::<Object>()) + 12 * size_of::<usize>() + 16;
+    allocation(node) / 5
+}
+
 /// Roughly how much heap a copy of `o` holds.
 fn held(o: &Object) -> usize {
     match o {
@@ -299,27 +323,36 @@ fn held(o: &Object) -> usize {
     }
 }
 
-/// Roughly how much heap a copy of `d` holds. A copy of its map keeps room for as many
-/// entries as its index has, at most twice as many as it holds and at least 3, each a hash,
-/// a key and an object; its index has a slot for at most 16/7 of an entry each and at least
-/// 4, each a `usize` and a control byte, and 16 control bytes more.
+/// Roughly how much heap a copy of `d` holds.
 fn dictionary_held(d: &Dictionary) -> usize {
+    map_room(d.len()) + entries_held(d)
+}
+
+/// Roughly how much heap a dictionary's map of `n` entries keeps room in. A copy keeps room
+/// for as many entries as its index has, at most twice as many as it holds and at least 3,
+/// each a hash, a key and an object; its index has a slot for at most 16/7 of an entry each
+/// and at least 4, each a `usize` and a control byte, and 16 control bytes more. A map grown
+/// by an entry keeps no more room than one copied with it.
+fn map_room(n: usize) -> usize {
     let entry = size_of::<u64>() + size_of::<Vec<u8>>() + size_of::<Object>();
-    let slots = (d.len() * 16 / 7 + 1).max(4);
-    let room = allocation((2 * d.len()).max(3) * entry) + allocation(slots * 9 + 16);
-    room + d
-        .iter()
+    let slots = (n * 16 / 7 + 1).max(4);
+    allocation((2 * n).max(3) * entry) + allocation(slots * 9 + 16)
+}
+
+/// Roughly how much heap `d`'s keys and values hold.
+fn entries_held(d: &Dictionary) -> usize {
+    d.iter()
         .map(|(k, v)| allocation(k.len()) + held(v))
         .sum::<usize>()
 }
 
-/// The heap an allocation of `n` bytes takes: none for none, else at least the least an
-/// allocator gives with its header.
+/// The heap an allocation of `n` bytes takes: none for none, else as glibc's malloc takes
+/// it, the bytes and an 8-byte header in 16-byte steps, at least 32.
 fn allocation(n: usize) -> usize {
     if n == 0 {
         0
     } else {
-        n.max(32)
+        (n + 8).next_multiple_of(16).max(32)
     }
 }
 
