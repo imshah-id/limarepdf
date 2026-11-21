@@ -2267,54 +2267,64 @@ fn a_reference_to_an_object_in_a_stream_under_another_generation_is_refused() {
     assert!(Pdf::from_bytes(&ok, None).unwrap().differs().is_none());
 }
 
-/// lopdf and pdf.js take a key given twice as its last value, and so does Poppler while the
-/// dictionary has fewer than 32 entries, the repeats counted; from 32 Poppler sorts them and
-/// may take another. The page written again with other page sizes before its own passed as
-/// unchanged, in its own object and in an object stream, and so did a trailer naming another
-/// catalog before its own.
+/// lopdf and pdf.js take a key given twice as its last value, and so does Poppler's lookup
+/// while the dictionary has fewer than 32 entries, the repeats counted; from 32 Poppler sorts
+/// them and may take another, and of a font resource dictionary it takes the first, at any
+/// size. The page written again with other page sizes before its own passed as unchanged, at
+/// 32 entries, in its own object and in an object stream, and so did a trailer naming another
+/// catalog before its own; below 32, the page naming a new font `/F1` before its own did, and
+/// Poppler drew its text in the new font (review round 4). Values written alike read alike.
 #[test]
-fn a_dictionary_of_32_entries_with_a_key_repeated_is_refused() {
+fn a_dictionary_giving_a_key_twice_is_refused_unless_written_alike() {
     let b = approve(&base_pdf());
     let d = Document::load_mem(&b).unwrap();
     let (p, signed, _) = page_texts(&b);
     let own = dict(&d, p).len();
-    assert!(dict(&d, p).has(b"MediaBox"));
-    // The page with `/MediaBox` repeated until it has `entries` entries.
-    let page = |entries: usize| {
-        let sizes = " /MediaBox [0 0 1 1]".repeat(entries - own);
+    let size = format!("{:?}", dict(&d, p).get(b"MediaBox").unwrap());
+    // The page with `/MediaBox`, written `value`, given until it has `entries` entries.
+    let sized = |entries: usize, value: &str| {
+        let sizes = format!(" /MediaBox {value}").repeat(entries - own);
         format!("<<{sizes}{}", signed.strip_prefix("<<").unwrap())
     };
     let c = d.max_id + 1;
     // The page written again in its own object, or in an object stream when `packed`.
-    let rewritten = |entries, packed| {
+    let rewritten = |page: &str, packed| {
         if packed {
-            let objstm = object_stream(c, &[(p.0, 0)], &page(entries), "");
+            let objstm = object_stream(c, &[(p.0, 0)], page, "");
             by_hand(&b, &[(c, objstm)], &[(p.0, c, 0)])
         } else {
-            by_hand(&b, &[(p.0, written(p.0, &page(entries)))], &[])
+            by_hand(&b, &[(p.0, written(p.0, page))], &[])
         }
     };
     let differs = |b: &[u8]| Pdf::from_bytes(b, None).unwrap().differs().is_some();
     for packed in [false, true] {
-        let bad = rewritten(32, packed);
-        assert_eq!(changes(&bad), read_otherwise(p.0), "packed {packed}");
-        assert!(differs(&bad), "packed {packed}");
-        let ok = rewritten(31, packed);
-        assert_eq!(changes(&ok), [], "packed {packed}");
-        assert!(!differs(&ok), "packed {packed}");
+        for entries in [own + 1, 31, 32] {
+            let bad = rewritten(&sized(entries, "[0 0 1 1]"), packed);
+            assert_eq!(
+                changes(&bad),
+                read_otherwise(p.0),
+                "{entries}, packed {packed}"
+            );
+            assert!(differs(&bad), "{entries}, packed {packed}");
+            let ok = rewritten(&sized(entries, &size), packed);
+            assert_eq!(changes(&ok), [], "{entries}, packed {packed}");
+            assert!(!differs(&ok), "{entries}, packed {packed}");
+        }
     }
-    // A revision listing nothing, whose trailer has `entries` entries.
+    // A revision listing nothing, whose trailer has `entries` entries, the first `/Root`
+    // naming `first`.
     let r = root(&d);
-    let trailer = |entries: usize| {
+    let trailer = |entries: usize, first: ObjectId| {
         let mut out = [&b[..], b"\n"].concat();
         let at = out.len();
         let more: String = (4..entries).map(|i| format!(" /E{i} 0")).collect();
         out.extend_from_slice(
             format!(
-                "xref\n0 0\ntrailer\n<< /Size {c} /Prev {}{more} /Root {} 0 R /Root {} {} R >>\n\
+                "xref\n0 0\ntrailer\n<< /Size {c} /Prev {}{more} /Root {} {} R /Root {} {} R >>\n\
                  startxref\n{at}\n%%EOF\n",
                 last_startxref(&b),
-                p.0,
+                first.0,
+                first.1,
                 r.0,
                 r.1
             )
@@ -2322,13 +2332,46 @@ fn a_dictionary_of_32_entries_with_a_key_repeated_is_refused() {
         );
         (out, at)
     };
-    let (bad, at) = trailer(32);
+    let (bad, at) = trailer(32, p);
     let want = ChangeKind::Malformed(format!(
         "the cross-reference section at byte {at} is malformed"
     ));
     assert_eq!(changes(&bad), [(want, Some(Refusal::Never))]);
     assert!(differs(&bad));
-    let (ok, _) = trailer(31);
+    for (entries, first) in [(31, p), (32, r)] {
+        let (ok, _) = trailer(entries, first);
+        assert_eq!(changes(&ok), [], "{entries}");
+        assert!(!differs(&ok), "{entries}");
+    }
+
+    // A page drawing in font `/F1`, signed; then its fonts naming a new font `/F1` (or `/F#31`,
+    // the same) before its own.
+    let mut doc = Document::load_mem(&base_pdf()).unwrap();
+    let helvetica =
+        dictionary! { "Type" => "Font", "Subtype" => "Type1", "BaseFont" => "Helvetica" };
+    let resources = dictionary! { "Font" => dictionary! { "F1" => helvetica } };
+    let mut drawn = dict(&doc, page(&doc));
+    drawn.set("Resources", resources);
+    doc.set_object(page(&doc), drawn);
+    let mut unsigned = Vec::new();
+    doc.save_to(&mut unsigned).unwrap();
+    let b = approve(&unsigned);
+    let d = Document::load_mem(&b).unwrap();
+    let (p, signed, _) = page_texts(&b);
+    assert!(signed.contains("/F1 <<"), "{signed}");
+    let n = d.max_id + 1;
+    let courier = written(n, "<< /Type /Font /Subtype /Type1 /BaseFont /Courier >>");
+    for name in ["F1", "F#31"] {
+        let twice = signed.replacen("/F1 <<", &format!("/F1 {n} 0 R /{name} <<"), 1);
+        let bad = by_hand(
+            &b,
+            &[(p.0, written(p.0, &twice)), (n, courier.clone())],
+            &[],
+        );
+        assert_eq!(changes(&bad), read_otherwise(p.0), "{name}");
+        assert!(differs(&bad), "{name}");
+    }
+    let ok = by_hand(&b, &[(p.0, written(p.0, &signed)), (n, courier)], &[]);
     assert_eq!(changes(&ok), []);
     assert!(!differs(&ok));
 }

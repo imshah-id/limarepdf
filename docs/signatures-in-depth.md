@@ -647,9 +647,12 @@ refuses as malformed:
   object it names that holds text or stream data, which LimarePDF's PDF library decrypts, is refused where it is
   used, and so is every object in an object stream holding one it names; when the encryption dictionary itself is in
   an object stream or can't be read as written, the whole revision is;
-- a dictionary of 32 entries or more giving a key twice, at any depth: LimarePDF's PDF library and pdf.js take its
-  last value, and so does Poppler below 32 entries, but from 32 Poppler sorts them and may take another. The object
-  holding it is refused where it is used; in cross-reference information, the whole revision is;
+- a dictionary giving a key twice, at any depth, with its values written differently: LimarePDF's PDF library and
+  pdf.js take the last value, and so does Poppler below 32 entries, but from 32 Poppler sorts them and may take
+  another, and of a font resources dictionary it takes the first at any size. In an object, the object is refused
+  where it is used, at any size; in cross-reference information, from 32 entries, the whole revision is. In an
+  encrypted file, so is an object giving `/Contents` twice, its values written alike or not: Poppler decrypts the
+  last twice, other apps once at most;
 - a reference, followed from the catalog or the document information, to an object LimarePDF's PDF library doesn't
   have: when the newest cross-reference section is a table, Poppler can't read it, scans the whole file for objects
   and from then on reads every object from what it found; when the reference gives another generation than the

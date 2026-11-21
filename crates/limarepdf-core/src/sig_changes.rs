@@ -1010,46 +1010,74 @@ fn revision_end(bytes: &[u8], after: usize, at: usize) -> Option<usize> {
 /// One direct object, enough for cross-reference dictionaries: numbers, names (with
 /// `#xx` escapes), references, arrays, dictionaries. Strings are kept empty.
 fn read_object(lx: &mut Lexer, depth: usize) -> Option<Object> {
-    object(lx, depth, true)
+    object(lx, depth, Read::Keep)
 }
 
-/// Whether one direct object reads as [`read_object`] reads it, without building it.
-fn skip_object(lx: &mut Lexer) -> bool {
-    object(lx, 0, false).is_some()
+/// Whether one direct object of the file's body reads as [`read_object`] reads it, without
+/// building it; `decrypted` when readers decrypt it, as one outside object streams in an
+/// encrypted file.
+fn skip_object(lx: &mut Lexer, decrypted: bool) -> bool {
+    object(lx, 0, Read::Check { decrypted }).is_some()
 }
 
-/// [`read_object`], keeping what arrays and dictionaries hold only when `keep`: otherwise
-/// they read as null. A dictionary of 32 entries or more with a key given twice doesn't read:
-/// lopdf and pdf.js take the last value, but Poppler, from 32 entries, sorts them and may take
-/// another.
-fn object(lx: &mut Lexer, depth: usize, keep: bool) -> Option<Object> {
+/// How [`object`] reads.
+#[derive(Clone, Copy)]
+enum Read {
+    /// Keeping what arrays and dictionaries hold, as cross-reference information is read.
+    Keep,
+    /// Only whether an object of the file's body reads alike: arrays and dictionaries read as
+    /// null.
+    Check { decrypted: bool },
+}
+
+/// [`read_object`], or only checking, as `read` says. lopdf and pdf.js take the last value of
+/// a key given twice, and so does Poppler's lookup below 32 entries; but from 32 Poppler sorts
+/// them and may take another, and of a font resource dictionary it takes the first, at any
+/// size. So a dictionary giving a key twice with values written differently doesn't read: in
+/// cross-reference information from 32 entries, in an object at any size. Nor does one giving
+/// `/Contents` twice in an object readers decrypt: Poppler decrypts the last value twice.
+fn object(lx: &mut Lexer, depth: usize, read: Read) -> Option<Object> {
     if depth > 32 {
         return None;
     }
+    let keep = matches!(read, Read::Keep);
     let (_, tok, _) = lx.next()?;
     Some(match tok {
         Tok::DictOpen => {
             let mut d = Dictionary::new();
+            // Each key, and its value as written.
             let mut keys = Vec::new();
             loop {
                 match lx.next()? {
                     (_, Tok::DictClose, _) => break,
                     (_, Tok::Name(k), _) => {
-                        let v = object(lx, depth + 1, keep)?;
+                        let mut from = lx.pos();
+                        let v = object(lx, depth + 1, read)?;
                         let k = decode_name(k)?;
                         if keep {
                             d.set(k.clone(), v);
                         }
-                        keys.push(k);
+                        let bytes = lx.bytes();
+                        while is_white(bytes[from]) {
+                            from += 1;
+                        }
+                        keys.push((k, &bytes[from..lx.pos()]));
                     }
                     _ => return None,
                 }
             }
-            if keys.len() >= 32 {
-                keys.sort_unstable();
-                if keys.windows(2).any(|w| w[0] == w[1]) {
-                    return None;
-                }
+            keys.sort_unstable();
+            let twice = keys.windows(2).any(|w| {
+                w[0].0 == w[1].0
+                    && match read {
+                        Read::Keep => keys.len() >= 32 && w[0].1 != w[1].1,
+                        Read::Check { decrypted } => {
+                            w[0].1 != w[1].1 || (decrypted && w[0].0 == b"Contents")
+                        }
+                    }
+            });
+            if twice {
+                return None;
             }
             if keep {
                 Object::Dictionary(d)
@@ -1065,7 +1093,7 @@ fn object(lx: &mut Lexer, depth: usize, keep: bool) -> Option<Object> {
                     *lx = look;
                     break;
                 }
-                let o = object(lx, depth + 1, keep)?;
+                let o = object(lx, depth + 1, read)?;
                 if keep {
                     a.push(o);
                 }
@@ -1395,7 +1423,7 @@ pub(crate) fn compare_reading(bytes: &[u8], doc: &Document) -> Result<Reading, S
             match header(bytes, offset as usize) {
                 Some((found, lx)) if found == id => {
                     if doc.objects.contains_key(&id)
-                        && (!whole_object(lx.clone(), &mut lengths)
+                        && (!whole_object(lx.clone(), encrypt.is_some(), &mut lengths)
                             || endobjs.as_deref().is_some_and(|endobjs| {
                                 cut_short(bytes, offset as usize, lx, &spec, endobjs)
                             }))
@@ -1657,8 +1685,9 @@ fn holds_string(o: &Object) -> bool {
 /// without `endobj`; not a number or a keyword, which lopdf may read on into a reference.
 /// A dictionary followed by `stream` counts only with a line end after the keyword (spaces
 /// and tabs aside): without one lopdf reads the dictionary alone, where Poppler and pdf.js
-/// read a stream. Adds the object a stream takes its `/Length` from to `lengths`.
-fn whole_object(mut lx: Lexer, lengths: &mut HashSet<ObjectId>) -> bool {
+/// read a stream. `decrypted` as for [`skip_object`]. Adds the object a stream takes its
+/// `/Length` from to `lengths`.
+fn whole_object(mut lx: Lexer, decrypted: bool, lengths: &mut HashSet<ObjectId>) -> bool {
     let mut dict = lx.clone();
     let first = lx.clone().next();
     if let Some((_, Tok::Word(w), _)) = first {
@@ -1666,7 +1695,7 @@ fn whole_object(mut lx: Lexer, lengths: &mut HashSet<ObjectId>) -> bool {
             return number(n).is_some();
         }
     }
-    if !skip_object(&mut lx) {
+    if !skip_object(&mut lx, decrypted) {
         return false;
     }
     let ends_itself = first.is_some_and(|(_, t, _)| {
@@ -1717,7 +1746,7 @@ fn cut_short(
     let first = lx.clone().next();
     let end = match first {
         Some((_, Tok::Word(w), end)) if w.ends_with(b"endobj") => end,
-        _ if !skip_object(&mut lx) => return true,
+        _ if !skip_object(&mut lx, true) => return true,
         _ => match lx.clone().next_word() {
             Some((_, Tok::Word(b"stream"), _)) if matches!(first, Some((_, Tok::DictOpen, _))) => {
                 let Some(data) = stream_data(bytes, at, spec) else {
@@ -1888,7 +1917,7 @@ fn laid_out_alike(read: &[u8], len: usize, first: usize, offsets: &[usize]) -> b
         let mut lx = Lexer::new(read, at);
         if start(at - shift) != start(at)
             || (i == 0 && start(first) != start(at))
-            || !skip_object(&mut lx)
+            || !skip_object(&mut lx, false)
             || lx.pos() > window
         {
             return false;
@@ -1910,7 +1939,7 @@ fn laid_out_alike(read: &[u8], len: usize, first: usize, offsets: &[usize]) -> b
                 Some((_, Tok::Word(b"endobj"), _)) => lx = look,
                 Some((_, Tok::Word(w), e)) if pdfjs_reads_zero(read, w, e) => lx = look,
                 Some(_) => {
-                    if !skip_object(&mut lx) {
+                    if !skip_object(&mut lx, false) {
                         return false;
                     }
                 }
@@ -5762,7 +5791,7 @@ mod tests {
     /// lopdf may read on into a reference.
     #[test]
     fn an_object_ends_where_every_reader_ends_it() {
-        let whole = |s: &str| whole_object(Lexer::new(s.as_bytes(), 0), &mut HashSet::new());
+        let whole = |s: &str| whole_object(Lexer::new(s.as_bytes(), 0), false, &mut HashSet::new());
         for ok in [
             "5 endobj",
             "58endobj",
@@ -5890,39 +5919,75 @@ mod tests {
         }
     }
 
-    /// A key given twice reads as its last value in lopdf and pdf.js, and in Poppler while the
-    /// dictionary has fewer than 32 entries, the repeats counted. From 32 Poppler sorts them
-    /// and may take another, so such a dictionary is refused, at any depth.
+    /// A key given twice reads as its last value in lopdf and pdf.js, and in Poppler's lookup
+    /// while the dictionary has fewer than 32 entries, the repeats counted. From 32 Poppler
+    /// sorts them and may take another, and of a font resource dictionary it takes the first at
+    /// any size. So values written differently are refused, at any depth: in cross-reference
+    /// information from 32 entries, in an object at any size. Values written alike read alike,
+    /// but for `/Contents` in an object readers decrypt: Poppler decrypts the last one twice.
     #[test]
-    fn a_key_repeated_reads_alike_below_32_entries() {
-        // `others` distinct entries, then `/K 1` and `/{last} 2`.
-        let dict = |others: usize, last: &str| {
+    fn a_key_repeated_reads_alike_only_written_alike() {
+        // `others` distinct entries, then `/K 1` and `/{last} {value}`.
+        let dict = |others: usize, last: &str, value: &str| {
             let mut s = String::from("<<");
             for i in 0..others {
                 s += &format!(" /E{i} 0");
             }
-            format!("{s} /K 1 /{last} 2 >>")
+            format!("{s} /K 1 /{last} {value} >>")
         };
         let read = |w: &str| read_object(&mut Lexer::new(w.as_bytes(), 0), 0);
-        let skip = |w: &str| skip_object(&mut Lexer::new(w.as_bytes(), 0));
-        let Some(Object::Dictionary(d)) = read(&dict(29, "K")) else {
+        let skip = |w: &str, decrypted| skip_object(&mut Lexer::new(w.as_bytes(), 0), decrypted);
+        let Some(Object::Dictionary(d)) = read(&dict(29, "K", "2")) else {
             panic!("31 entries");
         };
         assert_eq!((d.len(), d.get(b"K").unwrap()), (30, &Object::Integer(2)));
-        assert!(skip(&dict(29, "K")));
-        for ok in [dict(30, "L"), format!("[{}]", dict(29, "K"))] {
-            assert!(read(&ok).is_some() && skip(&ok), "{ok}");
+        for ok in [
+            dict(30, "L", "2"),
+            dict(30, "K", "1"),
+            dict(300, "#4B", "\n 1"),
+            format!("[{}]", dict(29, "K", "2")),
+        ] {
+            assert!(read(&ok).is_some(), "{ok}");
         }
         for bad in [
-            dict(30, "K"),
-            dict(30, "#4B"),
-            dict(300, "K"),
-            format!("[1 {}]", dict(30, "K")),
-            format!("<< /A {} >>", dict(30, "K")),
+            dict(30, "K", "2"),
+            dict(30, "#4B", "2"),
+            dict(300, "K", "2"),
+            format!("[1 {}]", dict(30, "K", "2")),
+            format!("<< /A {} >>", dict(30, "K", "2")),
         ] {
             assert_eq!(read(&bad), None, "{bad}");
-            assert!(!skip(&bad), "{bad}");
         }
+
+        for decrypted in [false, true] {
+            for ok in [
+                dict(0, "L", "2"),
+                dict(0, "K", "1"),
+                dict(0, "#4B", "\r\n1"),
+                dict(300, "K", "1"),
+                "<< /K << /A 1 >> /K << /A 1 >> >>".into(),
+                "<< /Contents (a) /K 1 /K 1 >>".into(),
+            ] {
+                assert!(skip(&ok, decrypted), "{ok}, {decrypted}");
+            }
+            for bad in [
+                dict(0, "K", "2"),
+                dict(0, "#4B", "2"),
+                dict(0, "K", "1.0"),
+                dict(0, "K", "%x\n1"),
+                dict(29, "K", "2"),
+                dict(300, "K", "2"),
+                format!("[1 {}]", dict(0, "K", "2")),
+                format!("<< /A {} >>", dict(0, "K", "2")),
+                "<< /F1 5 0 R /F#31 6 0 R >>".into(),
+            ] {
+                assert!(!skip(&bad, decrypted), "{bad}, {decrypted}");
+            }
+        }
+        let contents = "<< /Contents (a) /Contents (a) >>";
+        assert!(skip(contents, false));
+        assert!(!skip(contents, true));
+        assert!(!skip(&format!("[<< /A {contents} >>]"), true));
     }
 
     /// Other apps take a stream's data as long as its `/Length`, written in its dictionary or
@@ -6099,47 +6164,7 @@ mod tests {
     /// one. Such an object is unsure; one whose first `endobj` ends it isn't.
     #[test]
     fn an_encrypted_object_lopdf_cuts_at_an_endobj_inside_it_is_unsure() {
-        let mut d = Document::with_version("1.7");
-        let kids = Vec::<Object>::new();
-        let pages = d.add_object(dictionary! { "Type" => "Pages", "Kids" => kids, "Count" => 0 });
-        let root = d.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages });
-        d.trailer.set("Root", root);
-        let encrypt = encrypt_with_identity(&mut d);
-        let mut base = Vec::new();
-        d.save_to(&mut base).unwrap();
-        let prev = Document::load_mem(&base).unwrap().xref_start;
-        // Whether the object written `text` is unsure, and what lopdf holds.
-        let unsure = |text: &str| {
-            let (n, x) = (d.max_id + 1, d.max_id + 2);
-            let mut b = [&base[..], b"\n"].concat();
-            let at_n = b.len();
-            b.extend_from_slice(format!("{n} 0 obj\n{text}\nendobj\n").as_bytes());
-            let at = b.len();
-            let row =
-                |f1: usize| [&[1][..], &u32::try_from(f1).unwrap().to_be_bytes(), &[0, 0]].concat();
-            let rows = [row(at_n), row(at)].concat();
-            b.extend_from_slice(
-                format!(
-                    "{x} 0 obj\n<< /Type /XRef /W [1 4 2] /Index [{n} 2] /Size {} /Root {} 0 R \
-                     /Encrypt {} 0 R /ID [<{id}> <{id}>] /Prev {prev} /Length {} >>\nstream\n",
-                    x + 1,
-                    root.0,
-                    encrypt.0,
-                    rows.len(),
-                    id = "07".repeat(16)
-                )
-                .as_bytes(),
-            );
-            b.extend_from_slice(&rows);
-            b.extend_from_slice(
-                format!("\nendstream\nendobj\nstartxref\n{at}\n%%EOF\n").as_bytes(),
-            );
-            let read = Document::load_mem(&b).unwrap();
-            assert!(read.encryption_state.is_some());
-            let held = read.objects.get(&(n, 0)).cloned();
-            let found = compare_reading(&b, &read).unwrap().unsure.contains(&n);
-            (found, held)
-        };
+        let unsure = object_added_to_an_encrypted_file();
         let content = |o: Option<Object>| o.unwrap().as_stream().unwrap().content.clone();
 
         let data = "AB\nendstream\nendobj\nCD";
@@ -6169,6 +6194,77 @@ mod tests {
             let (cut, held) = unsure(whole);
             assert!(!cut, "{whole}");
             assert!(held.is_some(), "{whole}");
+        }
+    }
+
+    /// Reading a dictionary in an encrypted object, Poppler leaves its first `/Contents` as it
+    /// is and decrypts any repeat; then, but in a signature, it decrypts the last value. So a
+    /// `/Contents` given twice is decrypted twice in Poppler, where lopdf and pdf.js decrypt it
+    /// once at most: such an object is unsure, its values written alike or not.
+    #[test]
+    fn an_encrypted_object_giving_contents_twice_is_unsure() {
+        let unsure = object_added_to_an_encrypted_file();
+        for twice in [
+            "<< /Contents (a) /Contents (a) >>",
+            "<< /Contents (a) /Contents (b) >>",
+            "[<< /A << /Contents (a) /Contents (a) >> >>]",
+        ] {
+            let (found, held) = unsure(twice);
+            assert!(found, "{twice}");
+            assert!(held.is_some(), "{twice}");
+        }
+        for once in [
+            "<< /Contents (a) /A (a) >>",
+            "<< /A << /Contents (a) >> /Contents (a) >>",
+        ] {
+            let (found, held) = unsure(once);
+            assert!(!found, "{once}");
+            assert!(held.is_some(), "{once}");
+        }
+    }
+
+    /// An encrypted file (Identity crypt filter), and how a revision adding an object written
+    /// `text` reads: whether that object is unsure, and what lopdf holds.
+    fn object_added_to_an_encrypted_file() -> impl Fn(&str) -> (bool, Option<Object>) {
+        let mut d = Document::with_version("1.7");
+        let kids = Vec::<Object>::new();
+        let pages = d.add_object(dictionary! { "Type" => "Pages", "Kids" => kids, "Count" => 0 });
+        let root = d.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages });
+        d.trailer.set("Root", root);
+        let encrypt = encrypt_with_identity(&mut d);
+        let mut base = Vec::new();
+        d.save_to(&mut base).unwrap();
+        let prev = Document::load_mem(&base).unwrap().xref_start;
+        move |text: &str| {
+            let (n, x) = (d.max_id + 1, d.max_id + 2);
+            let mut b = [&base[..], b"\n"].concat();
+            let at_n = b.len();
+            b.extend_from_slice(format!("{n} 0 obj\n{text}\nendobj\n").as_bytes());
+            let at = b.len();
+            let row =
+                |f1: usize| [&[1][..], &u32::try_from(f1).unwrap().to_be_bytes(), &[0, 0]].concat();
+            let rows = [row(at_n), row(at)].concat();
+            b.extend_from_slice(
+                format!(
+                    "{x} 0 obj\n<< /Type /XRef /W [1 4 2] /Index [{n} 2] /Size {} /Root {} 0 R \
+                     /Encrypt {} 0 R /ID [<{id}> <{id}>] /Prev {prev} /Length {} >>\nstream\n",
+                    x + 1,
+                    root.0,
+                    encrypt.0,
+                    rows.len(),
+                    id = "07".repeat(16)
+                )
+                .as_bytes(),
+            );
+            b.extend_from_slice(&rows);
+            b.extend_from_slice(
+                format!("\nendstream\nendobj\nstartxref\n{at}\n%%EOF\n").as_bytes(),
+            );
+            let read = Document::load_mem(&b).unwrap();
+            assert!(read.encryption_state.is_some());
+            let held = read.objects.get(&(n, 0)).cloned();
+            let found = compare_reading(&b, &read).unwrap().unsure.contains(&n);
+            (found, held)
         }
     }
 
