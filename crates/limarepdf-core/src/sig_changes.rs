@@ -6747,8 +6747,8 @@ mod tests {
         let file = b"4 0 obj <</Length 2>> stream x\nab\nendstream\nendobj";
         assert_eq!(stream_data(file, 0, &none, None), None);
         // The length in an object of its own, where its entry says.
+        let head = "4 0 obj\n<< /Length 5 0 R >>\nstream\nab\nendstream\nendobj\n";
         let held = |length: &str, entry: Entry| {
-            let head = "4 0 obj\n<< /Length 5 0 R >>\nstream\nab\nendstream\nendobj\n";
             let file = format!("{head}5 0 obj {length}");
             let entry = match entry {
                 Entry::InUse { offset: 0, gen } => Entry::InUse {
@@ -6769,6 +6769,14 @@ mod tests {
         assert_eq!(held("endobj", listed), None);
         assert_eq!(held("2 endobj", Entry::InUse { offset: 0, gen: 1 }), None);
         assert_eq!(held("2 endobj", Entry::InUse { offset: 1, gen: 0 }), None);
+        // Another object's header where the entry says (round 4's c18).
+        let file = format!("{head}6 0 obj 2 endobj");
+        let other = Entry::InUse {
+            offset: head.len(),
+            gen: 0,
+        };
+        let spec = HashMap::from([(5, other)]);
+        assert_eq!(stream_data(file.as_bytes(), 0, &spec, None), None);
         let compressed = Entry::Compressed {
             container: 6,
             index: 0,
@@ -6792,7 +6800,7 @@ mod tests {
     /// `-.` at the end of an object stream fails, where before a line end it reads as 0.
     #[test]
     fn data_decrypted_unchanged_is_not_read_on_into_the_file() {
-        let unsure = encrypted_page_in_a_stream(false);
+        let unsure = encrypted_page_in_a_stream(false, 1);
         assert!(!unsure("", "\n", true));
         assert!(unsure(" -.", "\n", true));
     }
@@ -6801,9 +6809,18 @@ mod tests {
     /// object stream, with or without `/Type /ObjStm`; LimarePDF checked typed ones only.
     #[test]
     fn an_encrypted_files_object_stream_without_its_type_is_checked() {
-        let unsure = encrypted_page_in_a_stream(false);
+        let unsure = encrypted_page_in_a_stream(false, 1);
         assert!(!unsure("", "\n", false));
         assert!(unsure(" -.", "\n", false));
+    }
+
+    /// An object stream whose index lopdf reads and other apps don't, such as one whose `/N`
+    /// counts more objects than it lists (Poppler drops the stream, pdf.js fails the object),
+    /// is unsure without its type too, which lopdf opens in an encrypted file (round 4's c18).
+    #[test]
+    fn an_untyped_object_stream_whose_index_other_apps_refuse_is_unsure() {
+        assert!(!encrypted_page_in_a_stream(false, 1)("", "\n", false));
+        assert!(encrypted_page_in_a_stream(false, 2)("", "\n", false));
     }
 
     /// pdf.js reads the objects the encryption dictionary names before it can decrypt, so an
@@ -6811,7 +6828,7 @@ mod tests {
     /// object in it is kept as read so.
     #[test]
     fn an_object_stream_read_before_decrypting_is_unsure() {
-        let unsure = encrypted_page_in_a_stream(true);
+        let unsure = encrypted_page_in_a_stream(true, 1);
         assert!(unsure("", "\n", true));
     }
 
@@ -6820,7 +6837,7 @@ mod tests {
     /// own finding, which other apps don't. What it decrypted can't show which it took.
     #[test]
     fn an_encrypted_object_stream_framed_otherwise_is_unsure() {
-        let unsure = encrypted_page_in_a_stream(false);
+        let unsure = encrypted_page_in_a_stream(false, 1);
         for framed in ["\n", "\r\n", "\r", ""] {
             assert!(!unsure("", framed, true), "{framed:?}");
         }
@@ -6857,6 +6874,73 @@ mod tests {
         let string = dictionary! { "A" => vec![Object::string_literal("x")] };
         assert!(unsure(string.into()));
         assert!(unsure(Stream::new(dictionary! {}, b"x".to_vec()).into()));
+    }
+
+    /// Other apps decrypt with the encryption dictionary as written, which lopdf no longer
+    /// holds once it decrypts: one LimarePDF can't read so is refused, such as one of 32 entries
+    /// giving a key twice written differently, Poppler taking the first value and lopdf the
+    /// last; one of 31 isn't (round 4's c17).
+    #[test]
+    fn an_encryption_dictionary_read_otherwise_is_refused() {
+        let mut d = Document::with_version("1.7");
+        let kids = Vec::<Object>::new();
+        let pages = d.add_object(dictionary! { "Type" => "Pages", "Kids" => kids, "Count" => 0 });
+        let root = d.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages });
+        d.trailer.set("Root", root);
+        let encrypt = encrypt_with_identity(&mut d);
+        let held = d.get_dictionary(encrypt).unwrap().len();
+        let mut base = Vec::new();
+        d.save_to(&mut base).unwrap();
+        let read = Document::load_mem(&base).unwrap();
+        let Some(&XrefEntry::Normal { offset, .. }) = read.reference_table.get(encrypt.0) else {
+            panic!("the encryption dictionary has no entry");
+        };
+        let written = &base[offset as usize..];
+        let open = written.windows(2).position(|w| w == b"<<").unwrap();
+        let end = written.windows(6).position(|w| w == b"endobj").unwrap();
+        let close = written[..end].windows(2).rposition(|w| w == b">>").unwrap();
+        // The dictionary written again with `entries` in all, `/Z0` given twice.
+        let decrypting = |entries: usize| {
+            let added: String = (1..entries - held - 1)
+                .map(|i| format!(" /Z{i} 0"))
+                .collect();
+            let mut b = [&base[..], b"\n"].concat();
+            let at_e = b.len();
+            b.extend_from_slice(format!("{} 0 obj\n", encrypt.0).as_bytes());
+            b.extend_from_slice(&written[open..close]);
+            b.extend_from_slice(format!(" /Z0 1 /Z0 2{added} >>\nendobj\n").as_bytes());
+            let (x, at) = (d.max_id + 1, b.len());
+            let row =
+                |f1: usize| [&[1][..], &u32::try_from(f1).unwrap().to_be_bytes(), &[0, 0]].concat();
+            let rows = [row(at_e), row(at)].concat();
+            b.extend_from_slice(
+                format!(
+                    "{x} 0 obj\n<< /Type /XRef /W [1 4 2] /Index [{} 1 {x} 1] /Size {} \
+                     /Root {} 0 R /Encrypt {} 0 R /ID [<{id}> <{id}>] /Prev {} /Length {} >>\n\
+                     stream\n",
+                    encrypt.0,
+                    x + 1,
+                    root.0,
+                    encrypt.0,
+                    read.xref_start,
+                    rows.len(),
+                    id = "07".repeat(16)
+                )
+                .as_bytes(),
+            );
+            b.extend_from_slice(&rows);
+            b.extend_from_slice(
+                format!("\nendstream\nendobj\nstartxref\n{at}\n%%EOF\n").as_bytes(),
+            );
+            let read = Document::load_mem(&b).unwrap();
+            assert!(read.encryption_state.is_some());
+            compare_reading(&b, &read).map(|_| ())
+        };
+        assert_eq!(decrypting(31), Ok(()));
+        assert_eq!(
+            decrypting(32),
+            Err("they may decrypt it with another encryption dictionary".into())
+        );
     }
 
     /// Looking for `stream` after an object the encryption dictionary names reads no further
@@ -7055,9 +7139,9 @@ mod tests {
 
     /// An encrypted file (Identity crypt filter) and a revision taking its page, then `end`,
     /// from an unfiltered object stream, typed `/ObjStm` or not, `framing` between its data and
-    /// `endstream`; the encryption dictionary names the page when `named`. Whether the page is
-    /// unsure.
-    fn encrypted_page_in_a_stream(named: bool) -> impl Fn(&str, &str, bool) -> bool {
+    /// `endstream`, its `/N` `listed` where its index lists the page alone; the encryption
+    /// dictionary names the page when `named`. Whether the page is unsure.
+    fn encrypted_page_in_a_stream(named: bool, listed: usize) -> impl Fn(&str, &str, bool) -> bool {
         let mut d = Document::with_version("1.7");
         let pages = d.new_object_id();
         let page = d.add_object(dictionary! { "Type" => "Page", "Parent" => pages });
@@ -7082,7 +7166,7 @@ mod tests {
             let kind = if typed { "/Type /ObjStm " } else { "" };
             b.extend_from_slice(
                 format!(
-                    "{n} 0 obj\n<< {kind}/N 1 /First {} /Length {} >>\nstream\n\
+                    "{n} 0 obj\n<< {kind}/N {listed} /First {} /Length {} >>\nstream\n\
                      {index}{body}{framing}endstream\nendobj\n",
                     index.len(),
                     index.len() + body.len()
