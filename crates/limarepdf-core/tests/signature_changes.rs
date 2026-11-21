@@ -927,32 +927,55 @@ fn a_cross_reference_stream_with_narrow_rows_is_refused() {
 /// `/W [w[0] w[1] 0]`: type 1 in `w[0]` bytes (none or one) and its offset in `w[1]`. When
 /// `hybrid`, a table lists only that stream and names it with `/XRefStm`.
 fn object_one_in_rows(b: &[u8], body: &str, w: [usize; 2], hybrid: bool) -> Vec<u8> {
+    let rows = |at_1: u32| {
+        assert!(at_1 < 1 << (8 * w[1]));
+        let mut row = vec![1; w[0]];
+        row.extend_from_slice(&at_1.to_be_bytes()[4 - w[1]..]);
+        row
+    };
+    let keys = format!("/W [{} {} 0] /Index [1 1]", w[0], w[1]);
+    object_one_listed(b, body, &[], &keys, |at| rows(at[0]), "", hybrid)
+}
+
+/// A revision written by hand: object 1 as `body`, then `more` (number and text), listed in a
+/// cross-reference stream whose dictionary holds `keys` (`/W`, `/Index` and any other) and
+/// whose data `rows` makes from where object 1 and each of `more` start, `tail` written after
+/// the data, before the line end and `endstream`. When `hybrid`, a table lists only that
+/// stream and names it with `/XRefStm`.
+fn object_one_listed(
+    b: &[u8],
+    body: &str,
+    more: &[(u32, Vec<u8>)],
+    keys: &str,
+    rows: impl FnOnce(&[u32]) -> Vec<u8>,
+    tail: &str,
+    hybrid: bool,
+) -> Vec<u8> {
     let d = Document::load_mem(b).unwrap();
     let r = root(&d);
     let prev = last_startxref(b);
-    let x = d.max_id + 1;
+    let x = more.iter().map(|(n, _)| *n).fold(d.max_id, u32::max) + 1;
     let mut out = [b, b"\n"].concat();
-    let at_1 = u32::try_from(out.len()).unwrap();
-    assert!(at_1 < 1 << (8 * w[1]));
+    let mut at = vec![u32::try_from(out.len()).unwrap()];
     out.extend_from_slice(format!("1 0 obj\n{body}\nendobj\n").as_bytes());
-    let mut row = vec![1; w[0]];
-    row.extend_from_slice(&at_1.to_be_bytes()[4 - w[1]..]);
+    for (_, text) in more {
+        at.push(u32::try_from(out.len()).unwrap());
+        out.extend_from_slice(text);
+    }
+    let row = rows(&at);
     let at_x = out.len();
     let size = format!("/Size {}", x + 1);
     let links = format!("/Root {} {} R /Prev {prev}", r.0, r.1);
     let own = if hybrid { "" } else { &links };
     out.extend_from_slice(
         format!(
-            "{x} 0 obj\n<< /Type /XRef /W [{} {} 0] /Index [1 1] {size} {own} /Length {} >>\n\
-             stream\n",
-            w[0],
-            w[1],
+            "{x} 0 obj\n<< /Type /XRef {keys} {size} {own} /Length {} >>\nstream\n",
             row.len()
         )
         .as_bytes(),
     );
     out.extend_from_slice(&row);
-    out.extend_from_slice(b"\nendstream\nendobj\n");
+    out.extend_from_slice(format!("{tail}\nendstream\nendobj\n").as_bytes());
     let at_t = out.len();
     if hybrid {
         out.extend_from_slice(
@@ -966,6 +989,113 @@ fn object_one_in_rows(b: &[u8], body: &str, w: [usize; 2], hybrid: bool) -> Vec<
     let start = if hybrid { at_t } else { at_x };
     out.extend_from_slice(format!("startxref\n{start}\n%%EOF\n").as_bytes());
     out
+}
+
+/// Cross-reference streams lopdf reads otherwise, and those the specification doesn't allow,
+/// after signing, are refused, with object 1 turned in them or as signed. lopdf drops a hybrid
+/// revision's stream with a comment before `endstream` and reads object 1 as signed; it takes
+/// an object stream index past 65535 modulo 65536 and a 5-byte offset modulo 2^32, so reads
+/// object 1 where the specification leads nowhere. Bytes before `endstream`, a number with an
+/// exponent or `inf` in the dictionary, a type 3 entry, an odd `/Index` and a `/W` of 4 widths
+/// are malformed.
+#[test]
+fn a_cross_reference_stream_lopdf_reads_otherwise_is_refused() {
+    use lopdf::xref::XrefEntry;
+    let (b, offset, old) = object_one_signed();
+    let turned = format!("{}/Rotate 180>>", old.strip_suffix(">>").unwrap());
+    let refused = |why: String| vec![(ChangeKind::Malformed(why), Some(Refusal::Never))];
+    let lopdf_reads = |f: &[u8]| {
+        Document::load_mem(f)
+            .unwrap()
+            .reference_table
+            .get(1)
+            .cloned()
+    };
+    let plain = "/W [1 4 0] /Index [1 1]";
+    for body in [&turned, &old] {
+        let f = object_one_listed(&b, body, &[], plain, |at| row(1, at[0]), "%c", true);
+        assert!(matches!(
+            lopdf_reads(&f),
+            Some(XrefEntry::Normal { offset: o, .. }) if o == offset
+        ));
+        assert_eq!(
+            changes(&f),
+            refused("LimarePDF can't read object 1 reliably".into())
+        );
+        for (keys, tail, kind) in [
+            (plain, " x", 1),
+            ("/W [1 4 0] /Index [1 1] /Foo 1e5", "", 1),
+            ("/W [1 4 0] /Index [1 1] /Foo inf", "", 1),
+            (plain, "", 3),
+            ("/W [1 4 0] /Index [1 1 5]", "", 1),
+            ("/W [1 4 0 0] /Index [1 1]", "", 1),
+        ] {
+            for hybrid in [true, false] {
+                let f = object_one_listed(&b, body, &[], keys, |at| row(kind, at[0]), tail, hybrid);
+                let at = xref_stream_at(&f);
+                let bad = format!("the cross-reference section at byte {at} is malformed");
+                assert_eq!(changes(&f), refused(bad), "{keys} {tail:?} {kind}");
+            }
+        }
+        for hybrid in [true, false] {
+            let in_50 = [(50, object_stream(50, &[(1, 0)], body, ""))];
+            let f = object_one_listed(
+                &b,
+                body,
+                &in_50,
+                "/W [1 4 4] /Index [1 1 50 1]",
+                |at| {
+                    [
+                        row(2, 50),
+                        65536u32.to_be_bytes().into(),
+                        row(1, at[1]),
+                        vec![0; 4],
+                    ]
+                    .concat()
+                },
+                "",
+                hybrid,
+            );
+            assert!(matches!(
+                lopdf_reads(&f),
+                Some(XrefEntry::Compressed {
+                    container: 50,
+                    index: 0
+                })
+            ));
+            assert_eq!(
+                changes(&f),
+                refused("LimarePDF can't read object 1 reliably".into())
+            );
+            let wide = |at: &[u32]| [vec![1], row(1, at[0])].concat();
+            let f = object_one_listed(&b, body, &[], "/W [1 5 0] /Index [1 1]", wide, "", hybrid);
+            let at_1 = b.len() as u32 + 1;
+            assert!(matches!(
+                lopdf_reads(&f),
+                Some(XrefEntry::Normal { offset: o, .. }) if o == at_1
+            ));
+            assert_eq!(
+                changes(&f),
+                refused("object 1 points outside the revision that changes it".into())
+            );
+        }
+    }
+    // The same streams written plainly read alike everywhere.
+    for hybrid in [true, false] {
+        let f = object_one_listed(&b, &old, &[], plain, |at| row(1, at[0]), "", hybrid);
+        assert_eq!(changes(&f), []);
+    }
+}
+
+/// A cross-reference stream row of type `kind` and a 4-byte field `f1`.
+fn row(kind: u8, f1: u32) -> Vec<u8> {
+    [vec![kind], f1.to_be_bytes().into()].concat()
+}
+
+/// Where the last cross-reference stream in `f` starts.
+fn xref_stream_at(f: &[u8]) -> usize {
+    let dict = f.windows(14).rposition(|w| w == b"<< /Type /XRef").unwrap();
+    f[..dict - 1].iter().rposition(|&c| c == b'\n').unwrap() + 1
 }
 
 /// A pointer to a cross-reference section that names the white space before it, after
