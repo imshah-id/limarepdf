@@ -2109,29 +2109,389 @@ pub(crate) fn references(doc: &Document) -> HashSet<ObjectId> {
     out
 }
 
+/// How much of what other apps draw [`reached`] reads.
+struct Within {
+    /// The steps it may take: one for each byte of a drawing's data and each byte its
+    /// filters give.
+    steps: u64,
+    /// The bytes of one drawing's data, its streams read as one.
+    data: usize,
+    /// The references it keeps from them, counted once for each drawing they are written in.
+    refs: usize,
+}
+
+/// How much of what other apps draw [`reached`] reads: a drawing as much as a page's content
+/// is read elsewhere, and references enough for any file (other apps' drawings write none,
+/// but in an inline image's data that happens to read as one). Past it, the rest is unread.
+const DRAWN: Within = Within {
+    steps: 1 << 30,
+    data: crate::MAX_CONTENT,
+    refs: 1 << 16,
+};
+
+/// What other apps may follow in a document ([`reached`]).
+#[derive(Default)]
+pub(crate) struct Reached {
+    /// The objects they may read.
+    pub(crate) ids: HashSet<ObjectId>,
+    /// The references Poppler reads in the data of what they draw ([`data_references`]),
+    /// all taken as followed: it follows those in a dictionary there (an inline image's
+    /// settings, marked content's).
+    pub(crate) drawn: HashSet<ObjectId>,
+    /// What they draw that LimarePDF can't decode, or past what [`DRAWN`] reads: what its
+    /// data refers to isn't known.
+    pub(crate) unread: BTreeSet<ObjectId>,
+    /// The references kept from the drawings, as [`Within::refs`] counts them.
+    kept: usize,
+}
+
 /// The references other apps may follow in `doc`: from its trailer's catalog and document
-/// information, and on through every object they lead to. They read no other key of the
-/// trailer.
-pub(crate) fn reached(doc: &Document) -> HashSet<ObjectId> {
-    let mut out = HashSet::new();
+/// information, on through every object they lead to, and on from the data of what they
+/// draw. They read no other key of the trailer.
+pub(crate) fn reached(doc: &Document) -> Reached {
+    reached_within(doc, &DRAWN)
+}
+
+/// [`reached`], reading what is drawn as far as `within` allows.
+fn reached_within(doc: &Document, within: &Within) -> Reached {
+    let mut work = budget::Work::unkept("reading the drawings", within.steps);
+    let mut out = Reached::default();
+    let mut read: HashSet<Vec<ObjectId>> = HashSet::new();
+    let mut ids: Vec<ObjectId> = Vec::new();
     let mut stack: Vec<&Object> = [&b"Root"[..], b"Info"]
         .into_iter()
         .filter_map(|k| doc.trailer.get(k).ok())
         .collect();
-    while let Some(o) = stack.pop() {
-        match o {
-            Object::Reference(id) => {
-                if out.insert(*id) {
-                    stack.extend(doc.objects.get(id));
+    loop {
+        if let Some(id) = ids.pop() {
+            if out.ids.insert(id) {
+                if let Some(o) = doc.objects.get(&id) {
+                    if matches!(o, Object::Stream(s) if drawn_alone(doc, s)) {
+                        let drawing = vec![id];
+                        draw(
+                            doc, drawing, within, &mut work, &mut read, &mut out, &mut ids,
+                        );
+                    }
+                    stack.push(o);
                 }
             }
-            Object::Array(a) => stack.extend(a),
-            Object::Dictionary(d) => stack.extend(d.iter().map(|(_, o)| o)),
-            Object::Stream(s) => stack.extend(s.dict.iter().map(|(_, o)| o)),
-            _ => {}
+            continue;
         }
+        let Some(o) = stack.pop() else { break };
+        let d = match o {
+            Object::Reference(id) => {
+                ids.push(*id);
+                continue;
+            }
+            Object::Array(a) => {
+                stack.extend(a);
+                continue;
+            }
+            Object::Dictionary(d) => d,
+            Object::Stream(s) => &s.dict,
+            _ => continue,
+        };
+        for drawing in drawn_in(doc, d) {
+            draw(
+                doc, drawing, within, &mut work, &mut read, &mut out, &mut ids,
+            );
+        }
+        stack.extend(d.iter().map(|(_, o)| o));
     }
     out
+}
+
+/// Whether other apps draw stream `s` wherever it is: a form, or a tiling pattern.
+fn drawn_alone(doc: &Document, s: &Stream) -> bool {
+    let value = |k: &[u8]| {
+        s.dict
+            .get(k)
+            .ok()
+            .and_then(|o| doc.dereference(o).ok())
+            .map(|o| o.1)
+    };
+    value(b"Subtype").is_some_and(|o| o.as_name().is_ok_and(|n| n == b"Form"))
+        || value(b"PatternType").is_some_and(|o| matches!(o, Object::Integer(1)))
+}
+
+/// What other apps draw that dictionary `d` names, each drawing as the streams it is
+/// written in: a page's content (in several streams read as one), an annotation's
+/// appearances, a Type 3 font's glyphs, a soft mask's group.
+fn drawn_in(doc: &Document, d: &Dictionary) -> Vec<Vec<ObjectId>> {
+    let stream = |o: &Object| match doc.dereference(o) {
+        Ok((Some(id), Object::Stream(_))) => Some(id),
+        _ => None,
+    };
+    fn dict<'a>(doc: &'a Document, o: &'a Object) -> Option<&'a Dictionary> {
+        doc.dereference(o).ok().and_then(|(_, o)| o.as_dict().ok())
+    }
+    let dict = |o| dict(doc, o);
+    let alone = |o: &Object| stream(o).map(|id| vec![id]);
+    let mut out = Vec::new();
+    if let Ok(c) = d.get(b"Contents") {
+        match doc.dereference(c) {
+            Ok((_, Object::Array(a))) => out.push(a.iter().filter_map(stream).collect()),
+            _ => out.extend(alone(c)),
+        }
+    }
+    if let Some(ap) = d.get(b"AP").ok().and_then(dict) {
+        for (_, o) in ap.iter() {
+            match dict(o) {
+                Some(states) => out.extend(states.iter().filter_map(|(_, o)| alone(o))),
+                None => out.extend(alone(o)),
+            }
+        }
+    }
+    if let Some(glyphs) = d.get(b"CharProcs").ok().and_then(dict) {
+        out.extend(glyphs.iter().filter_map(|(_, o)| alone(o)));
+    }
+    out.extend(d.get(b"G").ok().and_then(alone));
+    out
+}
+
+/// Reads `drawing` (once) as far as `within` allows, and has its data's references followed.
+fn draw(
+    doc: &Document,
+    drawing: Vec<ObjectId>,
+    within: &Within,
+    work: &mut budget::Work,
+    read: &mut HashSet<Vec<ObjectId>>,
+    out: &mut Reached,
+    ids: &mut Vec<ObjectId>,
+) {
+    if read.contains(&drawing) {
+        return;
+    }
+    let (mut data, mut breaks) = (Vec::new(), Vec::new());
+    for id in &drawing {
+        let Some(Object::Stream(s)) = doc.objects.get(id) else {
+            continue;
+        };
+        match work.decode(s) {
+            Ok(Some(d)) if data.len() + d.len() <= within.data => {
+                breaks.push(data.len());
+                data.extend(d);
+            }
+            _ => {
+                out.unread.insert(*id);
+            }
+        }
+    }
+    let mut found = BTreeSet::new();
+    if data_references(&data, &breaks, &mut found, within.refs - out.kept) {
+        out.kept += found.len();
+        ids.extend(&found);
+        out.drawn.extend(found);
+    } else {
+        out.unread.extend(&drawing);
+    }
+    read.insert(drawing);
+}
+
+/// The references Poppler may read in drawn data `data`, written in parts that start at
+/// `breaks` (a page's content in several streams): `N G R`, three tokens as its lexer reads
+/// them, the numbers whole numbers within 32 bits, `N` positive and `G` not negative. A sign
+/// starts a number even right after another (`5+0R` is a reference), a comment separates
+/// like white space, and a number, name or word ends at the end of a part (a word after 128
+/// characters too), while white space, comments and strings run on into the next. From the
+/// first inline image on (`BI`, or `ID`, after which Poppler skips a character), where
+/// Poppler reads on is found as it decodes the image, so there every place a number may
+/// start is tried, in strings, names and image data too. Each byte is read a few times at
+/// most. False, leaving off, when there are more than `most` of them.
+fn data_references(
+    data: &[u8],
+    breaks: &[usize],
+    out: &mut BTreeSet<ObjectId>,
+    most: usize,
+) -> bool {
+    let len = data.len();
+    // Whether byte `i` runs on from the one before it in a number or word.
+    let joined = |i: usize| i > 0 && breaks.binary_search(&i).is_err();
+    let Some(from) = read_tokens(data, &joined, out, most) else {
+        return false;
+    };
+    let digit = |i: usize| i < len && data[i].is_ascii_digit();
+    let signed = |i: usize| i < len && matches!(data[i], b'+' | b'-');
+    // The whole number starting at `i`, `None` past 32 bits, and where it ends; `None` for
+    // a real.
+    let whole = |mut i: usize| -> Option<(Option<i64>, usize)> {
+        let neg = data[i] == b'-';
+        let mut v = Some(0);
+        if !signed(i) {
+            v = Some(i64::from(data[i] - b'0'));
+        }
+        i += 1;
+        while digit(i) && joined(i) {
+            let more = |v: i64| v * 10 + i64::from(data[i] - b'0');
+            v = v.map(more).filter(|v| *v <= i64::from(i32::MAX));
+            i += 1;
+        }
+        // (A point starting the next part can't be read as `G` or `R` either.)
+        if i < len && data[i] == b'.' {
+            return None;
+        }
+        Some((v.map(|v| if neg { -v } else { v }), i))
+    };
+    let apart = |mut i: usize| {
+        while i < len {
+            match data[i] {
+                b'%' => {
+                    while i < len && !matches!(data[i], b'\r' | b'\n') {
+                        i += 1;
+                    }
+                }
+                b if is_white(b) => i += 1,
+                _ => break,
+            }
+        }
+        i
+    };
+    for start in from..len {
+        let starts = signed(start)
+            || (digit(start)
+                && !(joined(start) && matches!(data[start - 1], b'0'..=b'9' | b'.' | b'+' | b'-')));
+        if !starts {
+            continue;
+        }
+        let Some((num, at)) = whole(start) else {
+            continue;
+        };
+        let at = apart(at);
+        if !(digit(at) || signed(at)) {
+            continue;
+        }
+        let Some((gen, at)) = whole(at) else { continue };
+        let at = apart(at);
+        let ends = |i: usize| i == len || !joined(i) || is_white(data[i]) || is_delim(data[i]);
+        if at < len && data[at] == b'R' && ends(at + 1) && !add_reference(out, num, gen, most) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Reads drawn data `data` token by token as Poppler's lexer does (where `joined` says a
+/// byte runs on from the one before it in a part), adding the references it reads to `out`.
+/// Where the first inline image starts, or the end; `None`, leaving off, when `out` holds more
+/// than `most`.
+fn read_tokens(
+    data: &[u8],
+    joined: &dyn Fn(usize) -> bool,
+    out: &mut BTreeSet<ObjectId>,
+    most: usize,
+) -> Option<usize> {
+    let len = data.len();
+    // Whether byte `i` is read in the token before it, if it may be: Poppler's lexer looks no
+    // further than the end of a part.
+    let on = |i: usize| i < len && joined(i);
+    let special = |b: u8| is_white(b) || is_delim(b);
+    // The last two tokens, each its value if it is a whole number within 32 bits.
+    let mut last: [Option<i64>; 2] = [None, None];
+    let mut i = 0;
+    loop {
+        while i < len && (is_white(data[i]) || data[i] == b'%') {
+            if data[i] == b'%' {
+                while i < len && !matches!(data[i], b'\r' | b'\n') {
+                    i += 1;
+                }
+            } else {
+                i += 1;
+            }
+        }
+        if i == len {
+            return Some(len);
+        }
+        let start = i;
+        let mut whole = None;
+        i += 1;
+        match data[start] {
+            b'0'..=b'9' | b'+' | b'-' | b'.' => {
+                let mut v = Some(0);
+                if data[start].is_ascii_digit() {
+                    v = Some(i64::from(data[start] - b'0'));
+                }
+                let mut real = data[start] == b'.';
+                while !real && on(i) && data[i].is_ascii_digit() {
+                    let more = |v: i64| v * 10 + i64::from(data[i] - b'0');
+                    v = v.map(more).filter(|v| *v <= i64::from(i32::MAX));
+                    i += 1;
+                }
+                if !real && on(i) && data[i] == b'.' {
+                    real = true;
+                    i += 1;
+                }
+                // A real runs on through digits and minus signs.
+                while real && on(i) && (data[i].is_ascii_digit() || data[i] == b'-') {
+                    i += 1;
+                }
+                let neg = data[start] == b'-';
+                whole = v.filter(|_| !real).map(|v| if neg { -v } else { v });
+            }
+            b'(' => {
+                let mut depth = 1;
+                while i < len {
+                    match data[i] {
+                        b'(' => depth += 1,
+                        b')' => depth -= 1,
+                        b'\\' => i += 1,
+                        _ => {}
+                    }
+                    i += 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                i = i.min(len);
+            }
+            b'<' | b'>' if on(i) && data[i] == data[start] => i += 1,
+            b'<' => {
+                while i < len && data[i] != b'>' {
+                    i += 1;
+                }
+                i = len.min(i + 1);
+            }
+            b'/' => {
+                while on(i) && !special(data[i]) {
+                    // An escape's first digit is looked at, the character after it taken.
+                    if data[i] == b'#' && on(i + 1) && data[i + 1].is_ascii_hexdigit() {
+                        i += 2;
+                    }
+                    i = len.min(i + 1);
+                }
+            }
+            b if special(b) => {}
+            _ => {
+                while on(i) && !special(data[i]) && i - start < 128 {
+                    i += 1;
+                }
+                match &data[start..i] {
+                    b"R" => {
+                        if !add_reference(out, last[0], last[1], most) {
+                            return None;
+                        }
+                    }
+                    b"BI" | b"ID" => return Some(start),
+                    _ => {}
+                }
+            }
+        }
+        last = [last[1], whole];
+    }
+}
+
+/// Adds reference `num gen R` to `out` if Poppler reads one there; false when `out` then
+/// holds more than `most`.
+fn add_reference(
+    out: &mut BTreeSet<ObjectId>,
+    num: Option<i64>,
+    gen: Option<i64>,
+    most: usize,
+) -> bool {
+    if let (Some(n @ 1..), Some(g @ 0..)) = (num, gen) {
+        let (n, g) = (u32::try_from(n), u16::try_from(g).unwrap_or(u16::MAX));
+        out.extend(n.ok().map(|n| (n, g)));
+    }
+    out.len() <= most
 }
 
 // ---------------------------------------------------------------- one step
@@ -6614,6 +6974,170 @@ mod tests {
                 !decodes_alike(&Stream::new(d, b"1 0 2 0".to_vec()), 1 << 10),
                 "{k}"
             );
+        }
+    }
+
+    /// Poppler reads `N G R` in drawn data as a reference however the three are written apart
+    /// or together, from whole numbers in range before `R` alone; a number or word ends with
+    /// the stream it is written in, white space, comments and strings run on into the next.
+    /// In a string, a comment or a name there is none, nor in a word, but in a word's 129th
+    /// character on; from an inline image on, wherever a number may start.
+    #[test]
+    fn references_in_drawn_data_are_read_as_poppler_reads_them() {
+        let refs = |data: &str, breaks: &[usize]| {
+            let mut out = BTreeSet::new();
+            assert!(data_references(data.as_bytes(), breaks, &mut out, 2));
+            Vec::from_iter(out)
+        };
+        let one = |data: &str| refs(data, &[]);
+        for data in [
+            "5 0 R",
+            "5 0R",
+            "5+0R",
+            "5 -0 R",
+            "5 - R",
+            "5-R",
+            "5 0 %c\nR",
+            "5 %c\r0\tR",
+            "05 +0 R\n",
+            "+5 0 R",
+            "5 0 R/x",
+            "5 0 R(",
+            "5\x0c0\0R",
+            "x 5 0 R ",
+            "1.5 5 0 R",
+        ] {
+            assert_eq!(one(data), [(5, 0)], "{data:?}");
+        }
+        assert_eq!(one("1 2 3 R"), [(2, 3)]);
+        assert_eq!(one("5 7 R 6 0 R"), [(5, 7), (6, 0)]);
+        assert_eq!(one("2147483647 70000 R"), [(i32::MAX as u32, u16::MAX)]);
+        // Not in a string (however it nests or escapes), a hex string, a comment, a name or a
+        // word.
+        for data in [
+            "(5 0 R)",
+            "(a(b)5 0 R)",
+            "(\\)5 0 R)",
+            "(\x001\x003\x00 \x00R)",
+            "(\\",
+            "<5 0 R>",
+            "% 5 0 R",
+            "/F5 0 R",
+            "x5 0 R",
+        ] {
+            assert_eq!(one(data), [], "{data:?}");
+        }
+        assert_eq!(one("(x)5 0 R"), [(5, 0)]);
+        assert_eq!(one("% (\n5 0 R"), [(5, 0)]);
+        assert_eq!(one("<<5 0 R>>"), [(5, 0)]);
+        // A name's escape takes the character after its first digit, whatever it is.
+        assert_eq!(one("/a#4( 5 0 R"), [(5, 0)]);
+        // A word is cut after 128 characters.
+        assert_eq!(one(&format!("{}5 0 R", "x".repeat(128))), [(5, 0)]);
+        assert_eq!(one(&format!("{}5 0 R", "x".repeat(127))), []);
+        // From an inline image on (where Poppler reads on is found as it decodes the image),
+        // wherever a number may start.
+        for data in ["(x) BI (5 0 R)", "ID (5 0 R)", "BI/F5 0 R"] {
+            assert_eq!(one(data), [(5, 0)], "{data:?}");
+        }
+        assert_eq!(one("/ID (BI) (5 0 R)"), []);
+        for data in [
+            "5 0 RG",
+            "5 0. R",
+            "5. 0 R",
+            "5 0.5 R",
+            "5.0 0 R",
+            "0 0 R",
+            "-5 0 R",
+            "5 -1 R",
+            "2147483648 0 R",
+            "-2147483648 0 R",
+            "5 0 (x) R",
+            "5 0",
+            "5 R",
+            "5 0 R5",
+            "5 0 %R",
+            "R",
+            "",
+        ] {
+            assert_eq!(one(data), [], "{data:?}");
+        }
+        // In parts: a number or `R` ends with its part, a comment or a string runs on, and `<`
+        // ending one starts a hex string.
+        assert_eq!(refs("50 R", &[0, 1]), [(5, 0)]);
+        assert_eq!(refs("56 0 R", &[0, 1]), [(6, 0)]);
+        assert_eq!(refs("5 0 RG", &[0, 5]), [(5, 0)]);
+        assert_eq!(refs("5 0 %cx\nR", &[0, 6]), [(5, 0)]);
+        assert_eq!(refs("(a5 0 R)", &[0, 2]), []);
+        assert_eq!(refs("<<5 0 R> 6 0 R", &[0, 1]), [(6, 0)]);
+        // Each once, and no more than asked for.
+        assert_eq!(one("5 0 R 5 0 R 6 0 R 6 0 R"), [(5, 0), (6, 0)]);
+        let mut out = BTreeSet::new();
+        assert!(!data_references(b"5 0 R 6 0 R 7 0 R", &[], &mut out, 2));
+    }
+
+    /// What the catalog leads to draws as other apps draw it: a page's content (its streams
+    /// read as one), an annotation's appearances, a Type 3 font's glyphs, a soft mask's
+    /// group, a form and a tiling pattern; the references in its data are followed. A
+    /// picture's data and a form nothing leads to aren't read; a drawing LimarePDF can't
+    /// decode, or every drawing past the steps, is unread; one drawn twice is read once.
+    #[test]
+    fn references_in_what_is_drawn_are_followed() {
+        let r = |id: u32| Object::Reference((id, 0));
+        let mut doc = Document::with_version("1.7");
+        let mut add = |id: u32, dict: Dictionary, data: &str| {
+            let s = Stream::new(dict, data.as_bytes().to_vec());
+            doc.objects.insert((id, 0), Object::Stream(s));
+        };
+        add(3, Dictionary::new(), "100 0");
+        add(4, Dictionary::new(), " R");
+        add(5, Dictionary::new(), "101 0 R");
+        add(6, Dictionary::new(), "102 0 R");
+        add(7, Dictionary::new(), "103 0 R");
+        add(8, Dictionary::new(), "104 0 R");
+        add(9, dictionary! { "Subtype" => "Form" }, "105 0 R");
+        add(10, dictionary! { "PatternType" => 1 }, "106 0 R");
+        add(11, dictionary! { "Subtype" => "Image" }, "107 0 R");
+        add(12, dictionary! { "Subtype" => "Form" }, "108 0 R");
+        add(13, dictionary! { "Filter" => "JBIG2Decode" }, "x");
+        add(14, dictionary! { "Subtype" => r(20) }, "110 0 R");
+        doc.objects.insert((20, 0), Object::Name(b"Form".to_vec()));
+        doc.objects
+            .insert((105, 0), dictionary! { "Next" => r(109) }.into());
+        let root = dictionary! {
+            "Contents" => vec![r(3), r(4)],
+            "AP" => dictionary! { "N" => r(5), "D" => dictionary! { "On" => r(6) }, "R" => r(13) },
+            "CharProcs" => dictionary! { "a" => r(7) },
+            "G" => r(8),
+            "X" => vec![r(9), r(10), r(11), r(14)],
+        };
+        doc.objects.insert((1, 0), root.into());
+        doc.trailer.set("Root", r(1));
+        let all = reached_within(&doc, &DRAWN);
+        let drawn: BTreeSet<u32> = all.drawn.iter().map(|id| id.0).collect();
+        assert_eq!(drawn, (100..=106).chain([110]).collect());
+        assert!(all.ids.contains(&(109, 0)));
+        assert!(!all.ids.contains(&(107, 0)) && !all.ids.contains(&(108, 0)));
+        assert_eq!(all.unread, BTreeSet::from([(13, 0)]));
+        let none = reached_within(&doc, &Within { steps: 0, ..DRAWN });
+        assert!(none.drawn.is_empty());
+        let every = (3..=10).chain([13, 14]).map(|n| (n, 0)).collect();
+        assert_eq!(none.unread, every);
+        // References from 8 drawings, one past 7.
+        let fewer = reached_within(&doc, &Within { refs: 7, ..DRAWN });
+        assert_eq!((fewer.drawn.len(), fewer.unread.len()), (7, 2));
+        // A form drawn as an appearance and as a form: 7 bytes, and a reference, read once.
+        let mut doc = Document::with_version("1.7");
+        let s = Stream::new(dictionary! { "Subtype" => "Form" }, b"105 0 R".to_vec());
+        doc.objects.insert((9, 0), Object::Stream(s));
+        let root = dictionary! { "AP" => dictionary! { "N" => r(9) } };
+        doc.objects.insert((1, 0), root.into());
+        doc.trailer.set("Root", r(1));
+        let unread = |steps, data, refs| reached_within(&doc, &Within { steps, data, refs }).unread;
+        assert!(unread(7, 7, 1).is_empty());
+        for (steps, data, refs) in [(6, 7, 1), (7, 6, 1), (7, 7, 0)] {
+            let why = format!("{steps} {data} {refs}");
+            assert_eq!(unread(steps, data, refs), BTreeSet::from([(9, 0)]), "{why}");
         }
     }
 }

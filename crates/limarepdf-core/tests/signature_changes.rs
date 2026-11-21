@@ -2382,7 +2382,11 @@ fn a_dictionary_giving_a_key_twice_is_refused_unless_written_alike() {
 /// generation than its own. After signing, a revision whose table left a reference with nothing
 /// to read, with a turned copy of the page after it that no entry lists, passed as nothing, and
 /// Poppler showed the page turned. They follow references from the catalog and the document
-/// information only, not from other keys of the trailer.
+/// information only, not from other keys of the trailer. Poppler follows them in what it draws
+/// too, where its drawing looks in a dictionary: a comment added with its appearance drawing
+/// an inline image whose filter's settings are an object nothing lists, or marking content
+/// with such an object as its text, passed as an added comment (review round 4). A drawing
+/// LimarePDF can't decode may refer to anything.
 #[test]
 fn a_reference_other_apps_read_the_file_again_for_is_refused() {
     let b = approve(&base_pdf());
@@ -2422,6 +2426,71 @@ fn a_reference_other_apps_read_the_file_again_for_is_refused() {
     ];
     for (i, (to, bad)) in bad.iter().enumerate() {
         assert!(read_otherwise(bad, *to), "{i}");
+    }
+    // In what a comment added draws, however Poppler reads a reference there: glued to the
+    // numbers, or apart by a comment.
+    let (note, form) = (n + 3, n + 4);
+    let filtered = |data: &str, filter: &str| {
+        let mut on = dict(&d, p);
+        let mut annots = on
+            .get(b"Annots")
+            .ok()
+            .and_then(|a| a.as_array().ok())
+            .cloned()
+            .unwrap_or_default();
+        annots.push(Object::Reference((note, 0)));
+        on.set("Annots", annots);
+        let square = format!(
+            "<< /Type /Annot /Subtype /Square /Rect [0 0 9 9] /P {} 0 R /AP << /N {form} 0 R >> >>",
+            p.0
+        );
+        let len = data.len();
+        let drawn = format!(
+            "<< /Type /XObject /Subtype /Form /BBox [0 0 9 9]{filter} /Length {len} >>\nstream\n\
+             {data}\nendstream"
+        );
+        [
+            (p.0, written(p.0, &format!("{on:?}"))),
+            (note, written(note, &square)),
+            (form, written(form, &drawn)),
+        ]
+    };
+    let commented = |data: &str| filtered(data, "");
+    let drawings = [
+        format!("q BI /W 1 /H 1 /BPC 8 /CS /G /F {gone} 0 R ID x EI Q"),
+        format!("/Span << /ActualText {gone} 0 R >> BDC EMC"),
+        format!("/Span <</ActualText {gone}+0R>> BDC EMC"),
+        format!("/Span <</ActualText {gone} -%c\nR>> BDC EMC"),
+    ];
+    for (i, data) in drawings.iter().enumerate() {
+        let bad = in_table(&b, &commented(data), &[], &dead, "");
+        assert!(read_otherwise(&bad, gone), "{i}");
+        assert!(read_alike(&by_hand(&b, &commented(data), &[])), "{i}");
+    }
+    // To an object only an object stream holds, which no entry lists: the reading drops it, and
+    // says it is used.
+    let (stray, stm) = (n + 5, n + 6);
+    let mut hiding = commented(&format!("/Span << /ActualText {stray} 0 R >> BDC EMC")).to_vec();
+    hiding.push((stm, object_stream(stm, &[(stray, 0)], "(hidden)", "")));
+    let why = format!(
+        "it uses object {stray}, which its cross-reference information deletes or doesn't list"
+    );
+    assert_eq!(differs(&by_hand(&b, &hiding, &[])), Some(why));
+    // To an object the file holds, or no reference (one in a string isn't): read alike.
+    let held = format!("/Span << /ActualText {} 0 R >> BDC EMC", p.0);
+    let alike = [held, format!("{gone} 0 0 RG {gone} 0. R ({gone} 0 R) Tj")];
+    for (i, data) in alike.iter().enumerate() {
+        let ok = in_table(&b, &commented(data), &[], &dead, "");
+        assert!(read_alike(&ok), "{i}");
+    }
+    // Drawn data LimarePDF can't decode: what it refers to isn't known, in either.
+    let unread = filtered("x", " /Filter /JBIG2Decode");
+    let bad = [
+        in_table(&b, &unread, &[], &dead, ""),
+        by_hand(&b, &unread, &[]),
+    ];
+    for (i, bad) in bad.iter().enumerate() {
+        assert!(read_otherwise(bad, form), "{i}");
     }
     // In a cross-reference stream Poppler reads nothing there, as lopdf and pdf.js do.
     assert!(read_alike(&by_hand(&b, &[page(gone, 0)], &[])));
