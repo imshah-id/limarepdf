@@ -1095,8 +1095,11 @@ fn object(lx: &mut Lexer, depth: usize, read: Read) -> Option<Object> {
     Some(match tok {
         Tok::DictOpen => {
             let mut d = Dictionary::new();
-            // Each key, and its value as written.
-            let mut keys = Vec::new();
+            // Each key once, with its first value as written, and the entries so far.
+            let mut keys: HashMap<Vec<u8>, &[u8]> = HashMap::new();
+            let mut entries = 0;
+            // A key given again with its value written differently; `/Contents` given again.
+            let (mut unlike, mut contents) = (false, false);
             loop {
                 match lx.next()? {
                     (_, Tok::DictClose, _) => break,
@@ -1104,30 +1107,36 @@ fn object(lx: &mut Lexer, depth: usize, read: Read) -> Option<Object> {
                         let mut from = lx.pos();
                         let v = object(lx, depth + 1, read)?;
                         let k = decode_name(k)?;
-                        if keep {
-                            d.set(k.clone(), v);
-                        }
                         let bytes = lx.bytes();
                         while is_white(bytes[from]) {
                             from += 1;
                         }
-                        keys.push((k, &bytes[from..lx.pos()]));
+                        let written = &bytes[from..lx.pos()];
+                        entries += 1;
+                        match keys.get(&k) {
+                            Some(&first) => {
+                                unlike |= first != written;
+                                contents |= k == b"Contents";
+                            }
+                            None => {
+                                keys.insert(k.clone(), written);
+                            }
+                        }
+                        #[cfg(test)]
+                        tests::HELD.set(tests::HELD.get().max(keys.len()));
+                        let refused = match read {
+                            Read::Keep => unlike && entries >= 32,
+                            Read::Check { decrypted } => unlike || (decrypted && contents),
+                        };
+                        if refused {
+                            return None;
+                        }
+                        if keep {
+                            d.set(k, v);
+                        }
                     }
                     _ => return None,
                 }
-            }
-            keys.sort_unstable();
-            let twice = keys.windows(2).any(|w| {
-                w[0].0 == w[1].0
-                    && match read {
-                        Read::Keep => keys.len() >= 32 && w[0].1 != w[1].1,
-                        Read::Check { decrypted } => {
-                            w[0].1 != w[1].1 || (decrypted && w[0].0 == b"Contents")
-                        }
-                    }
-            });
-            if twice {
-                return None;
             }
             if keep {
                 Object::Dictionary(d)
@@ -4606,6 +4615,8 @@ mod tests {
         pub(super) static NAMES_COPIED: Cell<usize> = const { Cell::new(0) };
         /// Bytes looked at telling whether a revision ends at a version's end, on this thread.
         pub(super) static SCANNED: Cell<usize> = const { Cell::new(0) };
+        /// The most keys a dictionary read (`object`) held at once, on this thread.
+        pub(super) static HELD: Cell<usize> = const { Cell::new(0) };
     }
 
     fn square(n: usize) -> Dictionary {
@@ -6676,6 +6687,33 @@ mod tests {
         assert!(skip(contents, false));
         assert!(!skip(contents, true));
         assert!(!skip(&format!("[<< /A {contents} >>]"), true));
+    }
+
+    /// A dictionary read holds each key once, however often it is given: it held each entry's
+    /// key to the end, about 50 bytes for each 4 of the file, on every open (round 4's c16).
+    /// One given again written differently stops the read where it is refused: in
+    /// cross-reference information at the 32nd entry, in an object at once.
+    #[test]
+    fn a_dictionary_read_holds_each_key_once() {
+        let repeated = |value: &str| format!("<< /K 1{} >>", format!(" /K {value}").repeat(10_000));
+        // Whether it reads, and how far.
+        let read = |w: &str| {
+            let mut lx = Lexer::new(w.as_bytes(), 0);
+            (read_object(&mut lx, 0).is_some(), lx.pos())
+        };
+        let skip = |w: &str| {
+            let mut lx = Lexer::new(w.as_bytes(), 0);
+            (skip_object(&mut lx, false), lx.pos())
+        };
+        HELD.set(0);
+        let alike = repeated("1");
+        assert_eq!(read(&alike), (true, alike.len()));
+        assert_eq!(skip(&alike), (true, alike.len()));
+        assert_eq!(HELD.get(), 1);
+        let unlike = repeated("2");
+        assert_eq!(read(&unlike), (false, "<< /K 1".len() + 31 * " /K 2".len()));
+        assert_eq!(skip(&unlike), (false, "<< /K 1 /K 2".len()));
+        assert_eq!(HELD.get(), 1);
     }
 
     /// Other apps take a stream's data as long as its `/Length`, written in its dictionary or
