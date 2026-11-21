@@ -1046,7 +1046,9 @@ pub fn append_update(bytes: &[u8], change: impl FnOnce(&mut IncrementalDocument)
 /// Appends a revision written by hand, for shapes lopdf won't write: `objects` (number
 /// and body, generation 0), then a cross-reference table listing them and `frees`, with
 /// `moved` overriding where an entry points (number, offset), and `trailer` added to the
-/// trailer. `/Prev` points to the last revision.
+/// trailer. `/Prev` points to the last revision. The table lists object 0, the head of the
+/// free list, as other apps' tables do: Poppler scans the file for objects when no section
+/// lists a number it looks up.
 pub fn append_raw(
     bytes: &[u8],
     objects: &[(u32, &[u8])],
@@ -1086,6 +1088,9 @@ pub fn append_raw(
     let size = entries.keys().copied().max().unwrap_or(0).max(doc.max_id) + 1;
     let xref = out.len();
     out.extend_from_slice(b"xref\n");
+    if !entries.contains_key(&0) {
+        out.extend_from_slice(b"0 1\n0000000000 65535 f \n");
+    }
     for (num, e) in &entries {
         let line = match e {
             Some(at) => format!("{num} 1\n{at:010} 00000 n \n"),

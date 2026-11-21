@@ -763,6 +763,13 @@ fn malformed(at: usize) -> String {
     format!("the cross-reference section at byte {at} is malformed")
 }
 
+fn skipped(num: u32) -> String {
+    format!(
+        "no cross-reference section lists object {num}, and some look for it and then scan the \
+         file for objects instead"
+    )
+}
+
 /// Refuses the newest section, the one at `at`, when its `/Size` reaches past
 /// [`MAX_ENTRIES`]: Poppler makes room for as many objects as the newest trailer gives (and
 /// as every cross-reference stream's gives, which [`read_xref_stream`] checks).
@@ -1510,7 +1517,8 @@ impl Reading {
     /// opening the first or last page; which objects those reach isn't followed here, so any
     /// with an entry in use counts. Poppler does when it can't read the object and the newest
     /// section is a table: it scans the file for objects and reads every object from what it
-    /// found from then on.
+    /// found from then on. It also does on looking up a number no section lists, without
+    /// following any reference, which [`whole_xref`] finds.
     pub(crate) fn read_again(&self, id: ObjectId) -> bool {
         match self.spec.get(&id.0) {
             Some(Entry::InUse { .. }) => true,
@@ -1532,7 +1540,11 @@ pub(crate) fn compare_reading(bytes: &[u8], doc: &Document) -> Result<Reading, S
         deleted,
         trailer,
         table: newest_table,
+        skipped: skipped_num,
     } = whole_xref(bytes, pointer.unwrap_or(doc.xref_start))?;
+    if let Some(num) = skipped_num {
+        return Err(skipped(num));
+    }
     // lopdf must take the newest trailer too: its catalog, and its encryption dictionary,
     // which lopdf drops from the trailer once it has decrypted the file with it.
     let encrypt = (doc.trailer.get(b"Encrypt").ok().cloned()).or_else(|| {
@@ -1946,6 +1958,8 @@ struct WholeXref {
     trailer: Dictionary,
     /// Whether the newest section is a table (a hybrid one too).
     table: bool,
+    /// The number Poppler looks up past every section, when it does: see [`whole_xref`].
+    skipped: Option<u32>,
 }
 
 /// The cross-reference entry each object number has for a reader following the
@@ -1953,12 +1967,24 @@ struct WholeXref {
 /// section's stream ranking after its table), the newest entry counting, free ones too.
 /// Also, for each number that entry frees, the newest older entry placing an object: the
 /// object a revision deleted.
+///
+/// Poppler reads the newest section first and the older ones only as it needs their entries,
+/// and when a newest table's chain ends without listing the number it looks for, it scans
+/// the whole file for objects and reads every object from what it found from then on.
+/// Looking for where an object ends, as it does for a long string or a stream's data it
+/// can't frame, it looks up every number below the size in turn: one no section lists,
+/// every lower one found before the oldest section, is `skipped`. Earlier lookups that
+/// read the oldest section aren't followed.
 fn whole_xref(bytes: &[u8], mut at: usize) -> Result<WholeXref, String> {
     let mut spec = HashMap::new();
     let mut deleted = HashMap::new();
     let mut trailer = Dictionary::new();
     let mut table = false;
     let mut seen = HashSet::new();
+    // The numbers the sections read before the last one list, the last one's, and Poppler's
+    // size: the newest trailer's, made larger for any number listed past it.
+    let (mut younger, mut last) = (HashSet::new(), HashSet::new());
+    let mut size = 0u64;
     loop {
         if !seen.insert(at) || seen.len() > MAX_SECTIONS {
             return Err("its chain of revisions loops or is too long".into());
@@ -1967,6 +1993,9 @@ fn whole_xref(bytes: &[u8], mut at: usize) -> Result<WholeXref, String> {
         decoded_alike(&read, at)?;
         if seen.len() == 1 {
             newest_has_room(&read, at)?;
+            if let Ok(&Object::Integer(n)) = read.trailer.get(b"Size") {
+                size = u64::try_from(n).unwrap_or(0);
+            }
             trailer = read.trailer;
             table = read.kind == SectionKind::Table;
         }
@@ -1979,7 +2008,10 @@ fn whole_xref(bytes: &[u8], mut at: usize) -> Result<WholeXref, String> {
             decoded_alike(&extra, stm)?;
             entries.extend(extra.entries);
         }
+        younger.extend(last.drain());
         for (num, e) in entries {
+            last.insert(num);
+            size = size.max(u64::from(num) + 1);
             if *spec.entry(num).or_insert(e) == Entry::Free && e != Entry::Free {
                 deleted.entry(num).or_insert(e);
             }
@@ -1987,12 +2019,17 @@ fn whole_xref(bytes: &[u8], mut at: usize) -> Result<WholeXref, String> {
         match read.prev {
             Some(p) => at = p,
             None => {
+                let first = (0..).find(|n| !younger.contains(n)).unwrap_or(u32::MAX);
+                let skipped = (table && seen.len() > 1 && u64::from(first) < size)
+                    .then_some(first)
+                    .filter(|n| !last.contains(n));
                 return Ok(WholeXref {
                     spec,
                     deleted,
                     trailer,
                     table,
-                })
+                    skipped,
+                });
             }
         }
     }
@@ -5819,8 +5856,8 @@ mod tests {
     }
 
     /// A plain one-page file, its page's number, the page written turned by the given angle
-    /// (0, as it is), and the end of a revision listing the page alone, at offset `entry`,
-    /// its section at `xref` following the one at `prev`.
+    /// (0, as it is), and the end of a revision listing object 0 and the page, at offset
+    /// `entry`, its section at `xref` following the one at `prev`.
     #[allow(clippy::type_complexity)]
     fn page_revisions() -> (
         Vec<u8>,
@@ -5854,8 +5891,9 @@ mod tests {
         let size = p.doc.trailer.get(b"Size").unwrap().as_i64().unwrap();
         let tail = move |entry: usize, prev: usize, xref: usize| {
             format!(
-                "xref\n{num} 1\n{entry:010} {gen:05} n \ntrailer\n<< /Size {size} /Root {root} \
-                 {root_gen} R /Prev {prev} >>\nstartxref\n{xref}\n%%EOF\n"
+                "xref\n0 1\n0000000000 65535 f \n{num} 1\n{entry:010} {gen:05} n \ntrailer\n<< \
+                 /Size {size} /Root {root} {root_gen} R /Prev {prev} >>\nstartxref\n{xref}\n\
+                 %%EOF\n"
             )
         };
         (signed, num, turned, tail)
@@ -6172,6 +6210,58 @@ mod tests {
             older.len()
         );
         assert_eq!(read(&[older, newer.into_bytes()].concat()), Ok(()));
+    }
+
+    /// Poppler reads older sections only as it needs their entries, and once a newest table's
+    /// chain ends without listing the number it looks for, it scans the whole file for objects
+    /// instead. Looking for where an object ends, it looks up every number below the size in
+    /// turn: one no section lists, every lower one found before the oldest section, makes it
+    /// scan (review round 4).
+    #[test]
+    fn a_number_poppler_looks_up_past_every_section_differs() {
+        let plain = table_file(&[
+            "<< /Type /Catalog /Pages 2 0 R >>",
+            "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 200] >>",
+        ]);
+        let at = last_startxref(&plain).unwrap();
+        let rows = &plain[at + 9..][..80];
+        let read = |b: &[u8]| compare_reading(b, &Document::load_mem(b).unwrap()).map(|_| ());
+        // A table listing `n` of the rows, then `free` free entries, and `size`.
+        let newer = |n: usize, free: usize, size: usize| {
+            let x = plain.len();
+            let mut b = plain.clone();
+            b.extend_from_slice(format!("xref\n0 {}\n", n + free).as_bytes());
+            b.extend_from_slice(&rows[..20 * n]);
+            b.extend_from_slice("0000000000 00001 f\r\n".repeat(free).as_bytes());
+            let tail = format!("trailer\n<< /Size {size} /Root 1 0 R /Prev {at} >>\n");
+            b.extend_from_slice(format!("{tail}startxref\n{x}\n%%EOF\n").as_bytes());
+            b
+        };
+        assert_eq!(read(&newer(4, 0, 5)), Err(skipped(4)));
+        assert_eq!(read(&newer(4, 0, 4)), Ok(()));
+        // Listed free, or found in the oldest section first.
+        assert_eq!(read(&newer(4, 1, 5)), Ok(()));
+        assert_eq!(read(&newer(2, 0, 5)), Ok(()));
+        // In one section, or a newest cross-reference stream, it never looks on.
+        let one = String::from_utf8(plain.clone()).unwrap();
+        assert_eq!(read(one.replace("/Size 4", "/Size 5").as_bytes()), Ok(()));
+        let x = plain.len();
+        let mut data = vec![0, 0, 0, 0, 0, 255, 255];
+        for row in rows[20..].chunks(20) {
+            let offset: u32 = std::str::from_utf8(&row[..10]).unwrap().parse().unwrap();
+            data.extend([&[1][..], &offset.to_be_bytes(), &[0, 0]].concat());
+        }
+        let mut b = plain.clone();
+        let d = format!(
+            "<< /Type /XRef /Size 5 /W [1 4 2] /Index [0 4] /Root 1 0 R /Prev {at} \
+             /Length {} >>",
+            data.len()
+        );
+        b.extend_from_slice(format!("5 0 obj\n{d}\nstream\n").as_bytes());
+        b.extend_from_slice(&data);
+        b.extend_from_slice(format!("\nendstream\nendobj\nstartxref\n{x}\n%%EOF\n").as_bytes());
+        assert_eq!(read(&b), Ok(()));
     }
 
     /// Poppler and pdf.js number a table subsection that starts at 1 with a free entry from 0

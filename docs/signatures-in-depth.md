@@ -620,6 +620,12 @@ refuses as malformed:
   IBM's patent server have it, and read each entry as the object before. A signed file whose own table is like this
   shows *can't check*. A subsection of that free entry alone deletes object 1 for LimarePDF but not for them, which
   is refused when object 1 is still used, as for any object deleted but still used;
+- a number below the size (the newest trailer's `/Size`, or past the highest number listed) that no cross-reference
+  section lists, when the newest section is a table and a later section than the oldest lists every number below it:
+  Poppler reads the older sections only as it needs them, and when it looks up each number in turn (as it does for a
+  long string, or for stream data it can't frame), it reads the oldest section last, doesn't find that number there
+  either, and scans the whole file for objects, as for a reference to a missing object (below). A signed file whose
+  own sections are like this shows *can't check*;
 - an object whose cross-reference entry points into the signed part, outside its own revision, or at another
   object (the published "shadow" attacks that re-point objects at content hidden in the signed file);
 - an object that can't be read, or that LimarePDF and its PDF library read differently;
