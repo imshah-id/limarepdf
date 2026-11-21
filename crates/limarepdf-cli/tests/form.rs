@@ -136,11 +136,12 @@ fn fill_sets_a_field_past_those_listed() {
 /// A form whose 1,100 fields share a 64 KiB title holds more than LimarePDF reads of one
 /// (2²⁶ steps, the bytes of their names among them): `form fill` naming a field past those
 /// read says so, writing nothing. It said there was no such field. Among 1,000, read whole,
-/// a field that isn't there is not there.
+/// a field that isn't there is not there. The name is given in a values file, looked up as
+/// `--set`'s are: Windows takes a command line of 32,767 characters at most.
 #[test]
 fn fill_says_a_field_past_what_is_read_may_be_there() {
     let title = "a".repeat(65_536);
-    let set = format!("{title}.k1099=x");
+    let values = format!("{{\"{title}.k1099\": \"x\"}}");
     for (kids, says) in [
         (
             1_100,
@@ -150,9 +151,18 @@ fn fill_says_a_field_past_what_is_read_may_be_there() {
     ] {
         let dir = folder(&format!("past-read-{kids}"));
         make_titled(&dir, kids);
+        std::fs::write(dir.join("values.json"), &values).unwrap();
         let res = run(
             &dir,
-            &["form", "fill", "in.pdf", "--set", &set, "-o", "out.pdf"],
+            &[
+                "form",
+                "fill",
+                "in.pdf",
+                "--values",
+                "values.json",
+                "-o",
+                "out.pdf",
+            ],
         );
         let err = String::from_utf8_lossy(&res.stderr).replace(&title, "<title>");
         assert!(!res.status.success(), "{kids}");
