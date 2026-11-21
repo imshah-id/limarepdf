@@ -615,6 +615,11 @@ refuses as malformed:
   9,223,372,036,854,775,807, which Poppler takes as damage; or a cross-reference stream's type wider than 4 bytes. A
   signed file whose own sections are like this opens as a file other apps may read differently, so its signatures
   show *can't check*;
+- a cross-reference table subsection of more than one entry that starts at object 1 with a free entry: Poppler (for
+  one at offset 0 with generation 65535) and pdf.js (for any) take it for one that should start at 0, as files from
+  IBM's patent server have it, and read each entry as the object before. A signed file whose own table is like this
+  shows *can't check*. A subsection of that free entry alone deletes object 1 for LimarePDF but not for them, which
+  is refused when object 1 is still used, as for any object deleted but still used;
 - an object whose cross-reference entry points into the signed part, outside its own revision, or at another
   object (the published "shadow" attacks that re-point objects at content hidden in the signed file);
 - an object that can't be read, or that LimarePDF and its PDF library read differently;

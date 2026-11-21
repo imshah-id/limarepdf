@@ -1277,6 +1277,79 @@ fn a_cross_reference_section_poppler_cant_read_is_refused() {
     }
 }
 
+/// A table subsection that starts at object 1 with a free entry, after signing, is refused:
+/// Poppler (for one at offset 0 with generation 65535, when no newer section lists object 1)
+/// and pdf.js (for any) take it for one that should start at 0, as files from IBM's patent
+/// server have it, and read each of its entries as the object before (review round 4). A
+/// revision writing objects 2 to the one after the catalog over unchanged that way had them
+/// find the next object where they looked for the catalog, scan the whole file for objects
+/// and show a turned copy of the page it doesn't list, while the revision passed as
+/// unchanged. A subsection of that one free entry alone, which they read as object 0's,
+/// leaves object 1 to the older sections there, while LimarePDF reads it deleted: judged as
+/// usual, it passes when nothing uses object 1.
+#[test]
+fn a_subsection_other_apps_number_from_0_is_refused() {
+    use lopdf::xref::XrefEntry;
+    // The base document numbered from 2, so that object 1 is free.
+    let mut d = Document::load_mem(&base_pdf()).unwrap();
+    d.renumber_objects_with(2);
+    let mut base = Vec::new();
+    d.save_to(&mut base).unwrap();
+    let b = approve(&base);
+    let d = Document::load_mem(&b).unwrap();
+    assert!(!d.objects.contains_key(&(1, 0)));
+    let (p, _, turned) = page_texts(&b);
+    let (r, prev, last) = (root(&d), last_startxref(&b), root(&d).0 + 1);
+    // Object 1's entry: as given, or in use for a new object 1 when none is given.
+    let free = Some("0000000000 65535 f\r\n");
+    let odd = Some("0000000007 00003 f\r\n");
+    for (head, one, mid, refused) in [
+        (format!("1 {last}\n"), free, "", true),
+        (format!("1 {last}\n"), odd, "", true),
+        (format!("1 {last}\n"), None, "", false),
+        (String::new(), Some(""), "2 _\n", false),
+        ("1 1\n".into(), free, "2 _\n", false),
+    ] {
+        let stray = format!("{} 0 obj {turned} endobj\n", p.0);
+        let mut f = [&b[..], b"\n", stray.as_bytes()].concat();
+        let one = one.map_or_else(
+            || {
+                let row = format!("{:010} 00000 n\r\n", f.len());
+                f.extend_from_slice(b"1 0 obj\nnull\nendobj\n");
+                row
+            },
+            String::from,
+        );
+        let mut rows = String::new();
+        for num in 2..=last {
+            let Some(&XrefEntry::Normal { offset, .. }) = d.reference_table.get(num) else {
+                panic!("object {num} isn't written plainly");
+            };
+            let obj = &b[offset as usize..];
+            let end = obj.windows(6).position(|w| w == b"endobj").unwrap() + 6;
+            rows += &format!("{:010} 00000 n\r\n", f.len());
+            f.extend_from_slice(&obj[..end]);
+            f.push(b'\n');
+        }
+        let at = f.len();
+        let mid = mid.replace('_', &(last - 1).to_string());
+        f.extend_from_slice(
+            format!(
+                "xref\n0 1\n0000000000 65535 f\r\n{head}{one}{mid}{rows}trailer\n<< /Size {} \
+                 /Root {} {} R /Prev {prev} >>\nstartxref\n{at}\n%%EOF\n",
+                d.max_id + 1,
+                r.0,
+                r.1
+            )
+            .as_bytes(),
+        );
+        let why = format!("the cross-reference section at byte {at} is malformed");
+        let want = vec![(ChangeKind::Malformed(why), Some(Refusal::Never))];
+        let case = format!("{head:?} {one:?} {mid:?}");
+        assert_eq!(changes(&f), if refused { want } else { vec![] }, "{case}");
+    }
+}
+
 /// A cross-reference stream row of type `kind` and a 4-byte field `f1`.
 fn row(kind: u8, f1: u32) -> Vec<u8> {
     [vec![kind], f1.to_be_bytes().into()].concat()

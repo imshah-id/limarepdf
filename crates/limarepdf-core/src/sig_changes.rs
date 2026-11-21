@@ -887,6 +887,14 @@ fn read_table(bytes: &[u8], mut lx: Lexer) -> Option<ReadSection> {
                 (_, Tok::Word(b"f"), _) => Entry::Free,
                 _ => return None,
             };
+            // Poppler (for one at offset 0 with generation 65535) and pdf.js (for any) take a
+            // subsection that starts at 1 with a free entry for one that should start at 0, as
+            // files from IBM's patent server have it, and read each entry as the object before.
+            // That entry alone frees object 1 here but leaves it to older sections there, which
+            // matters only while object 1 is used, and that is refused as deleted but used.
+            if first == 1 && count > 1 && i == 0 && e == Entry::Free {
+                return None;
+            }
             entries.push((num, e));
         }
     }
@@ -6129,6 +6137,34 @@ mod tests {
             older.len()
         );
         assert_eq!(read(&[older, newer.into_bytes()].concat()), Ok(()));
+    }
+
+    /// Poppler and pdf.js number a table subsection that starts at 1 with a free entry from 0
+    /// (review round 4), so a file whose own table has one reads differently there.
+    #[test]
+    fn a_subsection_other_apps_number_from_0_differs() {
+        let plain = table_file(&[
+            "null",
+            "<< /Type /Catalog /Pages 3 0 R >>",
+            "<< /Type /Pages /Kids [4 0 R] /Count 1 >>",
+            "<< /Type /Page /Parent 3 0 R /MediaBox [0 0 300 200] >>",
+        ]);
+        let at = last_startxref(&plain).unwrap();
+        let plain = String::from_utf8(plain)
+            .unwrap()
+            .replace("/Root 1", "/Root 2");
+        let read = |b: &str| {
+            let b = b.as_bytes();
+            compare_reading(b, &Document::load_mem(b).unwrap()).map(|_| ())
+        };
+        assert_eq!(read(&plain), Ok(()));
+        let zero = "0000000000 65535 f\r\n";
+        let split = plain.replace(&format!("0 5\n{zero}"), &format!("0 1\n{zero}1 4\n"));
+        assert_eq!(read(&split), Ok(()));
+        let page = format!("{:010} 00000 n", split.find("4 0 obj").unwrap());
+        assert_eq!(read(&split.replace(&page, "0000000000 65535 f")), Ok(()));
+        let freed = split.replace("0000000009 00000 n", "0000000000 65535 f");
+        assert_eq!(read(&freed), Err(malformed(at)));
     }
 
     /// The signed version's pointer must lead lopdf to the same section in the whole file as
