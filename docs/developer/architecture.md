@@ -81,9 +81,10 @@ option list given once was held by every kid: 700 kids of one `/DV` held 129 MB,
 MiB was held by each. Once the steps are taken the walk stops, the fields after are left out (`LeftOut::Large`,
 over `LeftOut::Deep`), and flattening, reset, removing values (and so `check_remove_hidden` and `find_hidden`),
 redaction (its report looks in every field) and setting a field the walk may have left out refuse with a
-`TooComplex`. The render corpus's dearest form takes 126,118 steps (`pdfjs/issue16081.pdf`, 240 fields; 1,197
-files, measured 2026-11-20); walks cut at the limit take at most 0.07 s in an optimised build (the `ci-test`
-profile).
+`TooComplex`. Flattening and reset refuse fields left out for being nested too deep (`LeftOut::Deep`) too, and
+removing values stops at them (`value_nodes`). The render corpus's dearest form takes 126,118 steps
+(`pdfjs/issue16081.pdf`, 240 fields; 1,197 files, measured 2026-11-20); walks cut at the limit take at most 0.07 s
+in an optimised build (the `ci-test` profile).
 
 Every dialog in the desktop app is built from the same parts in `crates/limarepdf-gui/src/dialogs.rs`, so they all
 look like Print: `Shell` (the window over the dimmed app, its title and file, and the dialogs' look from

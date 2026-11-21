@@ -653,6 +653,28 @@ fn flattening_refuses_a_form_nested_too_deep_to_follow() {
     assert!(back.page_text(0).contains("DEEPVALUE"));
 }
 
+/// Resetting refuses, with nothing changed, a form whose fields are nested more than 32
+/// deep, as flattening does: it reset the fields it could follow and said nothing of the
+/// rest, which kept their values. Just inside the limit, the value is emptied.
+#[test]
+fn resetting_refuses_a_form_nested_too_deep_to_follow() {
+    let mut p = deep_form(34);
+    let before = p.state_before();
+    let e = p.reset_form().unwrap_err().to_string();
+    assert_eq!(
+        e,
+        "This form's fields are nested too deeply for LimarePDF to follow (more than 32 \
+         levels), so resetting could miss some of them. Nothing was changed."
+    );
+    assert_eq!(p.state_since(&before), []);
+
+    let mut p = deep_form(33);
+    p.reset_form().unwrap();
+    let fields = p.form_fields();
+    assert_eq!(fields.len(), 1);
+    assert_eq!(fields[0].value, FieldValue::Text(String::new()));
+}
+
 /// A form listing `x`, a node with a name but no kind, then the text field `t` holding
 /// "SHAREDVALUE": both list `t`'s widget on the first page, with no drawing, in an array of
 /// their own or, when `shared`, in one array object.

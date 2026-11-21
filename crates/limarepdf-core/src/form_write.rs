@@ -120,11 +120,18 @@ impl Pdf {
 
     /// Put every field back to its default value (`/DV`), or empty when it has none.
     /// Read-only fields are left as they are. When a field can't be reset, none is, nor when
-    /// the fields hold more than LimarePDF reads of a form ([`crate::TooComplex`]).
+    /// the fields are nested more than [`MAX_DEPTH`] deep or hold more than LimarePDF reads
+    /// of a form ([`crate::TooComplex`]).
     pub fn reset_form(&mut self) -> Result<()> {
         let (all, left_out) = self.field_nodes(Reach::Every);
-        if left_out == Some(LeftOut::Large) {
-            return Err(forms::too_large().into());
+        match left_out {
+            Some(LeftOut::Deep) => bail!(
+                "This form's fields are nested too deeply for LimarePDF to follow (more than \
+                 {MAX_DEPTH} levels), so resetting could miss some of them. Nothing was \
+                 changed."
+            ),
+            Some(LeftOut::Large) => return Err(forms::too_large().into()),
+            None => {}
         }
         let mut staged = Vec::new();
         for (field, node) in all {
