@@ -1190,6 +1190,11 @@ impl<'a> Lexer<'a> {
         self.pos
     }
 
+    /// The bytes it reads.
+    pub(crate) fn bytes(&self) -> &'a [u8] {
+        self.bytes
+    }
+
     /// Once [`Lexer::next`] has given `None`: whether that was the end rather than malformed
     /// input.
     pub(crate) fn at_end(&self) -> bool {

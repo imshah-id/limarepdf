@@ -1671,6 +1671,50 @@ fn behind_a_stream(b: &[u8], data: Data, route: Route) -> (Vec<u8>, usize) {
     (out, at)
 }
 
+/// lopdf makes a stream of a dictionary followed by `stream` only with a line end after the
+/// keyword, spaces and tabs aside; Poppler and pdf.js make one regardless, and finding no
+/// data where they look, read the file again from its objects, taking any written in the
+/// "data". The page written again as it was after signing, then `stream` and a comment, a
+/// form feed or a letter, passed as unchanged, and they showed another page planted there.
+/// Written again with `endobj`, it changes nothing.
+#[test]
+fn a_dictionary_followed_by_stream_without_a_line_end_is_refused() {
+    let b = approve(&base_pdf());
+    let doc = Document::load_mem(&b).unwrap();
+    let (p, r) = (page(&doc), root(&doc));
+    let want = ChangeKind::Malformed(format!(
+        "other PDF apps may read the document differently from LimarePDF (LimarePDF can't \
+         read its object {} the way they do)",
+        p.0
+    ));
+    let rewritten = |after: &str| {
+        let mut out = b.clone();
+        out.push(b'\n');
+        let at = out.len();
+        let page = dict(&doc, p);
+        out.extend_from_slice(format!("{} {} obj\n{page:?}\n{after}\n", p.0, p.1).as_bytes());
+        let xref = out.len();
+        out.extend_from_slice(
+            format!(
+                "xref\n{} 1\n{at:010} {:05} n \ntrailer\n<< /Size {} /Root {} {} R /Prev {} \
+                 >>\nstartxref\n{xref}\n%%EOF\n",
+                p.0,
+                p.1,
+                doc.max_id + 1,
+                r.0,
+                r.1,
+                last_startxref(&b)
+            )
+            .as_bytes(),
+        );
+        out
+    };
+    for keyword in ["stream %", "stream\x0c", "stream x"] {
+        assert_refused(&rewritten(&format!("{keyword}\nendstream\nendobj")), &want);
+    }
+    assert_eq!(changes(&rewritten("endobj")), vec![]);
+}
+
 /// lopdf and pdf.js read each object in an object stream at its offset, and Poppler in
 /// windows as long as from one offset to the next, the first starting at `/First`. A page
 /// turned after signing, written before the page as signed, passed as unchanged, and Poppler

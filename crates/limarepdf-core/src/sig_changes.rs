@@ -1643,7 +1643,9 @@ fn holds_string(o: &Object) -> bool {
 /// dictionary, array, string or name, which ends itself, may instead be followed by the next
 /// object's header, `xref`, `trailer`, `startxref` or the end of the file, where they all stop
 /// without `endobj`; not a number or a keyword, which lopdf may read on into a reference.
-/// Adds the object a stream takes its `/Length` from to `lengths`.
+/// A dictionary followed by `stream` counts only with a line end after the keyword (spaces
+/// and tabs aside): without one lopdf reads the dictionary alone, where Poppler and pdf.js
+/// read a stream. Adds the object a stream takes its `/Length` from to `lengths`.
 fn whole_object(mut lx: Lexer, lengths: &mut HashSet<ObjectId>) -> bool {
     let mut dict = lx.clone();
     let first = lx.clone().next();
@@ -1664,13 +1666,14 @@ fn whole_object(mut lx: Lexer, lengths: &mut HashSet<ObjectId>) -> bool {
     let next = lx.next();
     match next {
         Some((_, Tok::Word(b"endobj"), _)) => true,
-        Some((_, Tok::Word(b"stream"), _)) => {
+        Some((_, Tok::Word(b"stream"), keyword)) => {
             if let Some(Object::Dictionary(d)) = read_object(&mut dict, 0) {
                 if let Ok(Object::Reference(id)) = d.get(b"Length") {
                     lengths.insert(*id);
                 }
             }
-            true
+            !matches!(first, Some((_, Tok::DictOpen, _)))
+                || data_start(lx.bytes(), keyword).is_some()
         }
         _ if !ends_itself => false,
         Some((_, Tok::Word(b"xref" | b"trailer" | b"startxref"), _)) => true,
@@ -5723,10 +5726,17 @@ mod tests {
             "/N",
             "/Aendobj",
             "<< /A 1 >> % x\n",
+            "<< /A 1 >>\nstream\n",
+            "<< /A 1 >> stream \t\r\n",
+            "[1 2] stream x",
         ] {
             assert!(whole(ok), "{ok}");
         }
         for bad in [
+            "<< /A 1 >> stream %\n",
+            "<< /A 1 >>\nstream\x0c\n",
+            "<< /A 1 >> stream x\n",
+            "<< /A 1 >>\nstream",
             "endobj",
             "nullendobj",
             "/Aendobj 5",

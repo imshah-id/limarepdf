@@ -632,7 +632,9 @@ refuses as malformed:
   than a million objects or an object number above 2,147,483,647 (some apps then read none of them) is refused. A
   stream any entry names as an object stream is checked so, with or without its type;
 - an object in use that other apps may find otherwise, also when it serves only as a stream's length: one listed in
-  the cross-reference information that isn't written as one whole object followed by `endobj` or its stream data,
+  the cross-reference information that isn't written as one whole object followed by `endobj` or its stream data
+  (`stream` after a dictionary counts with a line end after it, where all of them read a stream; without one,
+  LimarePDF's PDF library reads the dictionary alone and other apps a stream),
   or whose header gives another number (a number may run straight into `endobj`, and a dictionary, array, string or
   name may instead be followed by the next object, the cross-reference information or the end of the file, which
   every app reads alike); one in an object stream numbered as the place in the file of an object
