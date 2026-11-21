@@ -1989,6 +1989,72 @@ fn a_reference_to_an_object_in_a_stream_under_another_generation_is_refused() {
     assert!(Pdf::from_bytes(&ok, None).unwrap().differs().is_none());
 }
 
+/// lopdf and pdf.js take a key given twice as its last value, and so does Poppler while the
+/// dictionary has fewer than 32 entries, the repeats counted; from 32 Poppler sorts them and
+/// may take another. The page written again with other page sizes before its own passed as
+/// unchanged, in its own object and in an object stream, and so did a trailer naming another
+/// catalog before its own.
+#[test]
+fn a_dictionary_of_32_entries_with_a_key_repeated_is_refused() {
+    let b = approve(&base_pdf());
+    let d = Document::load_mem(&b).unwrap();
+    let (p, signed, _) = page_texts(&b);
+    let own = dict(&d, p).len();
+    assert!(dict(&d, p).has(b"MediaBox"));
+    // The page with `/MediaBox` repeated until it has `entries` entries.
+    let page = |entries: usize| {
+        let sizes = " /MediaBox [0 0 1 1]".repeat(entries - own);
+        format!("<<{sizes}{}", signed.strip_prefix("<<").unwrap())
+    };
+    let c = d.max_id + 1;
+    // The page written again in its own object, or in an object stream when `packed`.
+    let rewritten = |entries, packed| {
+        if packed {
+            let objstm = object_stream(c, &[(p.0, 0)], &page(entries), "");
+            by_hand(&b, &[(c, objstm)], &[(p.0, c, 0)])
+        } else {
+            by_hand(&b, &[(p.0, written(p.0, &page(entries)))], &[])
+        }
+    };
+    let differs = |b: &[u8]| Pdf::from_bytes(b, None).unwrap().differs().is_some();
+    for packed in [false, true] {
+        let bad = rewritten(32, packed);
+        assert_eq!(changes(&bad), read_otherwise(p.0), "packed {packed}");
+        assert!(differs(&bad), "packed {packed}");
+        let ok = rewritten(31, packed);
+        assert_eq!(changes(&ok), [], "packed {packed}");
+        assert!(!differs(&ok), "packed {packed}");
+    }
+    // A revision listing nothing, whose trailer has `entries` entries.
+    let r = root(&d);
+    let trailer = |entries: usize| {
+        let mut out = [&b[..], b"\n"].concat();
+        let at = out.len();
+        let more: String = (4..entries).map(|i| format!(" /E{i} 0")).collect();
+        out.extend_from_slice(
+            format!(
+                "xref\n0 0\ntrailer\n<< /Size {c} /Prev {}{more} /Root {} 0 R /Root {} {} R >>\n\
+                 startxref\n{at}\n%%EOF\n",
+                last_startxref(&b),
+                p.0,
+                r.0,
+                r.1
+            )
+            .as_bytes(),
+        );
+        (out, at)
+    };
+    let (bad, at) = trailer(32);
+    let want = ChangeKind::Malformed(format!(
+        "the cross-reference section at byte {at} is malformed"
+    ));
+    assert_eq!(changes(&bad), [(want, Some(Refusal::Never))]);
+    assert!(differs(&bad));
+    let (ok, _) = trailer(31);
+    assert_eq!(changes(&ok), []);
+    assert!(!differs(&ok));
+}
+
 #[test]
 fn filling_in_a_form_is_allowed() {
     let b = fill(&approve(&form(&["Name", "Date"])), "Name", "Jane");

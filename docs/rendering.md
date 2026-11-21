@@ -58,7 +58,8 @@ Flate format (or marked with an empty list of formats), or has decoding paramete
 (LimarePDF's PDF library decodes damaged data as far as it can; some apps fail and look for the objects elsewhere),
 an object stream holding a part in use whose objects aren't each exactly where its index says (some apps read
 them at the places in the index, others in stretches of the lengths it gives) or whose data its length doesn't end
-just before `endstream`, a part in use not written as one whole object, or one other apps reach where LimarePDF's
+just before `endstream`, a part in use not written as one whole object or holding a dictionary of 32 entries or
+more that gives a key twice (some apps then take another of its values), or one other apps reach where LimarePDF's
 PDF library doesn't (a reference under another generation, an object stream numbered as another part's place in
 the file), or an encryption dictionary, or a part it names, in an object stream (some apps read those before they
 can decrypt).

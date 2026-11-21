@@ -1019,7 +1019,9 @@ fn skip_object(lx: &mut Lexer) -> bool {
 }
 
 /// [`read_object`], keeping what arrays and dictionaries hold only when `keep`: otherwise
-/// they read as null.
+/// they read as null. A dictionary of 32 entries or more with a key given twice doesn't read:
+/// lopdf and pdf.js take the last value, but Poppler, from 32 entries, sorts them and may take
+/// another.
 fn object(lx: &mut Lexer, depth: usize, keep: bool) -> Option<Object> {
     if depth > 32 {
         return None;
@@ -1028,6 +1030,7 @@ fn object(lx: &mut Lexer, depth: usize, keep: bool) -> Option<Object> {
     Some(match tok {
         Tok::DictOpen => {
             let mut d = Dictionary::new();
+            let mut keys = Vec::new();
             loop {
                 match lx.next()? {
                     (_, Tok::DictClose, _) => break,
@@ -1035,10 +1038,17 @@ fn object(lx: &mut Lexer, depth: usize, keep: bool) -> Option<Object> {
                         let v = object(lx, depth + 1, keep)?;
                         let k = decode_name(k)?;
                         if keep {
-                            d.set(k, v);
+                            d.set(k.clone(), v);
                         }
+                        keys.push(k);
                     }
                     _ => return None,
+                }
+            }
+            if keys.len() >= 32 {
+                keys.sort_unstable();
+                if keys.windows(2).any(|w| w[0] == w[1]) {
+                    return None;
                 }
             }
             if keep {
@@ -5772,6 +5782,41 @@ mod tests {
             "99999999999999999999",
         ] {
             assert_eq!(read(w), None, "{w}");
+        }
+    }
+
+    /// A key given twice reads as its last value in lopdf and pdf.js, and in Poppler while the
+    /// dictionary has fewer than 32 entries, the repeats counted. From 32 Poppler sorts them
+    /// and may take another, so such a dictionary is refused, at any depth.
+    #[test]
+    fn a_key_repeated_reads_alike_below_32_entries() {
+        // `others` distinct entries, then `/K 1` and `/{last} 2`.
+        let dict = |others: usize, last: &str| {
+            let mut s = String::from("<<");
+            for i in 0..others {
+                s += &format!(" /E{i} 0");
+            }
+            format!("{s} /K 1 /{last} 2 >>")
+        };
+        let read = |w: &str| read_object(&mut Lexer::new(w.as_bytes(), 0), 0);
+        let skip = |w: &str| skip_object(&mut Lexer::new(w.as_bytes(), 0));
+        let Some(Object::Dictionary(d)) = read(&dict(29, "K")) else {
+            panic!("31 entries");
+        };
+        assert_eq!((d.len(), d.get(b"K").unwrap()), (30, &Object::Integer(2)));
+        assert!(skip(&dict(29, "K")));
+        for ok in [dict(30, "L"), format!("[{}]", dict(29, "K"))] {
+            assert!(read(&ok).is_some() && skip(&ok), "{ok}");
+        }
+        for bad in [
+            dict(30, "K"),
+            dict(30, "#4B"),
+            dict(300, "K"),
+            format!("[1 {}]", dict(30, "K")),
+            format!("<< /A {} >>", dict(30, "K")),
+        ] {
+            assert_eq!(read(&bad), None, "{bad}");
+            assert!(!skip(&bad), "{bad}");
         }
     }
 
