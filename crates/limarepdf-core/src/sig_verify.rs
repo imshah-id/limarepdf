@@ -7,8 +7,8 @@
 //! value must sit inside that version's signature dictionary.
 
 use crate::cms_check::{self, oid, Cert, CertInfo, DigestAlg, Fail, SignedData};
-use crate::forms::FieldKind;
-use crate::sig_changes::{self, Change};
+use crate::forms::{FieldKind, Node};
+use crate::sig_changes::{self, Change, Drawings};
 use crate::trust::{self, Purpose, Trust, TrustList};
 use crate::{Pdf, Result};
 use chrono::{DateTime, FixedOffset, NaiveDate, Utc};
@@ -480,17 +480,19 @@ impl fmt::Display for Permissions {
 
 /// Checks every digital signature in `bytes` (a whole PDF file), and whether `trust`
 /// vouches for each signer. `password` opens an encrypted file. Fails only when the file
-/// can't be opened at all; each signature's problems are in its
-/// [`DigitalSignature::status`].
+/// can't be opened at all, or its form holds more than is read of one, where signatures may
+/// be among the fields left out ([`crate::TooComplex`]); each signature's problems are in
+/// its [`DigitalSignature::status`].
 pub fn verify_signatures(
     bytes: &[u8],
     password: Option<&str>,
     trust: &TrustList,
 ) -> Result<SignatureReport> {
     let pdf = Pdf::from_bytes(bytes, password)?;
+    let nodes = pdf.whole_form()?;
     let mut groups: Vec<(Place, Vec<(crate::Field, ObjectId)>)> = Vec::new();
     let mut empty_fields = Vec::new();
-    for (field, node) in pdf.form_nodes() {
+    for (field, node) in &nodes {
         if field.kind != FieldKind::Signature {
             continue;
         }
@@ -504,7 +506,7 @@ pub fn verify_signatures(
                         .and_then(|l| field_lock(&pdf, l)),
                     page: w.map(|w| w.page),
                     bbox: w.map(|w| w.bbox),
-                    name: field.name,
+                    name: field.name.clone(),
                 });
                 continue;
             }
@@ -512,9 +514,10 @@ pub fn verify_signatures(
             Some(Object::Dictionary(_)) => Place::Direct(node.id),
             Some(_) => Place::NotADictionary(node.id),
         };
+        let field = (field.clone(), node.id);
         match groups.iter_mut().find(|(p, _)| *p == place) {
-            Some((_, fields)) => fields.push((field, node.id)),
-            None => groups.push((place, vec![(field, node.id)])),
+            Some((_, fields)) => fields.push(field),
+            None => groups.push((place, vec![field])),
         }
     }
     // A field signed after a signature counts as signing only if it's listed here.
@@ -530,7 +533,7 @@ pub fn verify_signatures(
         Some([_, _, c, d]) => (false, c + d),
         None => (true, 0),
     });
-    certification_rules(&pdf, &mut signatures);
+    certification_rules(&pdf, &nodes, &mut signatures);
 
     // What changed after each signature. Any certification limits every signature's
     // later changes; when more than one claims to certify, the strictest counts.
@@ -551,7 +554,11 @@ pub fn verify_signatures(
             locks: signatures[i].locks.as_ref(),
         })
         .collect();
-    let found = sig_changes::analyse(&mut versions, &inputs, &listed, certified);
+    let unchecked: Vec<usize> = (signatures.iter())
+        .filter(|s| s.signed_len.is_none())
+        .filter_map(|s| s.byte_range.and_then(|[_, _, c, d]| c.checked_add(d)))
+        .collect();
+    let found = sig_changes::analyse(&mut versions, &inputs, &unchecked, &listed, certified);
     for (i, changes) in which.into_iter().zip(found) {
         signatures[i].changes = changes;
     }
@@ -613,6 +620,8 @@ pub(crate) struct Versions<'a> {
     /// The whole file, already open.
     whole: &'a Pdf,
     cache: HashMap<usize, Option<Pdf>>,
+    /// The references in the data of what each open version draws, by drawing, once read.
+    drawings: HashMap<usize, Drawings>,
 }
 
 /// The most earlier versions opened while checking one file, and their combined size, so a
@@ -628,11 +637,12 @@ impl<'a> Versions<'a> {
             password,
             whole,
             cache: HashMap::new(),
+            drawings: HashMap::new(),
         }
     }
 
     /// Whether the version ending at `end` is open or may be opened within the limits.
-    fn allowed(&self, end: usize) -> bool {
+    pub(crate) fn allowed(&self, end: usize) -> bool {
         end == self.bytes.len()
             || self.cache.contains_key(&end)
             || (self.cache.len() < MAX_VERSIONS
@@ -657,10 +667,36 @@ impl<'a> Versions<'a> {
         self.cache.get(&end)?.as_ref()
     }
 
+    /// Reads the references in the data of what the version ending at `end` draws, if it is
+    /// open and they aren't read yet.
+    pub(crate) fn read_drawings(&mut self, end: usize) {
+        if !self.drawings.contains_key(&end) {
+            if let Some(pdf) = self.peek(end) {
+                let drawings = sig_changes::reached(&pdf.doc).drawings;
+                self.drawings.insert(end, drawings);
+            }
+        }
+    }
+
+    /// The version ending at `end` and the references in the data of what it draws, by
+    /// drawing, if it is open and they are read.
+    pub(crate) fn peek_drawn(&self, end: usize) -> Option<(&Pdf, &Drawings)> {
+        Some((self.peek(end)?, self.drawings.get(&end)?))
+    }
+
     fn get(&mut self, end: usize) -> Option<&Pdf> {
         self.load(end);
         self.peek(end)
     }
+}
+
+/// Why a version past the limits isn't opened.
+pub(crate) fn too_many_versions() -> String {
+    format!(
+        "the document has more signed versions than LimarePDF checks (at most {MAX_VERSIONS}, {} \
+         MB together)",
+        MAX_VERSION_BYTES >> 20
+    )
 }
 
 fn check_one(
@@ -768,11 +804,7 @@ fn check_into(
 
     // The version this signature signed, and the signature dictionary in it.
     if !versions.allowed(end) {
-        return cant(format!(
-            "the document has more signed versions than LimarePDF checks (at most {MAX_VERSIONS}, \
-             {} MB together)",
-            MAX_VERSION_BYTES >> 20
-        ));
+        return cant(too_many_versions());
     }
     let Some(signed) = versions.get(end) else {
         return cant("LimarePDF can't read the version of the document this signature covers");
@@ -1047,7 +1079,7 @@ pub(crate) fn is_white(ch: u8) -> bool {
     matches!(ch, b' ' | b'\t' | b'\n' | b'\r' | b'\x0c' | b'\0')
 }
 
-fn is_delim(ch: u8) -> bool {
+pub(crate) fn is_delim(ch: u8) -> bool {
     matches!(
         ch,
         b'(' | b')' | b'<' | b'>' | b'[' | b']' | b'{' | b'}' | b'/' | b'%'
@@ -1181,9 +1213,19 @@ impl<'a> Lexer<'a> {
         self.pos
     }
 
-    /// The next token with its start and end, or `None` at the end or on malformed input.
-    #[allow(clippy::should_implement_trait)]
-    pub(crate) fn next(&mut self) -> Option<(usize, Tok<'a>, usize)> {
+    /// The bytes it reads.
+    pub(crate) fn bytes(&self) -> &'a [u8] {
+        self.bytes
+    }
+
+    /// Once [`Lexer::next`] has given `None`: whether that was the end rather than malformed
+    /// input.
+    pub(crate) fn at_end(&self) -> bool {
+        self.pos >= self.bytes.len()
+    }
+
+    /// Skips white space and comments.
+    fn skip_blank(&mut self) {
         let b = self.bytes;
         loop {
             while self.pos < b.len() && is_white(b[self.pos]) {
@@ -1197,6 +1239,26 @@ impl<'a> Lexer<'a> {
             }
             break;
         }
+    }
+
+    /// The next token if it is a word, such as a number or a keyword; `None`, without reading
+    /// on, at the end or where the next token is anything else. Where only a word will do, this
+    /// reads no further into a string than its first byte, as lopdf does, and so never on to the
+    /// end of the file for each object a string that is never ended follows.
+    pub(crate) fn next_word(&mut self) -> Option<(usize, Tok<'a>, usize)> {
+        self.skip_blank();
+        let &ch = self.bytes.get(self.pos)?;
+        if is_delim(ch) {
+            return None;
+        }
+        self.next()
+    }
+
+    /// The next token with its start and end, or `None` at the end or on malformed input.
+    #[allow(clippy::should_implement_trait)]
+    pub(crate) fn next(&mut self) -> Option<(usize, Tok<'a>, usize)> {
+        let b = self.bytes;
+        self.skip_blank();
         let start = self.pos;
         let tok = match *b.get(start)? {
             b'<' if b.get(start + 1) == Some(&b'<') => {
@@ -1208,14 +1270,15 @@ impl<'a> Lexer<'a> {
                 Tok::DictClose
             }
             b'<' => {
-                let len = b[start..].iter().position(|&ch| ch == b'>')?;
-                if !b[start + 1..start + len]
+                // Ends at the first byte that is neither a digit nor white space, as lopdf's
+                // does, rather than searching on for a `>`.
+                let len = b[start + 1..]
                     .iter()
-                    .all(|&ch| ch.is_ascii_hexdigit() || is_white(ch))
-                {
+                    .position(|&ch| !(ch.is_ascii_hexdigit() || is_white(ch)))?;
+                if b[start + 1 + len] != b'>' {
                     return None;
                 }
-                self.pos = start + len + 1;
+                self.pos = start + len + 2;
                 Tok::Hex
             }
             b'[' => {
@@ -1357,8 +1420,8 @@ fn lock_from(pdf: &Pdf, d: &Dictionary) -> Option<FieldLock> {
 }
 
 /// Certification rules across signatures: it must be the first signature, and the
-/// document's `/Perms /DocMDP` must point to it.
-fn certification_rules(pdf: &Pdf, sigs: &mut [DigitalSignature]) {
+/// document's `/Perms /DocMDP` must point to it. `nodes` are the form's fields.
+fn certification_rules(pdf: &Pdf, nodes: &[(crate::Field, Node)], sigs: &mut [DigitalSignature]) {
     let registered = pdf
         .doc
         .catalog()
@@ -1370,8 +1433,8 @@ fn certification_rules(pdf: &Pdf, sigs: &mut [DigitalSignature]) {
         .and_then(|o| o.as_reference().ok());
     let registered_fields: Vec<String> = registered
         .map(|id| {
-            pdf.form_nodes()
-                .into_iter()
+            nodes
+                .iter()
                 .filter(|(_, n)| {
                     pdf.doc
                         .get_dictionary(n.id)
@@ -1380,7 +1443,7 @@ fn certification_rules(pdf: &Pdf, sigs: &mut [DigitalSignature]) {
                         .and_then(|v| v.as_reference().ok())
                         == Some(id)
                 })
-                .map(|(f, _)| f.name)
+                .map(|(f, _)| f.name.clone())
                 .collect()
         })
         .unwrap_or_default();
@@ -1501,6 +1564,132 @@ mod tests {
         assert!(ends_revision(b"...%%EOF\r\n"));
         assert!(!ends_revision(b"...%%EOF\r\nxref"));
         assert!(!ends_revision(b"...endobj\n"));
+    }
+
+    #[test]
+    fn words_alone_and_hex_strings_read_no_further_than_lopdf() {
+        let toks = |s: &'static str| {
+            let mut lx = Lexer::new(s.as_bytes(), 0);
+            std::iter::from_fn(move || lx.next())
+                .map(|(_, t, _)| t)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(toks("<0a 1F> <>"), [Tok::Hex, Tok::Hex]);
+        for bad in ["<0g>", "<0a", "<0a<", "<0a( >", "<0a x>"] {
+            assert!(toks(bad).is_empty(), "{bad}");
+        }
+
+        let word = |s: &'static str| {
+            let mut lx = Lexer::new(s.as_bytes(), 0);
+            (lx.next_word(), lx.pos(), lx.at_end())
+        };
+        assert_eq!(
+            word(" % c\n 12 "),
+            (Some((6, Tok::Word(b"12"), 8)), 8, false)
+        );
+        assert_eq!(
+            word("endobj("),
+            (Some((0, Tok::Word(b"endobj"), 6)), 6, false)
+        );
+        for (s, at) in [
+            ("  (never ended", 2),
+            ("<0a>", 0),
+            ("<<", 0),
+            ("/N", 0),
+            ("{", 0),
+        ] {
+            assert_eq!(word(s), (None, at, false), "{s}");
+        }
+        assert_eq!(word(" % c"), (None, 4, true));
+    }
+
+    /// A later version, signed by a signature that couldn't be checked, that other apps may
+    /// read differently refuses the earlier signatures, though comparing finds no change: what
+    /// they show there was never seen. The versions read alike, so the reason is made up.
+    #[test]
+    fn a_later_version_read_differently_refuses_the_earlier_ones() {
+        use sig_changes::{ChangeKind, Refusal};
+        let mut p = Pdf::new();
+        p.insert_blank(0, 300.0, 200.0).unwrap();
+        let signed = p.snapshot().unwrap();
+        // Revisions with only a new trailer.
+        let next = |b: &[u8], id: &[u8]| {
+            let mut p = Pdf::from_bytes(b, None).unwrap();
+            let id = Object::String(id.to_vec(), lopdf::StringFormat::Hexadecimal);
+            p.doc.trailer.set("ID", vec![id.clone(), id]);
+            crate::incremental::append_revision(b, &p.doc)
+                .unwrap()
+                .bytes
+        };
+        let later = next(&signed, b"later");
+        let bytes = next(&later, b"last");
+        let whole = Pdf::from_bytes(&bytes, None).unwrap();
+        for why in [None, Some("a reason")] {
+            let mut versions = Versions::new(&bytes, None, &whole);
+            versions.load(later.len());
+            let opened = versions
+                .cache
+                .get_mut(&later.len())
+                .unwrap()
+                .as_mut()
+                .unwrap();
+            assert!(opened.differs.is_none());
+            opened.differs = why.map(Into::into);
+            let sigs = [sig_changes::Signed {
+                end: signed.len(),
+                locks: None,
+            }];
+            let found =
+                sig_changes::analyse(&mut versions, &sigs, &[later.len()], &HashSet::new(), None);
+            let found: Vec<_> = found[0].iter().map(|c| (&c.kind, c.refused)).collect();
+            let want = why.map(|why| {
+                ChangeKind::Malformed(format!(
+                    "other PDF apps may read a later signed version differently from LimarePDF \
+                     ({why})"
+                ))
+            });
+            assert_eq!(
+                found,
+                Vec::from_iter(want.iter().map(|w| (w, Some(Refusal::Never))))
+            );
+        }
+    }
+
+    /// A later version signed by a signature that couldn't be checked, read alike everywhere,
+    /// is compared with the ones before and after it, as other apps may show it as signed: a
+    /// page turned there and turned back after is refused.
+    #[test]
+    fn a_later_version_that_couldnt_be_checked_is_compared() {
+        let mut p = Pdf::new();
+        p.insert_blank(0, 300.0, 200.0).unwrap();
+        let signed = p.snapshot().unwrap();
+        let mut p = Pdf::from_bytes(&signed, None).unwrap();
+        p.rotate_pages(&[0], 180).unwrap();
+        let turned = crate::incremental::append_revision(&signed, &p.doc)
+            .unwrap()
+            .bytes;
+        let mut p = Pdf::from_bytes(&turned, None).unwrap();
+        let old = Pdf::from_bytes(&signed, None).unwrap();
+        let page = old.page_ids()[0];
+        p.doc.objects.insert(page, old.doc.objects[&page].clone());
+        let bytes = crate::incremental::append_revision(&turned, &p.doc)
+            .unwrap()
+            .bytes;
+        let whole = Pdf::from_bytes(&bytes, None).unwrap();
+        let sigs = [sig_changes::Signed {
+            end: signed.len(),
+            locks: None,
+        }];
+        for (unchecked, changed) in [(&[][..], false), (&[turned.len()][..], true)] {
+            let mut versions = Versions::new(&bytes, None, &whole);
+            // Opened already, as checking its signature would have.
+            versions.load(turned.len());
+            assert!(versions.peek(turned.len()).is_some());
+            let found =
+                sig_changes::analyse(&mut versions, &sigs, unchecked, &HashSet::new(), None);
+            let refused = found[0].iter().any(|c| c.refused.is_some());
+            assert_eq!(refused, changed, "{:?}", found[0]);
+        }
     }
 
     #[test]

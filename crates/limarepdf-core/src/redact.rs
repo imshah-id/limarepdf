@@ -31,6 +31,7 @@ use crate::annot_ap::{self, Place};
 use crate::annots::with_replies;
 use crate::budget::{self, Work};
 use crate::fonts::FontCtx;
+use crate::forms;
 use crate::matrix::{self as mx, apply, mul, M};
 use crate::objects::{refused, span_boxes, STEPS};
 use crate::reach::{self, Decoded, Reach, Uses};
@@ -1711,7 +1712,8 @@ impl Pdf {
     /// any page, in the alternative text of what the pages draw (`reach`, a walk after the
     /// change), in bookmarks, comments (each named by the first page that lists it), form
     /// fields and the document information. Refused when the comments are too many or too
-    /// long to read ([`crate::TooComplex`]), none read past that.
+    /// long to read, or the form's fields hold more than LimarePDF reads of a form
+    /// ([`crate::TooComplex`]), none read past that.
     fn find_elsewhere(
         &self,
         report: &RedactReport,
@@ -1758,7 +1760,11 @@ impl Pdf {
             other.push((format!("a comment on page {}", a.page + 1), fold(&all)));
         }
         place.whole()?;
-        for f in self.every_form_field() {
+        let (fields, left_out) = self.field_nodes(forms::Reach::Every);
+        if left_out == Some(forms::LeftOut::Large) {
+            return Err(forms::too_large().into());
+        }
+        for (f, _) in fields {
             if let crate::FieldValue::Text(v) = &f.value {
                 other.push((format!("form field \u{201c}{}\u{201d}", f.name), fold(v)));
             }

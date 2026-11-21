@@ -1077,10 +1077,10 @@ impl Pdf {
         }
     }
 
-    /// [`Pdf::text_value`] (or [`Pdf::shown_text_value`] when `shown`), charged to `work` a
-    /// step for each byte before it is read: a stream its own bytes and what each of its
-    /// filters gives, a failure too, decoded only within the steps left and refused past
-    /// them ([`Work::decode`]).
+    /// [`Pdf::text_value`], strings decoded for showing ([`decode_shown_text`]) when `shown`,
+    /// charged to `work` a step for each byte before it is read: a stream its own bytes and
+    /// what each of its filters gives, a failure too, decoded only within the steps left and
+    /// refused past them ([`Work::decode`]).
     pub(crate) fn text_charged(
         &self,
         o: Option<&Object>,

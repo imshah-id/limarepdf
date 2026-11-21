@@ -243,7 +243,8 @@ fn check_rules(rep: &SignatureReport, pdf: &Pdf, req: &SignRequest) -> Result<()
             if rep.signatures.iter().any(|s| s.fields.contains(name)) {
                 bail!("the field \"{name}\" is already signed");
             }
-            let Some(field) = pdf.every_form_field().into_iter().find(|f| &f.name == name) else {
+            let Some((field, _)) = pdf.whole_form()?.into_iter().find(|(f, _)| &f.name == name)
+            else {
                 bail!("the document has no field named \"{name}\"");
             };
             if field.kind != FieldKind::Signature {
@@ -333,7 +334,7 @@ fn place_signature(
     }
     let name = match &req.place {
         SignPlace::Field(n) => n.clone(),
-        SignPlace::NewBox { .. } => free_field_name(pdf),
+        SignPlace::NewBox { .. } => free_field_name(pdf)?,
     };
     // Fields this signature locks, from the field's `/Lock`.
     if let Some(lock) = rep
@@ -373,7 +374,7 @@ fn place_signature(
         );
         // Read-only in every reader, as Acrobat does. Signature fields stay as they are:
         // the lock itself covers signing them.
-        for (field, node) in pdf.form_nodes() {
+        for (field, node) in pdf.whole_form()? {
             if field.name != name
                 && field.kind != FieldKind::Signature
                 && !field.read_only
@@ -424,7 +425,7 @@ fn place_signature(
     match &req.place {
         SignPlace::Field(_) => {
             let (_, node) = pdf
-                .form_nodes()
+                .whole_form()?
                 .into_iter()
                 .find(|(f, _)| f.name == name)
                 .ok_or_else(|| anyhow!("the field \"{name}\" disappeared"))?;
@@ -529,11 +530,11 @@ fn effective_ff(pdf: &Pdf, mut id: ObjectId) -> i64 {
 }
 
 /// "Signature1", "Signature2", ...: the first name no top-level field has.
-fn free_field_name(pdf: &Pdf) -> String {
+fn free_field_name(pdf: &Pdf) -> Result<String> {
     let mut taken: HashSet<String> = pdf
-        .every_form_field()
+        .whole_form()?
         .into_iter()
-        .filter_map(|f| f.name.split('.').next().map(str::to_string))
+        .filter_map(|(f, _)| f.name.split('.').next().map(str::to_string))
         .collect();
     let top = pdf
         .acro_form()
@@ -550,10 +551,10 @@ fn free_field_name(pdf: &Pdf) -> String {
             taken.insert(t);
         }
     }
-    (1..)
+    Ok((1..)
         .map(|i| format!("Signature{i}"))
         .find(|n| !taken.contains(n))
-        .expect("some number is free")
+        .expect("some number is free"))
 }
 
 /// Adds a new top-level field to the form, making the form if there is none.

@@ -42,6 +42,30 @@ fn make_pdf(dir: &Path) -> PathBuf {
          /P 3 0 R >>"
             .into(),
     );
+    write_pdf(dir, &objects)
+}
+
+/// A one-page PDF at `dir/in.pdf` with a form of one field titled with 64 KiB of `a`, and
+/// under it `kids` text fields `k0`, `k1`..., each holding `v`, none with a widget.
+fn make_titled(dir: &Path, kids: usize) -> PathBuf {
+    const FIRST: usize = 5;
+    let ids: Vec<String> = (0..kids).map(|i| format!("{} 0 R", FIRST + i)).collect();
+    let mut objects = vec![
+        "<< /Type /Catalog /Pages 2 0 R /AcroForm << /Fields [4 0 R] >> >>".to_string(),
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".into(),
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 200] >>".into(),
+        format!(
+            "<< /T ({}) /Kids [{}] >>",
+            "a".repeat(65_536),
+            ids.join(" ")
+        ),
+    ];
+    objects.extend((0..kids).map(|i| format!("<< /FT /Tx /T (k{i}) /V (v) /Parent 4 0 R >>")));
+    write_pdf(dir, &objects)
+}
+
+/// `objects`, numbered from 1, the first the catalog, written as `dir/in.pdf`.
+fn write_pdf(dir: &Path, objects: &[String]) -> PathBuf {
     let mut pdf = b"%PDF-1.7\n".to_vec();
     let mut offsets = Vec::new();
     for (i, o) in objects.iter().enumerate() {
@@ -107,4 +131,42 @@ fn fill_sets_a_field_past_those_listed() {
     let last = pdf.every_form_field().pop().unwrap();
     assert_eq!(last.name, "last");
     assert_eq!(last.value, FieldValue::Text("Jane Doe".into()));
+}
+
+/// A form whose 1,100 fields share a 64 KiB title holds more than LimarePDF reads of one
+/// (2²⁶ steps, the bytes of their names among them): `form fill` naming a field past those
+/// read says so, writing nothing. It said there was no such field. Among 1,000, read whole,
+/// a field that isn't there is not there. The name is given in a values file, looked up as
+/// `--set`'s are: Windows takes a command line of 32,767 characters at most.
+#[test]
+fn fill_says_a_field_past_what_is_read_may_be_there() {
+    let title = "a".repeat(65_536);
+    let values = format!("{{\"{title}.k1099\": \"x\"}}");
+    for (kids, says) in [
+        (
+            1_100,
+            "reading the form's fields would take more than 67108864 steps",
+        ),
+        (1_000, "no form field named"),
+    ] {
+        let dir = folder(&format!("past-read-{kids}"));
+        make_titled(&dir, kids);
+        std::fs::write(dir.join("values.json"), &values).unwrap();
+        let res = run(
+            &dir,
+            &[
+                "form",
+                "fill",
+                "in.pdf",
+                "--values",
+                "values.json",
+                "-o",
+                "out.pdf",
+            ],
+        );
+        let err = String::from_utf8_lossy(&res.stderr).replace(&title, "<title>");
+        assert!(!res.status.success(), "{kids}");
+        assert!(err.contains(says), "{kids}: {err}");
+        assert!(!dir.join("out.pdf").exists(), "{kids}");
+    }
 }

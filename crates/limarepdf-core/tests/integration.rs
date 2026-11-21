@@ -243,6 +243,111 @@ fn files_holding_their_encryption_in_the_trailer_open() {
     }
 }
 
+/// A file protected with `cipher` and an empty open password, written with a table.
+fn protected(cipher: Cipher) -> Vec<u8> {
+    let mut p = doc_with_text();
+    p.doc.reference_table.cross_reference_type = lopdf::xref::XrefType::CrossReferenceTable;
+    p.set_encryption(Some(Encryption {
+        user_password: "".into(),
+        owner_password: "owner".into(),
+        cipher,
+        restrictions: Restrictions::default(),
+    }));
+    p.to_bytes().unwrap()
+}
+
+/// The offset the last `startxref` in `bytes` gives.
+fn startxref(bytes: &[u8]) -> usize {
+    let s = bytes.windows(9).rposition(|w| w == b"startxref").unwrap() + 9;
+    let digits = bytes[s..].trim_ascii_start();
+    let n = digits.iter().take_while(|c| c.is_ascii_digit()).count();
+    std::str::from_utf8(&digits[..n]).unwrap().parse().unwrap()
+}
+
+/// `bytes`, a file with one revision and a table, with an update appended: `objects` (whole
+/// `N G obj ... endobj` texts), a table of `rows` (`{i}` standing for the offset of
+/// `objects[i]`), and the file's trailer naming its section with `/Prev`. The new pointer is
+/// `pointer(new section, the file's section)`.
+fn append_update(
+    bytes: &[u8],
+    objects: &[&[u8]],
+    rows: &str,
+    pointer: impl Fn(usize, usize) -> usize,
+) -> Vec<u8> {
+    let prev = startxref(bytes);
+    let t = bytes.windows(7).rposition(|w| w == b"trailer").unwrap() + 7;
+    let trailer = bytes[t..t + find(&bytes[t..], b"startxref").unwrap()].trim_ascii();
+    assert!(trailer.starts_with(b"<<") && find(trailer, b"/Prev").is_none());
+    let mut out = bytes.to_vec();
+    let mut rows = rows.to_string();
+    for (i, o) in objects.iter().enumerate() {
+        out.push(b'\n');
+        rows = rows.replace(&format!("{{{i}}}"), &format!("{:010}", out.len()));
+        out.extend_from_slice(o);
+    }
+    out.push(b'\n');
+    let xref = out.len();
+    out.extend_from_slice(format!("xref\n{rows}trailer\n<< /Prev {prev} ").as_bytes());
+    out.extend_from_slice(&trailer[2..]);
+    out.extend_from_slice(format!("\nstartxref\n{}\n%%EOF\n", pointer(xref, prev)).as_bytes());
+    out
+}
+
+/// LimarePDF reads a copy of a file whose encryption dictionary lopdf can't read as
+/// written. A pointer lopdf takes to an older section near it, and its trailer, must show
+/// there as it does in other files, where other apps read the newer section.
+#[test]
+fn a_moved_pointer_shows_in_a_file_read_through_a_copy() {
+    let rc4 = protected(Cipher::Rc4_128);
+    let aes = protected(Cipher::Aes128);
+    for (case, bytes) in [
+        ("written as is", rc4.clone()),
+        ("a short /U", short_user_hash(rc4)),
+        ("in the trailer", encryption_in_the_trailer(&aes)),
+    ] {
+        // Nor is data after the end hidden.
+        let after = [&bytes[..], b"junk\n"].concat();
+        let p = Pdf::from_bytes(&after, None).unwrap_or_else(|e| panic!("{case}: {e:#}"));
+        assert!(
+            p.differs().is_some(),
+            "{case}: the data after the end wasn't seen"
+        );
+        let rows = "0 1\n0000000000 65535 f\r\n";
+        let moved = append_update(&bytes, &[], rows, |_, first| first - 4);
+        let p = Pdf::from_bytes(&moved, None).unwrap_or_else(|e| panic!("{case}: {e:#}"));
+        assert!(p.repaired(), "{case}: the moved pointer wasn't seen");
+        assert!(p.page_text(0).contains("needle"), "{case}");
+        let kept = append_update(&bytes, &[], rows, |new, _| new);
+        let p = Pdf::from_bytes(&kept, None).unwrap_or_else(|e| panic!("{case}: {e:#}"));
+        assert_eq!(p.differs(), None, "{case}");
+    }
+}
+
+/// An encrypted file listing its encryption dictionary twice in a section: other apps take
+/// the first entry, lopdf the last, and each decrypts the file with what it finds.
+#[test]
+fn an_encryption_dictionary_listed_twice_differs() {
+    let bytes = protected(Cipher::Rc4_128);
+    let filter = find(&bytes, b"/Filter/Standard").unwrap();
+    let obj = bytes[..filter].windows(3).rposition(|w| w == b"obj");
+    let line = bytes[..obj.unwrap()].iter().rposition(|&c| c == b'\n');
+    let at = line.unwrap() + 1;
+    let end = filter + find(&bytes[filter..], b"endobj").unwrap() + 6;
+    let copy = &bytes[at..end];
+    let n = std::str::from_utf8(&copy[..copy.iter().position(|&c| c == b' ').unwrap()]).unwrap();
+    let twice = format!("{n} 1\n{at:010} 00000 n\r\n{n} 1\n{{0}} 00000 n\r\n");
+    let p = Pdf::from_bytes(&append_update(&bytes, &[copy], &twice, |x, _| x), None).unwrap();
+    assert_eq!(
+        p.differs(),
+        Some("they may decrypt it with another encryption dictionary")
+    );
+    // Listed once, in the newer section.
+    let once = format!("{n} 1\n{{0}} 00000 n\r\n");
+    let p = Pdf::from_bytes(&append_update(&bytes, &[copy], &once, |x, _| x), None).unwrap();
+    assert_eq!(p.differs(), None);
+    assert!(p.page_text(0).contains("needle"));
+}
+
 #[test]
 fn files_tell_whether_they_needed_a_password() {
     let protect = |user: &str| {

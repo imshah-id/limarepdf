@@ -587,7 +587,9 @@ Every object that differs is judged by each part it plays in the newer version: 
 field's value or appearance, a signature, the document's structure. A change is allowed only when every one of
 those parts allows it. So an object that is both page content and, say, a comment's appearance can't be changed
 as "just a comment". Pointers from one structure to another (a bookmark to a page, a tag to an annotation) don't
-count as parts. A signature field added with an action on it or on its widget (one run when its page opens, say)
+count as parts. An object the data of what is drawn refers to (marked content's text, which Poppler reads, say) is
+part of that drawing: changing it changes the page's content, or the comment's appearance. A signature field
+added with an action on it or on its widget (one run when its page opens, say)
 is refused for the action, even where adding the field is allowed: the field is listed as added beside the refused
 action. Signing in a field counts as signing only when LimarePDF lists that signature, since nothing else checks it:
 one it doesn't list (in a field nested more than 32 levels deep, say, or on one of a field's widgets rather than the
@@ -605,9 +607,93 @@ LimarePDF reads the later additions with its own strict reader rather than the l
 refuses as malformed:
 
 - a later revision that doesn't lead back to the signed version, or data after the end of the file;
+- a cross-reference section Poppler can't read as written, which makes it scan the whole file for objects and take
+  the last copy of each it finds: one making room for more than 8,388,608 objects (the newest trailer's `/Size`, a
+  cross-reference stream's, or a subsection reaching past that number; Poppler 26 can't make room for more than
+  16,777,216, older versions for more than 33,554,432, and a machine short of memory for fewer); a cross-reference
+  stream's object number, a generation or a compressed object's index above 2,147,483,647, or an offset above
+  9,223,372,036,854,775,807, which Poppler takes as damage; or a cross-reference stream's type wider than 4 bytes. A
+  signed file whose own sections are like this opens as a file other apps may read differently, so its signatures
+  show *can't check*;
+- a cross-reference table subsection of more than one entry that starts at object 1 with a free entry: Poppler (for
+  one at offset 0 with generation 65535) and pdf.js (for any) take it for one that should start at 0, as files from
+  IBM's patent server have it, and read each entry as the object before. A signed file whose own table is like this
+  shows *can't check*. A subsection of that free entry alone deletes object 1 for LimarePDF but not for them, which
+  is refused when object 1 is still used, as for any object deleted but still used;
 - an object whose cross-reference entry points into the signed part, outside its own revision, or at another
   object (the published "shadow" attacks that re-point objects at content hidden in the signed file);
-- an object that can't be read, or that LimarePDF and its PDF library read differently.
+- an object that can't be read, or that LimarePDF and its PDF library read differently;
+- a cross-reference stream, or an object stream holding an object in use, whose data other apps may decode
+  differently: compressed data that is damaged (cut off, or with a wrong header or checksum), which LimarePDF's PDF
+  library decodes as far as it can where some apps fail and may then scan the file for objects no section lists;
+  decoding parameters out of range, written as references, under abbreviated names, or for the rarely used TIFF
+  predictor, which apps read differently;
+  or data in a format other than the usual Flate compression, or marked with an empty list of formats. A signed
+  file whose own streams are like this opens as a file other apps may read differently, so its signatures show
+  *can't check*;
+- an object stream holding an object in use whose objects apps may find in different places: LimarePDF's PDF
+  library reads each at the place the stream's index gives, and some apps read each in a stretch as long as from its
+  place to the next one's, but start every stretch early: by the first object's place or by where the objects begin,
+  whichever is less. Others read the last object on past the end of the stream's data. So anything but white space
+  and comments before an object (from either start); after one, anything but whole objects, `endobj`, white space,
+  comments and a lone sign or point some apps read as 0 (so a `stream` keyword, or a sign ending the data, which
+  some apps read on past and can't read as a number); offsets out of order; an object running past the next one's
+  place or into what follows the data; a comment hiding where the next object starts; a comment ending the data with
+  no line end after it (as after compressed data); a reference written with a sign; a name with a `#` not followed
+  by two hexadecimal digits; a number with a sign inside it (but for minus signs after its point and a digit, which
+  every app skips); an index with other white space than PDF's between its numbers or running into the objects
+  without a space; data other apps may take otherwise, as for any stream (below); or more
+  than a million objects or an object number above 2,147,483,647 (some apps then read none of them) is refused. A
+  stream any entry names as an object stream is checked so, with or without its type;
+- an object in use that other apps may find otherwise, also when it serves only as a stream's length: one listed in
+  the cross-reference information that isn't written as one whole object followed by `endobj` or its stream data
+  (`stream` after a dictionary counts with a line end after it, where all of them read a stream; without one,
+  LimarePDF's PDF library reads the dictionary alone and other apps a stream),
+  or whose header gives another number (a number may run straight into `endobj`, and a dictionary, array, string or
+  name may instead be followed by the next object, the cross-reference information or the end of the file, which
+  every app reads alike); a stream whose data other apps may take otherwise. With a whole-number `/Length`, written
+  there or in an object of its own, followed by `endstream` and `endobj`, other apps take that much, and LimarePDF's
+  PDF library must take the same, give or take white space at its end. With any other `/Length`, or none, other
+  apps look for `endstream` themselves: pdf.js for `endstrea` or `endsteam` anywhere in the data, Poppler for the
+  word, past comments, after the first token where a whole-number `/Length` ends or else where the data starts (when
+  that token is `endstream`, it takes the data as long as `/Length`). So the library's data (as long as a `/Length`
+  written with a decimal point, on to an `endstream` of its own finding, or none without a `/Length`) must be
+  followed by a line end and `endstream`, perhaps with other white space and comments between, must hold neither of
+  pdf.js's words, and must be what Poppler takes, give or take what is between. In an encrypted file, whose
+  decrypted data can't show where white space ends, only data as long as a whole-number `/Length`, then
+  `endstream` a line end at most apart, counts;
+  one in an object stream numbered as the place in the file of an object
+  listed outside it (pdf.js then takes the stream's copy of that object); one in an object stream LimarePDF's PDF
+  library can't open; one in an object stream reached by a reference under a generation other than 0, which
+  other apps follow and LimarePDF's PDF library doesn't; and, in an encrypted file, one holding `endobj` before its
+  end, in a string, a comment or its stream data: LimarePDF's PDF library reads it only as far as that, where other
+  apps read on, past a comment into a reference or a stream, or a stream's data as long as its `/Length`. Some apps
+  read the encryption dictionary, and the objects it names, before they can decrypt, as written in the file: so an
+  object it names that holds text or stream data, which LimarePDF's PDF library decrypts, is refused where it is
+  used, and so is every object in an object stream holding one it names; when the encryption dictionary itself is in
+  an object stream or can't be read as written, the whole revision is;
+- a dictionary giving a key twice, at any depth, with its values written differently: LimarePDF's PDF library and
+  pdf.js take the last value, and so does Poppler below 32 entries, but from 32 Poppler sorts them and may take
+  another, and of a font resources dictionary it takes the first at any size. In an object, the object is refused
+  where it is used, at any size; in cross-reference information, from 32 entries, the whole revision is. In an
+  encrypted file, so is an object giving `/Contents` twice, its values written alike or not: Poppler decrypts the
+  last twice, other apps once at most;
+- a reference, followed from the catalog or the document information, to an object LimarePDF's PDF library doesn't
+  have: when the newest cross-reference section is a table, Poppler can't read it, scans the whole file for objects
+  and from then on reads every object from what it found; when the reference gives another generation than the
+  object's entry, pdf.js reads the whole file again too. Either may then read any object otherwise, so the
+  reference is refused where it is used. A missing or free object reached through a cross-reference stream under
+  its own generation is read as null by every app, and other apps don't follow the trailer's other keys. Poppler
+  follows references in what it draws too (a page's content, an annotation's appearance, a form, a pattern, a Type 3
+  font's glyphs) where its drawing looks in a dictionary, such as an inline image's settings or marked content's:
+  LimarePDF decodes that data as Poppler reads its filters (from `/F` and `/DP` where `/Filter` and `/DecodeParms`
+  are missing, by short names such as `/Fl` too, through references), reads it as Poppler's lexer does and takes
+  every `N G R` it reads, in a dictionary or not, as followed, and as used by the objects an object stream or a
+  deleted entry hides. From an inline image on, Poppler finds where it reads on only as it decodes the image, so
+  there every `N G R` written counts, in strings and the image's data too. Drawn data it can't decode, data whose
+  `/Filter` and `/F`, or `/DecodeParms` and `/DP`, differ (pdf.js reads the other), a drawing larger than 256 MiB,
+  or what is drawn past a gigabyte read or 65,536 references found in all, may refer to anything, so it is refused
+  where it is used.
 
 An object deleted while still in use, and an object the signed version referred to but didn't have, are refused
 too. These are the shapes of the published shadow (hide, replace, hide-and-replace) and incremental-saving attacks.
@@ -678,6 +764,10 @@ The full record, with the files used, is in [Testing](developer/testing.md#digit
   sharing 500 of them of ten objects each is enough there; an object shared by many pages costs each page after the
   first a step for each of its references that page reached already, so a hundred pages sharing resources of 100
   objects that each refer to the same 500 others is enough as well. Ordinary documents come nowhere near these.
+- A form whose fields hold more than LimarePDF reads of a form (their names, values and options taking tens of
+  megabytes, as no real form's do) may have signatures among the fields not read, so its signatures can't be
+  checked ("reading the form's fields would take more than 67108864 steps"), and it can't be signed, or saved
+  without writing the whole file.
 - Files that PDF apps read differently (something uses a part the file deletes or doesn't list, or the file is
   damaged) are shown as the PDF standard says, which other apps may not do. Their signatures show *can't check*
   even where another app calls them valid, and LimarePDF signs such a file only by writing it out in full first, which it

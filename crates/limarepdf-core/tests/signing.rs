@@ -1640,6 +1640,82 @@ fn signed_hidden_content_cant_be_checked_or_added_to() {
     }
 }
 
+/// Puts a field titled with 64 KiB first in `p`'s form, with `kids` text fields sharing the
+/// title: each kid's name holds it, so past 1,024 kids the form holds more than is read of
+/// one (2²⁶ steps), and the fields after are left out.
+fn large_form_first(p: &mut Pdf, kids: usize) {
+    let parent = p.doc.new_object_id();
+    let kids: Vec<Object> = (0..kids)
+        .map(|i| {
+            let t = Object::string_literal(format!("k{i}"));
+            let kid = dictionary! { "FT" => "Tx", "T" => t, "V" => "v", "Parent" => parent };
+            p.doc.add_object(kid).into()
+        })
+        .collect();
+    let title = Object::string_literal("a".repeat(65_536));
+    let field = dictionary! { "T" => title, "Kids" => kids };
+    p.doc.objects.insert(parent, field.into());
+    let form = p.doc.catalog_mut().unwrap().get_mut(b"AcroForm").unwrap();
+    let fields = form.as_dict_mut().unwrap().get_mut(b"Fields").unwrap();
+    fields.as_array_mut().unwrap().insert(0, parent.into());
+}
+
+/// A form holding more than is read of one may list signatures after what is read:
+/// checking its signatures is refused with a typed reason, and so are saving edits on top
+/// and signing, in a field or a new box, and with edits that make the form so. Checking
+/// found no signature in a signed file, saving took the file for unsigned, and signing went
+/// ahead, or failed for a field it took for gone. Read whole, the file checks and signs.
+#[test]
+fn signatures_past_what_is_read_of_a_form_are_refused() {
+    use limarepdf_core::TooComplex;
+    let with_form = |kids| {
+        let mut p = Pdf::from_bytes(&form_doc(&[("s", None)], false), None).unwrap();
+        large_form_first(&mut p, kids);
+        p
+    };
+    let too_complex = |r: limarepdf_core::Result<()>| {
+        let e = r.expect_err("must be refused");
+        let too = (e.downcast_ref::<TooComplex>()).unwrap_or_else(|| panic!("{e:#}"));
+        assert_eq!(
+            (too.what, too.limit),
+            ("reading the form's fields", 1 << 26)
+        );
+    };
+    for (kids, whole) in [(1_000, true), (1_100, false)] {
+        let unsigned = with_form(kids).snapshot().unwrap();
+        let signed = sigkit::sign(
+            &unsigned,
+            &id("rsa3072"),
+            &Field::default(),
+            &Cms::default(),
+        );
+        let checked = verify_signatures(&signed, None, &TrustList::default());
+        let mut p = Pdf::from_bytes(&signed, None).unwrap();
+        note(&mut p);
+        let saved = append_edits(&signed, &p);
+        let in_field = sign_document(&unsigned, None, &req(rsa(), field("s")));
+        let in_box = sign_document(&unsigned, None, &req(rsa(), new_box(1)));
+        if whole {
+            let s = checked.unwrap().signatures;
+            assert_eq!(s.len(), 1);
+            assert_eq!(s[0].status, SigStatus::Valid, "{:?}", s[0].status);
+            saved.unwrap();
+            in_field.unwrap();
+            in_box.unwrap();
+        } else {
+            too_complex(checked.map(drop));
+            too_complex(saved.map(drop));
+            too_complex(in_field.map(drop));
+            too_complex(in_box.map(drop));
+        }
+    }
+    let mut grown = with_form(1_000);
+    let whole = grown.snapshot().unwrap();
+    large_form_first(&mut grown, 100);
+    too_complex(sign_document(&whole, Some(&grown), &req(rsa(), field("s"))).map(drop));
+    too_complex(sign_document(&whole, Some(&grown), &req(rsa(), new_box(1))).map(drop));
+}
+
 // ------------------------------------------------------------------ cross-checks
 
 /// LimarePDF's signatures as poppler's pdfsig and OpenSSL judge them:

@@ -52,8 +52,22 @@ unsaved changes, and Save asks whether to replace the original or save the repai
 Some files open without repair but aren't put together quite as the PDF format asks, so PDF apps can disagree
 about what they hold: a part in use that the cross-reference information deletes or doesn't list, data after the
 end-of-file marker, entries that point at the wrong object (which LimarePDF's PDF library quietly corrects, and
-other apps may correct differently), or cross-reference information that can't be read as written. LimarePDF shows
-such a file as the PDF standard says (the parts it deletes stay deleted). Since a crafted file can use this to show
+other apps may correct differently), cross-reference information that can't be read as written, a
+cross-reference stream or an object stream holding a part in use whose compressed data is damaged, not in the usual
+Flate format (or marked with an empty list of formats), or has decoding parameters apps read differently
+(LimarePDF's PDF library decodes damaged data as far as it can; some apps fail and look for the objects elsewhere),
+an object stream holding a part in use whose objects aren't each exactly where its index says (some apps read
+them at the places in the index, others in stretches of the lengths it gives) or whose data its length doesn't end
+just before `endstream`, a part in use not written as one whole object or holding a dictionary that gives a key
+twice with its values written differently (some apps then take another of its values) or, in an encrypted file,
+`/Contents` twice (one app decrypts it twice), or one other apps reach where LimarePDF's
+PDF library doesn't (a reference under another generation, an object stream numbered as another part's place in
+the file), a reference from the catalog or the document information, or written in what the pages draw, to a part
+LimarePDF's PDF library doesn't have, under another generation than its entry gives or when the newest
+cross-reference section is a table (some apps then read the whole file again and may find any part elsewhere),
+drawing data LimarePDF can't decode or read in full (it may refer to any part), or an encryption dictionary, or a
+part it names, in an object stream (some apps read those before they can decrypt).
+LimarePDF shows such a file as the PDF standard says (the parts it deletes stay deleted). Since a crafted file can use this to show
 one thing in LimarePDF and another elsewhere, the app shows a notice saying other apps may show the file
 differently, with a Save as… button: the saved copy is written the way LimarePDF shows it, without the parts other
 apps may read differently. `limarepdf-cli` prints a note on stderr. Repaired files get the repair notice instead, and signed files

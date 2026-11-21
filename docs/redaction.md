@@ -125,7 +125,9 @@ complex: checking the drawings would take more than 4194304 steps, so nothing wa
 test files takes about 130,000 of those steps. It stops too when the comments are too many or too long to read,
 as it reads every mark's areas and looks for the removed text in every comment ("reading the annotations would
 take more than 16777216 steps"), or too many to look through, page by marked page, for those touching the areas
-("drawing the annotations would take more than 16777216 steps").
+("drawing the annotations would take more than 16777216 steps"), and when the form's fields hold more than it reads
+of a form, as it looks for the removed text in every field ("reading the form's fields would take more than
+67108864 steps"; the most any of the test files' forms takes is 126,118).
 
 ## The check afterwards
 

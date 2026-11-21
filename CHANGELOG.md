@@ -520,6 +520,53 @@
   pages. Before, each found every page by counting through the document's pages again, so the time grew with the
   square of the page count: on 10,000 pages, finding a word to redact (`limarepdf-cli redact --text`) took 14.5
   seconds; now 0.16.
+- Checking a signed document refuses more changes made after signing that other PDF apps read differently from
+  LimarePDF, of the kind the published "shadow" attacks use: they are listed as malformed additions, which no
+  signature allows. Before, a document changed in one of these ways could show another page in other apps while
+  LimarePDF called its signature valid, with only allowed changes or none. In the cross-reference information
+  (where each object is): a cross-reference stream naming another (`/XRefStm`); a mixed (hybrid) section whose
+  table frees an object its stream places, or an object freed that LimarePDF's PDF library still reads in use; an
+  object given two different entries in one section; a stream with rows under 3 bytes wide; a pointer to a section
+  that lands near it rather than on it, which LimarePDF's PDF library moves to a section nearby; a version taking
+  its catalog or encryption from another section, or whose encryption dictionary other apps may read otherwise; a
+  dictionary of 32 entries or more giving a key twice with its values written differently; a cross-reference
+  stream other apps may decode differently (damaged compressed data, unusual decoding parameters, a format other
+  than Flate); a section Poppler can't read as written, which makes it scan the whole file for objects; and a table
+  subsection that starts at object 1 with a free entry, which other apps number from 0. A signed file whose own
+  signed version is written in one of the last three ways shows *can't check*.
+- Checking a signed document also refuses, where it is used, an object added or changed after signing that other
+  PDF apps may read differently from LimarePDF: one not written as one whole object where its cross-reference
+  entry says; a stream whose data other apps may take as longer or shorter, or whose dictionary runs into `stream`
+  without a line end; an object stream whose objects other apps may find in other places, or may decode
+  differently (a signed file whose own object streams may be decoded so shows *can't check*); a dictionary giving
+  a key twice with its values written differently, as Poppler may take another of them, or, in an encrypted file,
+  `/Contents` twice; in an encrypted file, an object holding `endobj` before its end, or one the encryption
+  dictionary names that LimarePDF's PDF library decrypts and other apps read as written; and a reference to an
+  object LimarePDF's PDF library doesn't have, for which other apps read the whole file again, whether followed
+  from the catalog or written in what a page draws. An object that drawn data refers to (the text of marked
+  content, say) is part of the drawing, so changing it changes the page's content. Before, each of these could
+  show other content in another app while LimarePDF called the signature valid.
+- Each signature is checked against every later signed version of the document, also one past the 100 versions
+  LimarePDF opens and one signed by a signature it can't check, and a later version other PDF apps read
+  differently from LimarePDF is refused for every signature before it. A later signature signing a part of the
+  file that isn't one of its versions is refused too. Before, a change other apps show, signed by a second
+  signature LimarePDF couldn't check and then undone, left the first signature valid with only allowed changes.
+- Reading a form's fields has a limit, as reading pages and comments does: a form whose fields hold more (their
+  names, values and options taking tens of megabytes, as no real form's do) is read only that far. Listing shows
+  the fields read. Flatten form, Reset form, removing form values with Remove hidden information, redaction,
+  checking the signatures and signing stop with a message, changing nothing ("reading the form's fields would take
+  more than 67108864 steps"), as does `limarepdf-cli form fill` naming a field past those read; changes to such a
+  signed file are saved only by writing the whole file. Before, reading a form held every field's whole name at
+  once: a form of 1,100 fields under one 64 KiB name took 72 MB, and more fields or longer names took more,
+  without limit.
+- Reset form (and `limarepdf-cli form reset`) refuses a form whose fields are nested more than 32 levels deep,
+  changing nothing, as flattening does. Before, it reset the fields it could follow and said nothing of the deeper
+  ones, which kept their values.
+- A damaged file whose list of pages has branches sharing one list with pages written in it opens with each
+  branch's own pages, as other readers show them, within 64 MiB for those copies; a file needing more isn't
+  opened, and LimarePDF says its list of pages is too complex to rebuild. A damaged form whose fields share one
+  list of fields is read through that list once, a widget several fields list going to the first. Before, both
+  took time and memory growing with the square of the branches or fields sharing the list, without limit.
 
 ### Changed
 

@@ -8,7 +8,7 @@
 mod sigkit;
 
 use limarepdf_core::{
-    verify_signatures, Change, ChangeKind, DigitalSignature, Permissions, Refusal, SigStatus,
+    verify_signatures, Change, ChangeKind, DigitalSignature, Pdf, Permissions, Refusal, SigStatus,
     SignatureReport, TrustList,
 };
 use lopdf::{dictionary, Dictionary, Document, Object, ObjectId, Stream};
@@ -53,6 +53,18 @@ fn edit(b: &[u8], f: impl FnOnce(&Document, &mut Document)) -> Vec<u8> {
     append_update(b, |inc| {
         let prev = inc.get_prev_documents().clone();
         f(&prev, &mut inc.new_document);
+    })
+}
+
+/// Page 1 turned by `rotate` degrees, or not turned, in an appended revision.
+fn turned(b: &[u8], rotate: Option<i64>) -> Vec<u8> {
+    edit(b, |prev, new| {
+        let mut d = dict(prev, page(prev));
+        match rotate {
+            Some(r) => d.set("Rotate", r),
+            None => _ = d.remove(b"Rotate"),
+        }
+        new.set_object(page(prev), d);
     })
 }
 
@@ -357,18 +369,13 @@ fn a_table_after_a_cross_reference_stream_changes_nothing_by_itself() {
 
 /// A revision written by hand: object 1 as `body` in a new object stream, and a
 /// cross-reference stream giving object 0 the entry `zero` (type and fields, `/W [1 4 2]`).
-fn object_one_in_a_stream(b: &[u8], body: &str, zero: (u8, u32, u16)) -> Vec<u8> {
+/// When `named`, that entry is in a second cross-reference stream the first names with
+/// `/XRefStm` instead, and the first lists nothing for object 0.
+fn object_one_in_a_stream(b: &[u8], body: &str, zero: (u8, u32, u16), named: bool) -> Vec<u8> {
     let d = Document::load_mem(b).unwrap();
     let r = root(&d);
-    let tail = String::from_utf8_lossy(&b[b.len() - 40..]).into_owned();
-    let prev = tail
-        .split("startxref")
-        .last()
-        .unwrap()
-        .split_whitespace()
-        .next()
-        .unwrap();
-    let (stm, x) = (d.max_id + 1, d.max_id + 2);
+    let prev = last_startxref(b);
+    let (stm, x, s) = (d.max_id + 1, d.max_id + 2, d.max_id + 3);
     let mut out = [b, b"\n"].concat();
     let at_stm = out.len();
     let data = format!("1 0 {body}");
@@ -380,23 +387,44 @@ fn object_one_in_a_stream(b: &[u8], body: &str, zero: (u8, u32, u16)) -> Vec<u8>
         )
         .as_bytes(),
     );
-    let at_x = out.len();
-    let mut rows = Vec::new();
-    for (kind, f1, f2) in [
-        zero,
-        (2, stm, 0),
-        (1, at_stm as u32, 0),
-        (1, at_x as u32, 0),
-    ] {
-        rows.push(kind);
-        rows.extend_from_slice(&f1.to_be_bytes());
-        rows.extend_from_slice(&f2.to_be_bytes());
+    let rows = |entries: &[(u8, u32, u16)]| {
+        let mut rows = Vec::new();
+        for &(kind, f1, f2) in entries {
+            rows.push(kind);
+            rows.extend_from_slice(&f1.to_be_bytes());
+            rows.extend_from_slice(&f2.to_be_bytes());
+        }
+        rows
+    };
+    let at_s = out.len();
+    if named {
+        let zero = rows(&[zero]);
+        out.extend_from_slice(
+            format!(
+                "{s} 0 obj\n<< /Type /XRef /W [1 4 2] /Index [0 1] /Size {} /Length {} >>\n\
+                 stream\n",
+                s + 1,
+                zero.len()
+            )
+            .as_bytes(),
+        );
+        out.extend_from_slice(&zero);
+        out.extend_from_slice(b"\nendstream\nendobj\n");
     }
+    let at_x = out.len();
+    let mut entries = vec![(2, stm, 0), (1, at_stm as u32, 0), (1, at_x as u32, 0)];
+    let (index, size, more) = if named {
+        entries.push((1, at_s as u32, 0));
+        (format!("1 1 {stm} 3"), s + 1, format!(" /XRefStm {at_s}"))
+    } else {
+        entries.insert(0, zero);
+        (format!("0 2 {stm} 2"), x + 1, String::new())
+    };
+    let rows = rows(&entries);
     out.extend_from_slice(
         format!(
-            "{x} 0 obj\n<< /Type /XRef /W [1 4 2] /Index [0 2 {stm} 2] /Size {} /Root {} {} R \
-             /Prev {prev} /Length {} >>\nstream\n",
-            x + 1,
+            "{x} 0 obj\n<< /Type /XRef /W [1 4 2] /Index [{index}] /Size {size} /Root {} {} R \
+             /Prev {prev}{more} /Length {} >>\nstream\n",
             r.0,
             r.1,
             rows.len()
@@ -408,15 +436,83 @@ fn object_one_in_a_stream(b: &[u8], body: &str, zero: (u8, u32, u16)) -> Vec<u8>
     out
 }
 
-/// An entry in use for object 0, added between two signatures and freed after the second,
-/// is refused. One pointing at the signed bytes of object 1 has lopdf read that old copy
-/// over a new one in an object stream (it keeps the object an entry's bytes name, and
-/// never puts an object-stream member over one it has). The second signature can't be
-/// checked then, so the first was compared with the end alone, where object 0 is only
-/// free, and the page tree turned for the second signer, then turned back, passed as
-/// allowed.
-#[test]
-fn an_entry_in_use_for_object_0_is_refused() {
+/// A hybrid revision written by hand: object 1 as `body` in a new object stream, listed in
+/// a cross-reference stream that a table names with `/XRefStm`. The table lists a new
+/// number N with `table_n`, rows of type and offset (`f` or `n`), and the stream with
+/// `stream_n`, rows of type and fields (`/W [1 4 2]`). Returns the file and N.
+fn hybrid_revision(
+    b: &[u8],
+    body: &str,
+    table_n: &[(char, u32)],
+    stream_n: &[(u8, u32, u16)],
+) -> (Vec<u8>, u32) {
+    let d = Document::load_mem(b).unwrap();
+    let r = root(&d);
+    let prev = last_startxref(b);
+    let (stm, x, n) = (d.max_id + 1, d.max_id + 2, d.max_id + 3);
+    let mut out = [b, b"\n"].concat();
+    let at_stm = out.len();
+    let data = format!("1 0 {body}");
+    out.extend_from_slice(
+        format!(
+            "{stm} 0 obj\n<< /Type /ObjStm /N 1 /First 4 /Length {} >>\nstream\n{data}\n\
+             endstream\nendobj\n",
+            data.len()
+        )
+        .as_bytes(),
+    );
+    let mut entries = vec![(2u8, stm, 0u16)];
+    let mut index = "1 1".to_string();
+    for &e in stream_n {
+        entries.push(e);
+        index.push_str(&format!(" {n} 1"));
+    }
+    let mut rows = Vec::new();
+    for (kind, f1, f2) in entries {
+        rows.push(kind);
+        rows.extend_from_slice(&f1.to_be_bytes());
+        rows.extend_from_slice(&f2.to_be_bytes());
+    }
+    let at_x = out.len();
+    out.extend_from_slice(
+        format!(
+            "{x} 0 obj\n<< /Type /XRef /W [1 4 2] /Index [{index}] /Size {} /Length {} >>\n\
+             stream\n",
+            n + 1,
+            rows.len()
+        )
+        .as_bytes(),
+    );
+    out.extend_from_slice(&rows);
+    out.extend_from_slice(b"\nendstream\nendobj\n");
+    let at_t = out.len();
+    let mut table = format!("xref\n{stm} 2\n{at_stm:010} 00000 n\r\n{at_x:010} 00000 n\r\n");
+    for &(kind, offset) in table_n {
+        table.push_str(&format!("{n} 1\n{offset:010} 00000 {kind}\r\n"));
+    }
+    out.extend_from_slice(
+        format!(
+            "{table}trailer\n<< /Size {} /Root {} {} R /Prev {prev} /XRefStm {at_x} >>\n\
+             startxref\n{at_t}\n%%EOF\n",
+            n + 1,
+            r.0,
+            r.1
+        )
+        .as_bytes(),
+    );
+    (out, n)
+}
+
+/// The `startxref` value of the revision `b` ends with.
+fn last_startxref(b: &[u8]) -> String {
+    let tail = String::from_utf8_lossy(&b[b.len() - 40..]).into_owned();
+    let prev = tail.split("startxref").last().unwrap();
+    prev.split_whitespace().next().unwrap().to_string()
+}
+
+/// A signed file whose cross-reference is a stream, with object 1 (the catalog) written
+/// plainly: the file, where object 1 starts, and its dictionary as written.
+fn object_one_signed() -> (Vec<u8>, u32, String) {
     let mut d = Document::load_mem(&base_pdf()).unwrap();
     d.reference_table.cross_reference_type = lopdf::xref::XrefType::CrossReferenceStream;
     let mut base = Vec::new();
@@ -433,11 +529,26 @@ fn an_entry_in_use_for_object_0_is_refused() {
         .split("endobj")
         .next()
         .unwrap()
-        .trim();
+        .trim()
+        .to_string();
+    (b, offset, old)
+}
+
+/// An entry in use for object 0, added between two signatures and freed after the second,
+/// is refused. One pointing at the signed bytes of object 1 has lopdf read that old copy
+/// over a new one in an object stream (it keeps the object an entry's bytes name, and
+/// never puts an object-stream member over one it has). The second signature can't be
+/// checked then, so the first was compared with the end alone, where object 0 is only
+/// free, and the page tree turned for the second signer, then turned back, passed as
+/// allowed.
+#[test]
+fn an_entry_in_use_for_object_0_is_refused() {
+    let (b, offset, old) = object_one_signed();
+    let max_id = Document::load_mem(&b).unwrap().max_id;
     let turned = format!("{}/Rotate 180>>", old.strip_suffix(">>").unwrap());
     // Object 0 at object 1's signed bytes, or in the new object stream.
-    for zero in [(1, offset, 0), (2, d.max_id + 1, 0)] {
-        let r2 = object_one_in_a_stream(&b, &turned, zero);
+    for zero in [(1, offset, 0), (2, max_id + 1, 0)] {
+        let r2 = object_one_in_a_stream(&b, &turned, zero, false);
         let s2 = countersign(&r2, "Signature2", true);
         let b = append_raw(&s2, &[(1, old.as_bytes())], &[0], &[], "");
         let want = ChangeKind::Malformed("LimarePDF can't read object 0 reliably".into());
@@ -446,6 +557,2331 @@ fn an_entry_in_use_for_object_0_is_refused() {
             got.contains(&(want, Some(Refusal::Never))),
             "{zero:?}: {got:#?}"
         );
+    }
+}
+
+/// A cross-reference stream naming another with `/XRefStm`, after signing, is refused. The
+/// specification gives that key to a table's trailer only, and other apps don't follow it
+/// from a stream, but lopdf does: there an entry in use for object 0, at object 1's signed
+/// bytes, brought back that old copy past the check of
+/// [`an_entry_in_use_for_object_0_is_refused`], and the page tree turned for the second
+/// signer, then turned back, passed as allowed.
+#[test]
+fn a_cross_reference_stream_naming_another_is_refused() {
+    let want = ChangeKind::Malformed(
+        "a later revision's cross-reference stream names another one (/XRefStm), which PDF \
+         apps read differently"
+            .into(),
+    );
+    let (end, _) = turned_for_the_second_signer(|b, turned, offset| {
+        let r2 = object_one_in_a_stream(b, turned, (1, offset, 0), true);
+        // LimarePDF says other apps read the file differently.
+        assert!(Pdf::from_bytes(&r2, None).unwrap().differs().is_some());
+        (r2, 0)
+    });
+    let got = changes(&end);
+    assert!(
+        got.contains(&(want.clone(), Some(Refusal::Never))),
+        "{got:#?}"
+    );
+    // The key alone is refused, whatever the stream it names lists.
+    let (b, _, old) = object_one_signed();
+    let plain = object_one_in_a_stream(&b, &old, (0, 0, 65535), true);
+    assert_eq!(changes(&plain), [(want, Some(Refusal::Never))]);
+}
+
+/// The page tree turned for a second signer by a revision that lopdf reads with object 1's
+/// signed copy, and turned back after: `revision` makes the first from the signed file,
+/// object 1 turned and where its signed copy starts, returning it and the number lopdf
+/// reads at that copy, which the last revision frees. Returns the file and that number.
+fn turned_for_the_second_signer(
+    revision: impl Fn(&[u8], &str, u32) -> (Vec<u8>, u32),
+) -> (Vec<u8>, u32) {
+    let (b, offset, old) = object_one_signed();
+    let turned = format!("{}/Rotate 180>>", old.strip_suffix(">>").unwrap());
+    let (r2, n) = revision(&b, &turned, offset);
+    let lopdf = Document::load_mem(&r2).unwrap();
+    assert!(matches!(
+        lopdf.reference_table.get(n),
+        Some(&lopdf::xref::XrefEntry::Normal { offset: o, .. }) if o == offset
+    ));
+    let s2 = countersign(&r2, "Signature2", true);
+    (append_raw(&s2, &[(1, old.as_bytes())], &[n], &[], ""), n)
+}
+
+/// A hybrid revision whose table frees a number its cross-reference stream places, after
+/// signing, is refused. Apps that read the table first take the number as free, but lopdf
+/// lets the stream's entry replace a free one: placed at object 1's signed bytes, it
+/// brought back that old copy over a new one in an object stream, and the page tree
+/// turned for the second signer, then turned back, passed as allowed.
+#[test]
+fn a_hybrid_table_freeing_what_its_stream_places_is_refused() {
+    let want = |n| {
+        ChangeKind::Malformed(format!(
+            "a later revision lists object {n} as free in its cross-reference table but in \
+             use in its cross-reference stream, which PDF apps read differently"
+        ))
+    };
+    let (end, n) = turned_for_the_second_signer(|b, turned, offset| {
+        hybrid_revision(b, turned, &[('f', 0)], &[(1, offset, 0)])
+    });
+    let got = changes(&end);
+    assert!(got.contains(&(want(n), Some(Refusal::Never))), "{got:#?}");
+    // The two entries alone are refused, with nothing changed.
+    let (b, offset, old) = object_one_signed();
+    let (plain, n) = hybrid_revision(&b, &old, &[('f', 0)], &[(1, offset, 0)]);
+    assert_eq!(changes(&plain), [(want(n), Some(Refusal::Never))]);
+}
+
+/// A revision giving a number two different entries in one cross-reference section, after
+/// signing, is refused. LimarePDF takes the first and lopdf the last: free, then at object
+/// 1's signed bytes, lopdf brought back that old copy over a new one in an object stream,
+/// and the page tree turned for the second signer, then turned back, passed as allowed.
+#[test]
+fn a_number_listed_twice_differently_is_refused() {
+    let want = |n| {
+        ChangeKind::Malformed(format!(
+            "a later revision gives object {n} two different cross-reference entries, which \
+             PDF apps read differently"
+        ))
+    };
+    // Twice in the table, or twice in the cross-reference stream.
+    for in_stream in [false, true] {
+        let revision = |b: &[u8], body: &str, offset| match in_stream {
+            false => hybrid_revision(b, body, &[('f', 0), ('n', offset)], &[]),
+            true => hybrid_revision(b, body, &[], &[(0, 0, 0), (1, offset, 0)]),
+        };
+        let (end, n) = turned_for_the_second_signer(revision);
+        let got = changes(&end);
+        assert!(got.contains(&(want(n), Some(Refusal::Never))), "{got:#?}");
+        // The two entries alone are refused, with nothing changed.
+        let (b, offset, old) = object_one_signed();
+        let (plain, n) = revision(&b, &old, offset);
+        assert_eq!(changes(&plain), [(want(n), Some(Refusal::Never))]);
+    }
+    // The same entry twice reads alike everywhere.
+    let (b, _, old) = object_one_signed();
+    let (twice, _) = hybrid_revision(&b, &old, &[('f', 0), ('f', 0)], &[]);
+    assert_eq!(changes(&twice), []);
+}
+
+/// A later signature whose version other apps may read differently from LimarePDF can't be
+/// checked, but its version is still compared with the ones before and after it, which
+/// refuses the earlier signatures. A new number at object 1's signed bytes had lopdf read
+/// that old copy over a new one in an object stream, and the page tree turned for the second
+/// signer, then turned back, passed as allowed, when the versions either side were compared
+/// as one.
+#[test]
+fn a_later_signed_version_read_differently_is_refused() {
+    let (end, n) = turned_for_the_second_signer(|b, turned, offset| {
+        let r2 = hybrid_revision(b, turned, &[('n', offset)], &[]);
+        assert!(Pdf::from_bytes(&r2.0, None).unwrap().differs().is_some());
+        r2
+    });
+    assert!(matches!(
+        sig(&end, "Signature2").status,
+        SigStatus::CantCheck(why) if why.starts_with("other PDF apps may read the version")
+    ));
+    let want = ChangeKind::Malformed(format!(
+        "object {n} points outside the revision that changes it"
+    ));
+    let got = changes(&end);
+    assert!(got.contains(&(want, Some(Refusal::Never))), "{got:#?}");
+    // A signature after it, over a version read alike everywhere, is unaffected.
+    let s3 = countersign(&end, "Signature3", true);
+    assert_eq!(sig(&s3, "Signature3").status, SigStatus::Valid);
+    assert!(sig(&s3, "Signature3").changes.is_empty());
+}
+
+/// Moves the end of the last signature's range by `by` bytes, keeping its width.
+fn range_end_moved(b: &mut [u8], by: isize) {
+    let key = b"/ByteRange";
+    let at = b.windows(key.len()).rposition(|w| w == key).unwrap();
+    let at = at + b[at..].iter().position(|&c| c == b'[').unwrap() + 1;
+    let close = at + b[at..].iter().position(|&c| c == b']').unwrap();
+    let text = String::from_utf8(b[at..close].to_vec()).unwrap();
+    let d: usize = text.split_whitespace().last().unwrap().parse().unwrap();
+    let i = text.rfind(&d.to_string()).unwrap();
+    let moved = format!(
+        "{}{:<w$}",
+        &text[..i],
+        d.checked_add_signed(by).unwrap(),
+        w = text.len() - i
+    );
+    b[at..close].copy_from_slice(moved.as_bytes());
+}
+
+/// A later signature signing a part of the file that isn't one of its versions refuses the
+/// earlier ones. Its range ending inside its revision's end-of-file marker, just before it,
+/// or after a comment following it, LimarePDF can't check it, but Poppler shows it as valid
+/// when it was signed over that range, and the file cut there shows the page as turned for
+/// the second signer: turned back after, that passed as allowed.
+#[test]
+fn a_later_signed_version_ending_elsewhere_is_refused() {
+    let want = ChangeKind::Malformed(
+        "a later signature signs a part of the file that isn't one of the document's \
+         versions, which PDF apps may show as signed"
+            .into(),
+    );
+    let s2 = countersign(
+        &turned(&approve(&base_pdf()), Some(180)),
+        "Signature2",
+        true,
+    );
+    let eof = s2.windows(5).rposition(|w| w == b"%%EOF").unwrap();
+    let mid = eof as isize + 2 - s2.len() as isize;
+    let before = eof as isize - s2.len() as isize;
+    for (by, comment) in [(mid, ""), (before, ""), (3, "%x\n")] {
+        let mut b = s2.clone();
+        b.extend_from_slice(comment.as_bytes());
+        range_end_moved(&mut b, by);
+        let end = turned(&b, None);
+        assert_eq!(
+            sig(&end, "Signature2").status,
+            SigStatus::Broken(
+                "the signed part doesn't end where a version of the document ends".into()
+            )
+        );
+        let got = changes(&end);
+        assert!(
+            got.contains(&(want.clone(), Some(Refusal::Never))),
+            "{by}: {got:#?}"
+        );
+    }
+}
+
+/// A later signature that can't be checked for another reason refuses nothing earlier: the
+/// version it signed reads alike everywhere, and is compared with the rest.
+#[test]
+fn a_later_signature_broken_otherwise_refuses_nothing() {
+    let mut b = countersign(&approve(&base_pdf()), "Signature2", false);
+    // A digit of Signature2's value, in the gap its range leaves, changed.
+    let key = b"/ByteRange";
+    let at = b.windows(key.len()).rposition(|w| w == key).unwrap();
+    let text = String::from_utf8_lossy(&b[at..at + 80]).into_owned();
+    let range: Vec<usize> = (text.split(['[', ']']).nth(1).unwrap().split_whitespace())
+        .map(|n| n.parse().unwrap())
+        .collect();
+    let at = range[1] + 41;
+    b[at] = if b[at] == b'0' { b'1' } else { b'0' };
+    assert!(!matches!(sig(&b, "Signature2").status, SigStatus::Valid));
+    assert_eq!(
+        changes(&b),
+        [(ChangeKind::Signed("Signature2".into()), None)]
+    );
+}
+
+/// A later signature whose range ends in the white space just after an earlier signer's
+/// version signs that version, and refuses nothing for its signer, as one ending right at it
+/// wouldn't. That white space was taken for a part of the file that isn't a version.
+#[test]
+fn a_later_signed_version_ending_in_white_space_after_one_refuses_nothing() {
+    let mut b = approve(&base_pdf());
+    let end = b.len();
+    b.extend_from_slice(b"\n   \n");
+    let mut b = countersign(&b, "Signature2", true);
+    // Signature2's range, the same width, ending 2 bytes into the white space.
+    let key = b"/ByteRange";
+    let at = b.windows(key.len()).rposition(|w| w == key).unwrap();
+    let at = at + b[at..].iter().position(|&c| c == b'[').unwrap() + 1;
+    let close = at + b[at..].iter().position(|&c| c == b']').unwrap();
+    let range = format!("0 1 2 {:<w$}", end, w = close - at - 6);
+    b[at..close].copy_from_slice(range.as_bytes());
+    assert!(!matches!(sig(&b, "Signature2").status, SigStatus::Valid));
+    assert_eq!(
+        changes(&b),
+        [(ChangeKind::Signed("Signature2".into()), None)]
+    );
+}
+
+/// A later signature past the most signed versions LimarePDF opens can't be checked, but its
+/// version is still compared with the ones before and after it, and as LimarePDF can't read
+/// it, the earlier signatures are refused. 99 signatures with empty values used up the limit
+/// before the second signer's, and the page turned for that signer, then turned back, passed
+/// as allowed.
+#[test]
+fn a_later_signed_version_past_the_limit_is_refused() {
+    let mut b = approve(&base_pdf());
+    for k in 1..100 {
+        let f = Field {
+            name: format!("Filler{k}").leak(),
+            invisible: true,
+            // Each placeholder its own size, as the empty values leave them in place.
+            room: 16 + k,
+            ..Field::default()
+        };
+        b = sign_with(&b, &f, |_| Vec::new());
+    }
+    let s2 = countersign(&turned(&b, Some(180)), "Signature2", true);
+    let end = turned(&s2, None);
+    assert_eq!(
+        sig(&end, "Signature2").status,
+        SigStatus::CantCheck(
+            "the document has more signed versions than LimarePDF checks (at most 100, 1024 MB \
+             together)"
+                .into()
+        )
+    );
+    let want = ChangeKind::Malformed(
+        "the document has more signed versions than LimarePDF checks (at most 100, 1024 MB \
+         together)"
+            .into(),
+    );
+    let got = changes(&end);
+    assert!(got.contains(&(want, Some(Refusal::Never))), "{got:#?}");
+}
+
+/// A later signed version that isn't one of the revisions the file's chain reads is refused.
+/// The last revision lists again what the two after the first signature wrote, the page not
+/// turned, and points back past them to the first signature's: the second signer's version,
+/// with the page turned, was never compared, and the turn passed unseen.
+#[test]
+fn a_later_signed_version_off_the_chain_is_refused() {
+    let b = approve(&base_pdf());
+    let s2 = countersign(&turned(&b, Some(180)), "Signature2", true);
+    let doc = Document::load_mem(&s2).unwrap();
+    let mut out = s2.clone();
+    let mut rows = String::new();
+    for (&n, e) in &doc.reference_table.entries {
+        let &lopdf::xref::XrefEntry::Normal { offset, generation } = e else {
+            continue;
+        };
+        let mut at = offset as usize;
+        if at < b.len() {
+            continue;
+        }
+        if (n, generation) == page(&doc) {
+            let len = s2[at..].windows(6).position(|w| w == b"endobj").unwrap() + 6;
+            let text = String::from_utf8_lossy(&s2[at..at + len]).replace("/Rotate 180", "");
+            at = out.len();
+            out.extend_from_slice(text.as_bytes());
+            out.push(b'\n');
+        }
+        rows += &format!("{n} 1\n{at:010} {generation:05} n \n");
+    }
+    let xref = out.len();
+    let (num, gen) = root(&doc);
+    let tail = format!(
+        "xref\n{rows}trailer\n<< /Size {} /Root {num} {gen} R /Prev {} >>\nstartxref\n{xref}\n\
+         %%EOF\n",
+        doc.max_id + 1,
+        last_startxref(&b)
+    );
+    out.extend_from_slice(tail.as_bytes());
+    let rotate = |b: &[u8]| {
+        let d = Document::load_mem(b).unwrap();
+        dict(&d, page(&d)).get(b"Rotate").ok().cloned()
+    };
+    // Other apps show the page turned where the second signer signed, and not at the end.
+    assert_eq!(rotate(&out[..s2.len()]), Some(Object::Integer(180)));
+    assert_eq!(rotate(&out), None);
+    let want = ChangeKind::Malformed(
+        "a later signature signs a part of the file that isn't one of the document's \
+         versions, which PDF apps may show as signed"
+            .into(),
+    );
+    let got = changes(&out);
+    assert!(got.contains(&(want, Some(Refusal::Never))), "{got:#?}");
+}
+
+/// A cross-reference stream whose rows are under 3 bytes wide, after signing, is refused.
+/// lopdf can't read one unless its data is padded, and drops it from a hybrid revision, where
+/// other apps read it: there object 1 turned for the second signer, which lopdf read as
+/// signed, then turned back. The second signature's version reads differently, which refuses
+/// the first too; this check names the cause.
+#[test]
+fn a_cross_reference_stream_with_narrow_rows_is_refused() {
+    let want = ChangeKind::Malformed(
+        "a later revision's cross-reference stream has entries under 3 bytes wide, which some \
+         PDF apps can't read"
+            .into(),
+    );
+    let (b, offset, old) = object_one_signed();
+    let turned = format!("{}/Rotate 180>>", old.strip_suffix(">>").unwrap());
+    let r2 = object_one_in_rows(&b, &turned, [0, 2], true);
+    let lopdf = Document::load_mem(&r2).unwrap();
+    assert!(matches!(
+        lopdf.reference_table.get(1),
+        Some(&lopdf::xref::XrefEntry::Normal { offset: o, .. }) if o == offset
+    ));
+    assert!(Pdf::from_bytes(&r2, None).unwrap().differs().is_some());
+    let s2 = countersign(&r2, "Signature2", true);
+    let end = append_raw(&s2, &[(1, old.as_bytes())], &[], &[], "");
+    let got = changes(&end);
+    assert!(
+        got.contains(&(want.clone(), Some(Refusal::Never))),
+        "{got:#?}"
+    );
+    // The stream alone is refused, with nothing changed, in a hybrid revision or its own.
+    for hybrid in [true, false] {
+        let plain = object_one_in_rows(&b, &old, [0, 2], hybrid);
+        assert_eq!(changes(&plain), [(want.clone(), Some(Refusal::Never))]);
+        // Rows of 3 bytes read alike everywhere, with the type or without.
+        for w in [[1, 2], [0, 3]] {
+            assert_eq!(changes(&object_one_in_rows(&b, &old, w, hybrid)), []);
+        }
+    }
+}
+
+/// A revision written by hand: object 1 as `body`, listed in a cross-reference stream with
+/// `/W [w[0] w[1] 0]`: type 1 in `w[0]` bytes (none or one) and its offset in `w[1]`. When
+/// `hybrid`, a table lists only that stream and names it with `/XRefStm`.
+fn object_one_in_rows(b: &[u8], body: &str, w: [usize; 2], hybrid: bool) -> Vec<u8> {
+    let rows = |at_1: u32| {
+        assert!(at_1 < 1 << (8 * w[1]));
+        let mut row = vec![1; w[0]];
+        row.extend_from_slice(&at_1.to_be_bytes()[4 - w[1]..]);
+        row
+    };
+    let keys = format!("/W [{} {} 0] /Index [1 1]", w[0], w[1]);
+    object_one_listed(b, body, &[], &keys, |at| rows(at[0]), "", hybrid)
+}
+
+/// A revision written by hand: object 1 as `body`, then `more` (number and text), listed in a
+/// cross-reference stream whose dictionary holds `keys` (`/W`, `/Index` and any other) and
+/// whose data `rows` makes from where object 1 and each of `more` start, `tail` written after
+/// the data, before the line end and `endstream`. When `hybrid`, a table lists only that
+/// stream and names it with `/XRefStm`.
+fn object_one_listed(
+    b: &[u8],
+    body: &str,
+    more: &[(u32, Vec<u8>)],
+    keys: &str,
+    rows: impl FnOnce(&[u32]) -> Vec<u8>,
+    tail: &str,
+    hybrid: bool,
+) -> Vec<u8> {
+    let d = Document::load_mem(b).unwrap();
+    let r = root(&d);
+    let prev = last_startxref(b);
+    let x = more.iter().map(|(n, _)| *n).fold(d.max_id, u32::max) + 1;
+    let mut out = [b, b"\n"].concat();
+    let mut at = vec![u32::try_from(out.len()).unwrap()];
+    out.extend_from_slice(format!("1 0 obj\n{body}\nendobj\n").as_bytes());
+    for (_, text) in more {
+        at.push(u32::try_from(out.len()).unwrap());
+        out.extend_from_slice(text);
+    }
+    let row = rows(&at);
+    let at_x = out.len();
+    let size = format!("/Size {}", x + 1);
+    let links = format!("/Root {} {} R /Prev {prev}", r.0, r.1);
+    let own = if hybrid { "" } else { &links };
+    out.extend_from_slice(
+        format!(
+            "{x} 0 obj\n<< /Type /XRef {keys} {size} {own} /Length {} >>\nstream\n",
+            row.len()
+        )
+        .as_bytes(),
+    );
+    out.extend_from_slice(&row);
+    out.extend_from_slice(format!("{tail}\nendstream\nendobj\n").as_bytes());
+    let at_t = out.len();
+    if hybrid {
+        out.extend_from_slice(
+            format!(
+                "xref\n{x} 1\n{at_x:010} 00000 n\r\ntrailer\n<< {size} {links} /XRefStm \
+                 {at_x} >>\n"
+            )
+            .as_bytes(),
+        );
+    }
+    let start = if hybrid { at_t } else { at_x };
+    out.extend_from_slice(format!("startxref\n{start}\n%%EOF\n").as_bytes());
+    out
+}
+
+/// Cross-reference streams lopdf reads otherwise, and those the specification doesn't allow,
+/// after signing, are refused, with object 1 turned in them or as signed. lopdf drops a hybrid
+/// revision's stream with a comment before `endstream` and reads object 1 as signed; it takes
+/// an object stream index past 65535 modulo 65536 and a 5-byte offset modulo 2^32, so reads
+/// object 1 where the specification leads nowhere. Bytes before `endstream`, a number with an
+/// exponent or `inf` in the dictionary, a type 3 entry, an odd `/Index` and a `/W` of 4 widths
+/// are malformed.
+#[test]
+fn a_cross_reference_stream_lopdf_reads_otherwise_is_refused() {
+    use lopdf::xref::XrefEntry;
+    let (b, offset, old) = object_one_signed();
+    let turned = format!("{}/Rotate 180>>", old.strip_suffix(">>").unwrap());
+    let refused = |why: String| vec![(ChangeKind::Malformed(why), Some(Refusal::Never))];
+    let lopdf_reads = |f: &[u8]| {
+        Document::load_mem(f)
+            .unwrap()
+            .reference_table
+            .get(1)
+            .cloned()
+    };
+    let plain = "/W [1 4 0] /Index [1 1]";
+    for body in [&turned, &old] {
+        let f = object_one_listed(&b, body, &[], plain, |at| row(1, at[0]), "%c", true);
+        assert!(matches!(
+            lopdf_reads(&f),
+            Some(XrefEntry::Normal { offset: o, .. }) if o == offset
+        ));
+        assert_eq!(
+            changes(&f),
+            refused("LimarePDF can't read object 1 reliably".into())
+        );
+        for (keys, tail, kind) in [
+            (plain, " x", 1),
+            ("/W [1 4 0] /Index [1 1] /Foo 1e5", "", 1),
+            ("/W [1 4 0] /Index [1 1] /Foo inf", "", 1),
+            (plain, "", 3),
+            ("/W [1 4 0] /Index [1 1 5]", "", 1),
+            ("/W [1 4 0 0] /Index [1 1]", "", 1),
+        ] {
+            for hybrid in [true, false] {
+                let f = object_one_listed(&b, body, &[], keys, |at| row(kind, at[0]), tail, hybrid);
+                let at = xref_stream_at(&f);
+                let bad = format!("the cross-reference section at byte {at} is malformed");
+                assert_eq!(changes(&f), refused(bad), "{keys} {tail:?} {kind}");
+            }
+        }
+        for hybrid in [true, false] {
+            let in_50 = [(50, object_stream(50, &[(1, 0)], body, ""))];
+            let f = object_one_listed(
+                &b,
+                body,
+                &in_50,
+                "/W [1 4 4] /Index [1 1 50 1]",
+                |at| {
+                    [
+                        row(2, 50),
+                        65536u32.to_be_bytes().into(),
+                        row(1, at[1]),
+                        vec![0; 4],
+                    ]
+                    .concat()
+                },
+                "",
+                hybrid,
+            );
+            assert!(matches!(
+                lopdf_reads(&f),
+                Some(XrefEntry::Compressed {
+                    container: 50,
+                    index: 0
+                })
+            ));
+            assert_eq!(
+                changes(&f),
+                refused("LimarePDF can't read object 1 reliably".into())
+            );
+            let wide = |at: &[u32]| [vec![1], row(1, at[0])].concat();
+            let f = object_one_listed(&b, body, &[], "/W [1 5 0] /Index [1 1]", wide, "", hybrid);
+            let at_1 = b.len() as u32 + 1;
+            assert!(matches!(
+                lopdf_reads(&f),
+                Some(XrefEntry::Normal { offset: o, .. }) if o == at_1
+            ));
+            assert_eq!(
+                changes(&f),
+                refused("object 1 points outside the revision that changes it".into())
+            );
+        }
+    }
+    // The same streams written plainly read alike everywhere.
+    for hybrid in [true, false] {
+        let f = object_one_listed(&b, &old, &[], plain, |at| row(1, at[0]), "", hybrid);
+        assert_eq!(changes(&f), []);
+    }
+}
+
+/// A cross-reference section Poppler can't read as written, after signing, is refused:
+/// Poppler then scans the whole file for objects and takes the last copy of each it finds, so
+/// a stray turned copy of the page after the signed version showed turned in Poppler while
+/// the revision passed as unchanged (review round 4). Poppler can't make room for many more
+/// objects than 2^23 (the newest trailer's or a cross-reference stream's `/Size`, or a
+/// subsection reaching past that), and takes a number past its whole numbers, an offset past
+/// 2^63 - 1 or a type wider than 4 bytes as damage. Those just within the limits pass, as
+/// Poppler reads them as written.
+#[test]
+fn a_cross_reference_section_poppler_cant_read_is_refused() {
+    const ROOM: u32 = 1 << 23;
+    let check = |f: &[u8], at: usize, refused: bool, case: &str| {
+        let why = format!("the cross-reference section at byte {at} is malformed");
+        let want = vec![(ChangeKind::Malformed(why), Some(Refusal::Never))];
+        assert_eq!(changes(f), if refused { want } else { vec![] }, "{case}");
+    };
+    let b = approve(&base_pdf());
+    let d = Document::load_mem(&b).unwrap();
+    let (p, _, turned) = page_texts(&b);
+    let (r, prev, free) = (root(&d), last_startxref(&b), d.max_id + 1);
+    let table = |rows: &str, size: u32| {
+        let stray = format!("% {} 0 obj {turned} endobj\n", p.0);
+        let mut out = [&b[..], b"\n", stray.as_bytes()].concat();
+        let at = out.len();
+        out.extend_from_slice(
+            format!(
+                "xref\n0 1\n0000000000 65535 f\r\n{rows}trailer\n<< /Size {size} /Root {} {} R \
+                 /Prev {prev} >>\nstartxref\n{at}\n%%EOF\n",
+                r.0, r.1
+            )
+            .as_bytes(),
+        );
+        (out, at)
+    };
+    for (rows, size, refused) in [
+        (String::new(), ROOM, false),
+        (String::new(), ROOM + 1, true),
+        (format!("{ROOM} 0\n"), free + 1, false),
+        (format!("{} 0\n", ROOM + 1), free + 1, true),
+        (
+            format!("{free} 1\n0000000000 2147483647 f\r\n"),
+            free + 1,
+            false,
+        ),
+        (
+            format!("{free} 1\n0000000000 2147483648 f\r\n"),
+            free + 1,
+            true,
+        ),
+    ] {
+        let (f, at) = table(&rows, size);
+        check(&f, at, refused, &format!("{rows:?} /Size {size}"));
+    }
+    // An older table's `/Size`, which Poppler doesn't make room for.
+    let (older, at) = table("", ROOM + 1);
+    let newer = format!(
+        "xref\n0 1\n0000000000 65535 f\r\ntrailer\n<< /Size {free} /Root {} {} R /Prev {at} >>\n\
+         startxref\n{}\n%%EOF\n",
+        r.0,
+        r.1,
+        older.len()
+    );
+    let f = [older, newer.into_bytes()].concat();
+    check(&f, 0, false, "an older /Size");
+
+    let (b, _, old) = object_one_signed();
+    fn gen(g: u32) -> Vec<u8> {
+        g.to_be_bytes().into()
+    }
+    fn far(f1: u64) -> Vec<u8> {
+        [vec![0], f1.to_be_bytes().into(), gen(0)].concat()
+    }
+    type Rows = fn(u32) -> Vec<u8>;
+    let rows: [(&str, Rows, bool); 11] = [
+        (
+            "/W [4 4 0] /Index [1 1]",
+            |at| [vec![0; 3], row(1, at)].concat(),
+            false,
+        ),
+        (
+            "/W [5 4 0] /Index [1 1]",
+            |at| [vec![0; 4], row(1, at)].concat(),
+            true,
+        ),
+        (
+            "/W [1 4 0] /Index [1 1 8388607 1]",
+            |at| [row(1, at), row(0, 0)].concat(),
+            false,
+        ),
+        (
+            "/W [1 4 0] /Index [1 1 8388608 1]",
+            |at| [row(1, at), row(0, 0)].concat(),
+            true,
+        ),
+        (
+            "/W [1 4 4] /Index [1 1 1000 1]",
+            |at| [row(1, at), gen(0), row(0, 0), gen(i32::MAX as u32)].concat(),
+            false,
+        ),
+        (
+            "/W [1 4 4] /Index [1 1 1000 1]",
+            |at| [row(1, at), gen(0), row(0, 0), gen(1 << 31)].concat(),
+            true,
+        ),
+        (
+            "/W [1 4 4] /Index [0 1 1 1]",
+            |at| [row(0, 0), gen(u32::MAX), row(1, at), gen(0)].concat(),
+            false,
+        ),
+        (
+            "/W [1 4 4] /Index [1 1 1000 1]",
+            |at| [row(1, at), gen(0), row(0, 0), gen(u32::MAX)].concat(),
+            true,
+        ),
+        (
+            "/W [1 4 4] /Index [0 1 1 1]",
+            |at| [row(0, 0), gen(u32::MAX - 1), row(1, at), gen(0)].concat(),
+            true,
+        ),
+        (
+            "/W [1 8 4] /Index [1 1 1000 1]",
+            |at| {
+                [
+                    vec![1],
+                    u64::from(at).to_be_bytes().into(),
+                    gen(0),
+                    far(i64::MAX as u64),
+                ]
+                .concat()
+            },
+            false,
+        ),
+        (
+            "/W [1 8 4] /Index [1 1 1000 1]",
+            |at| {
+                [
+                    vec![1],
+                    u64::from(at).to_be_bytes().into(),
+                    gen(0),
+                    far(1 << 63),
+                ]
+                .concat()
+            },
+            true,
+        ),
+    ];
+    for (i, (keys, rows, refused)) in rows.into_iter().enumerate() {
+        for hybrid in [true, false] {
+            let f = object_one_listed(&b, &old, &[], keys, |at| rows(at[0]), "", hybrid);
+            check(
+                &f,
+                xref_stream_at(&f),
+                refused,
+                &format!("{i} {keys} {hybrid}"),
+            );
+        }
+    }
+    // The number in a cross-reference stream's header, and its own `/Size`.
+    let keys = "/W [1 4 0] /Index [1 1]";
+    let plain = object_one_listed(&b, &old, &[], keys, |at| row(1, at[0]), "", false);
+    let at = xref_stream_at(&plain);
+    let header = at + plain[at..].iter().position(|&c| c == b' ').unwrap();
+    for (num, refused) in [("2147483647", false), ("2147483648", true)] {
+        let f = [&plain[..at], num.as_bytes(), &plain[header..]].concat();
+        check(&f, at, refused, num);
+    }
+    // Poppler makes room for every cross-reference stream's `/Size`, under a newer table too.
+    let s = at + plain[at..].windows(6).position(|w| w == b"/Size ").unwrap() + 6;
+    let e = s + plain[s..].iter().position(|c| !c.is_ascii_digit()).unwrap();
+    let r = root(&Document::load_mem(&plain).unwrap());
+    for (size, refused) in [
+        (ROOM.to_string(), false),
+        ((ROOM + 1).to_string(), true),
+        ("-1".into(), true),
+    ] {
+        let f = [&plain[..s], size.as_bytes(), &plain[e..]].concat();
+        check(&f, at, refused, &size);
+        let newer = format!(
+            "xref\n0 1\n0000000000 65535 f\r\ntrailer\n<< /Size {} /Root {} {} R /Prev {at} >>\n\
+             startxref\n{}\n%%EOF\n",
+            String::from_utf8_lossy(&plain[s..e]),
+            r.0,
+            r.1,
+            f.len()
+        );
+        let f = [f, newer.into_bytes()].concat();
+        check(&f, at, refused, &format!("{size} under a table"));
+    }
+}
+
+/// A table subsection that starts at object 1 with a free entry, after signing, is refused:
+/// Poppler (for one at offset 0 with generation 65535, when no newer section lists object 1)
+/// and pdf.js (for any) take it for one that should start at 0, as files from IBM's patent
+/// server have it, and read each of its entries as the object before (review round 4). A
+/// revision writing objects 2 to the one after the catalog over unchanged that way had them
+/// find the next object where they looked for the catalog, scan the whole file for objects
+/// and show a turned copy of the page it doesn't list, while the revision passed as
+/// unchanged. A subsection of that one free entry alone, which they read as object 0's,
+/// leaves object 1 to the older sections there, while LimarePDF reads it deleted: judged as
+/// usual, it passes when nothing uses object 1.
+#[test]
+fn a_subsection_other_apps_number_from_0_is_refused() {
+    use lopdf::xref::XrefEntry;
+    // The base document numbered from 2, so that object 1 is free.
+    let mut d = Document::load_mem(&base_pdf()).unwrap();
+    d.renumber_objects_with(2);
+    let mut base = Vec::new();
+    d.save_to(&mut base).unwrap();
+    let b = approve(&base);
+    let d = Document::load_mem(&b).unwrap();
+    assert!(!d.objects.contains_key(&(1, 0)));
+    let (p, _, turned) = page_texts(&b);
+    let (r, prev, last) = (root(&d), last_startxref(&b), root(&d).0 + 1);
+    // Object 1's entry: as given, or in use for a new object 1 when none is given.
+    let free = Some("0000000000 65535 f\r\n");
+    let odd = Some("0000000007 00003 f\r\n");
+    for (head, one, mid, refused) in [
+        (format!("1 {last}\n"), free, "", true),
+        (format!("1 {last}\n"), odd, "", true),
+        (format!("1 {last}\n"), None, "", false),
+        (String::new(), Some(""), "2 _\n", false),
+        ("1 1\n".into(), free, "2 _\n", false),
+    ] {
+        let stray = format!("{} 0 obj {turned} endobj\n", p.0);
+        let mut f = [&b[..], b"\n", stray.as_bytes()].concat();
+        let one = one.map_or_else(
+            || {
+                let row = format!("{:010} 00000 n\r\n", f.len());
+                f.extend_from_slice(b"1 0 obj\nnull\nendobj\n");
+                row
+            },
+            String::from,
+        );
+        let mut rows = String::new();
+        for num in 2..=last {
+            let Some(&XrefEntry::Normal { offset, .. }) = d.reference_table.get(num) else {
+                panic!("object {num} isn't written plainly");
+            };
+            let obj = &b[offset as usize..];
+            let end = obj.windows(6).position(|w| w == b"endobj").unwrap() + 6;
+            rows += &format!("{:010} 00000 n\r\n", f.len());
+            f.extend_from_slice(&obj[..end]);
+            f.push(b'\n');
+        }
+        let at = f.len();
+        let mid = mid.replace('_', &(last - 1).to_string());
+        f.extend_from_slice(
+            format!(
+                "xref\n0 1\n0000000000 65535 f\r\n{head}{one}{mid}{rows}trailer\n<< /Size {} \
+                 /Root {} {} R /Prev {prev} >>\nstartxref\n{at}\n%%EOF\n",
+                d.max_id + 1,
+                r.0,
+                r.1
+            )
+            .as_bytes(),
+        );
+        let why = format!("the cross-reference section at byte {at} is malformed");
+        let want = vec![(ChangeKind::Malformed(why), Some(Refusal::Never))];
+        let case = format!("{head:?} {one:?} {mid:?}");
+        assert_eq!(changes(&f), if refused { want } else { vec![] }, "{case}");
+    }
+}
+
+/// A cross-reference stream row of type `kind` and a 4-byte field `f1`.
+fn row(kind: u8, f1: u32) -> Vec<u8> {
+    [vec![kind], f1.to_be_bytes().into()].concat()
+}
+
+/// Where the last cross-reference stream in `f` starts.
+fn xref_stream_at(f: &[u8]) -> usize {
+    let dict = f.windows(14).rposition(|w| w == b"<< /Type /XRef").unwrap();
+    f[..dict - 1].iter().rposition(|&c| c == b'\n').unwrap() + 1
+}
+
+/// A pointer to a cross-reference section that names the white space before it, after
+/// signing, is refused when lopdf finds another section near it. lopdf takes the nearest
+/// `xref` within 64 bytes of a pointer that doesn't lead straight to a section: a decoy table
+/// there named the signed catalog, or left out the section's entries, so lopdf read the page
+/// as signed while other apps read it turned, and the turn passed as allowed.
+#[test]
+fn a_pointer_lopdf_moves_to_a_section_near_it_is_refused() {
+    let want = |at| {
+        ChangeKind::Malformed(format!(
+            "PDF apps may take different cross-reference sections near byte {at}: the pointer \
+             to it doesn't lead straight to one"
+        ))
+    };
+    let b = approve(&base_pdf());
+    let rotate = |d: &Document| dict(d, page(d)).get(b"Rotate").ok().cloned();
+    for decoy in [Decoy::Stream, Decoy::Table, Decoy::XRefStm, Decoy::Prev] {
+        let (turned, at) = behind_a_decoy(&b, decoy, true, true);
+        // lopdf reads the page as signed.
+        assert_eq!(rotate(&Document::load_mem(&turned).unwrap()), None);
+        let got = changes(&turned);
+        assert!(
+            got.contains(&(want(at), Some(Refusal::Never))),
+            "{decoy:?}: {got:#?}"
+        );
+        assert!(Pdf::from_bytes(&turned, None).unwrap().differs().is_some());
+        // The decoy alone is refused, with nothing changed.
+        let (plain, at) = behind_a_decoy(&b, decoy, false, true);
+        assert_eq!(
+            changes(&plain),
+            [(want(at), Some(Refusal::Never))],
+            "{decoy:?}"
+        );
+        // A `/Prev` must name where its revision's own pointer does, white space or not.
+        if let Decoy::Prev = decoy {
+            continue;
+        }
+        // Without it, lopdf takes the section after the white space too, and reads the turn.
+        let (alone, _) = behind_a_decoy(&b, decoy, true, false);
+        assert_eq!(
+            rotate(&Document::load_mem(&alone).unwrap()),
+            Some(Object::Integer(180))
+        );
+        assert!(Pdf::from_bytes(&alone, None).unwrap().differs().is_none());
+        let got = changes(&alone);
+        assert!(
+            !got.is_empty()
+                && got
+                    .iter()
+                    .all(|(k, _)| !matches!(k, ChangeKind::Malformed(_))),
+            "{decoy:?}: {got:#?}"
+        );
+    }
+}
+
+/// Which pointer names the white space before a revision's cross-reference section, in
+/// [`behind_a_decoy`].
+#[derive(Clone, Copy, Debug)]
+enum Decoy {
+    /// `startxref`, before a cross-reference stream, which the decoy names with `/Prev`.
+    Stream,
+    /// `startxref`, before a table past more white space; the decoy names a cross-reference
+    /// stream listing the same with `/Prev`.
+    Table,
+    /// A hybrid table's `/XRefStm`, before its stream.
+    XRefStm,
+    /// The next revision's `/Prev`, before a cross-reference stream.
+    Prev,
+}
+
+/// A revision written by hand, page 1 turned when `rotate`, whose pointer (by `decoy`) names
+/// the white space just before its section. When `near`, a decoy table (`xref 0 0`) ends at
+/// that white space, which lopdf takes instead. Through `startxref`, the revision adds a new
+/// catalog over a copy of the page, and the decoy's trailer names the signed catalog;
+/// otherwise the page itself changes, and the decoy leads past the section listing it.
+/// Returns the file and where the pointer points.
+fn behind_a_decoy(b: &[u8], decoy: Decoy, rotate: bool, near: bool) -> (Vec<u8>, usize) {
+    let d = Document::load_mem(b).unwrap();
+    let (r, p) = (root(&d), page(&d));
+    let prev = last_startxref(b);
+    let n = d.max_id + 1;
+    let mut page = dict(&d, p);
+    if rotate {
+        page.set("Rotate", 180);
+    }
+    let mut out = [b, b"\n"].concat();
+    let put = |out: &mut Vec<u8>, num: u32, body: &Dictionary| {
+        let at = out.len();
+        out.extend_from_slice(format!("{num} 0 obj\n{body:?}\nendobj\n").as_bytes());
+        at
+    };
+    // A cross-reference stream listing objects at `offsets` (`/W [1 4 2]`).
+    let stream = |out: &mut Vec<u8>, num: u32, index: String, offsets: &[usize], more: String| {
+        let mut rows = Vec::new();
+        for &at in offsets {
+            rows.push(1);
+            rows.extend_from_slice(&u32::try_from(at).unwrap().to_be_bytes());
+            rows.extend_from_slice(&[0, 0]);
+        }
+        out.extend_from_slice(
+            format!(
+                "{num} 0 obj\n<< /Type /XRef /W [1 4 2] /Index [{index}] {more} /Length {} >>\n\
+                 stream\n",
+                rows.len()
+            )
+            .as_bytes(),
+        );
+        out.extend_from_slice(&rows);
+        out.extend_from_slice(b"\nendstream\nendobj\n");
+    };
+    // The decoy, ending where the pointer points.
+    let decoy_then = |out: &mut Vec<u8>, trailer: String| {
+        if near {
+            let text = format!("xref\n0 0\ntrailer<<{trailer}>>\n");
+            assert!(text.len() <= 64, "{text}");
+            out.extend_from_slice(text.as_bytes());
+        }
+        out.len()
+    };
+    let at = match decoy {
+        Decoy::Stream | Decoy::Table => {
+            // A new catalog over a new page tree holding a copy of the page.
+            let (c, q, p2) = (n, n + 1, n + 2);
+            let mut catalog = dict(&d, r);
+            let pages = catalog.get(b"Pages").unwrap().as_reference().unwrap();
+            catalog.set("Pages", (q, 0));
+            let mut tree = dict(&d, pages);
+            tree.set("Kids", vec![Object::Reference((p2, 0))]);
+            page.set("Parent", (q, 0));
+            let offsets = vec![
+                put(&mut out, c, &catalog),
+                put(&mut out, q, &tree),
+                put(&mut out, p2, &page),
+            ];
+            let size = n + 4;
+            let own = format!("/Size {size} /Root {c} 0 R /Prev {prev}");
+            if let Decoy::Stream = decoy {
+                // The stream follows one byte of white space; the decoy's `/Prev` names it.
+                let trailer = |x: usize| format!("/Size {size}/Root {} 0 R/Prev {x:05}", r.0);
+                let len = format!("xref\n0 0\ntrailer<<{}>>\n", trailer(0)).len();
+                let x = out.len() + if near { len } else { 0 } + 1;
+                let at = decoy_then(&mut out, trailer(x));
+                out.push(b'\n');
+                assert_eq!(out.len(), x);
+                let mut offsets = offsets;
+                offsets.push(x);
+                stream(&mut out, n + 3, format!("{c} 4"), &offsets, own);
+                at
+            } else {
+                // The same objects in a stream the decoy names with `/Prev`, then the table
+                // past more white space than lopdf looks through.
+                let s = out.len();
+                stream(
+                    &mut out,
+                    n + 3,
+                    format!("{c} 3"),
+                    &offsets,
+                    format!("/Size {size} /Prev {prev}"),
+                );
+                let at = decoy_then(&mut out, format!("/Size {size}/Root {} 0 R/Prev {s}", r.0));
+                out.extend_from_slice(if near { &[b' '; 70][..] } else { b"\n" });
+                let mut table = format!("xref\n{c} 3\n");
+                for o in &offsets {
+                    table += &format!("{o:010} 00000 n\r\n");
+                }
+                out.extend_from_slice(format!("{table}trailer\n<< {own} >>\n").as_bytes());
+                at
+            }
+        }
+        Decoy::XRefStm => {
+            let at_p = put(&mut out, p.0, &page);
+            let at = decoy_then(&mut out, format!("/Size {}", n + 1));
+            out.push(b'\n');
+            let x = out.len();
+            stream(
+                &mut out,
+                n,
+                format!("{} 1", p.0),
+                &[at_p],
+                format!("/Size {}", n + 1),
+            );
+            let t = out.len();
+            out.extend_from_slice(
+                format!(
+                    "xref\n{n} 1\n{x:010} 00000 n\r\ntrailer\n<< /Size {} /Root {} 0 R /Prev \
+                     {prev} /XRefStm {at} >>\nstartxref\n{t}\n%%EOF\n",
+                    n + 1,
+                    r.0
+                )
+                .as_bytes(),
+            );
+            return (out, at);
+        }
+        Decoy::Prev => {
+            // A revision read alike everywhere, but for the decoy before its section, then
+            // one whose `/Prev` names the white space before that section.
+            let at_p = put(&mut out, p.0, &page);
+            let at = decoy_then(
+                &mut out,
+                format!("/Size {}/Root {} 0 R/Prev {prev}", n + 1, r.0),
+            );
+            out.push(b'\n');
+            let x = out.len();
+            stream(
+                &mut out,
+                n,
+                format!("{} 1 {n} 1", p.0),
+                &[at_p, x],
+                format!("/Size {} /Root {} 0 R /Prev {prev}", n + 1, r.0),
+            );
+            let t = out.len() + 10 + x.to_string().len() + 7;
+            out.extend_from_slice(
+                format!(
+                    "startxref\n{x}\n%%EOF\nxref\n0 0\ntrailer\n<< /Size {} /Root {} 0 R /Prev \
+                     {at} >>\nstartxref\n{t}\n%%EOF\n",
+                    n + 1,
+                    r.0
+                )
+                .as_bytes(),
+            );
+            return (out, at);
+        }
+    };
+    out.extend_from_slice(format!("startxref\n{at}\n%%EOF\n").as_bytes());
+    (out, at)
+}
+
+/// A cross-reference stream or object stream whose data other apps may decode differently
+/// from lopdf is refused, after signing and when opening. lopdf decodes damaged Flate data
+/// as far as it can, where some apps fail and rebuild the cross-reference information by
+/// scanning the file, finding objects no section lists: a page turned after signing and
+/// listed nowhere, behind a stream with its zlib header garbled, passed as unchanged, and
+/// Poppler shows it turned. So did a predictor Poppler drops and lopdf applies, a filter
+/// named only by its abbreviation, which lopdf doesn't read, and an object stream with an
+/// empty list of filters, which lopdf decodes as nothing. Data in other filters, and
+/// predictors the spec doesn't define, are refused too.
+#[test]
+fn a_stream_other_apps_cant_decode_is_refused() {
+    let in_xref = |at| {
+        ChangeKind::Malformed(format!(
+            "the cross-reference stream at byte {at} holds data PDF apps may decode \
+             differently: damaged, or not plain Flate data"
+        ))
+    };
+    let b = approve(&base_pdf());
+    let p = page(&Document::load_mem(&b).unwrap());
+    let in_objstm = ChangeKind::Malformed(format!(
+        "other PDF apps may read the document differently from LimarePDF (LimarePDF can't \
+         read its object {} the way they do)",
+        p.0
+    ));
+    let rotate = |d: &Document| dict(d, page(d)).get(b"Rotate").ok().cloned();
+    for data in [
+        Data::BadHeader,
+        Data::BadChecksum,
+        Data::NoChecksum,
+        Data::CutOff,
+        Data::Hex,
+        Data::NoColors,
+        Data::CutRow,
+        Data::Tiff,
+        Data::OddPredictor,
+        Data::Abbreviated,
+        Data::NoFilters,
+    ] {
+        for route in [Route::Stream, Route::Hybrid, Route::Packed] {
+            let (bad, at) = behind_a_stream(&b, data, route);
+            // lopdf reads the stream, and the page as signed. It reads a cross-reference
+            // stream with no filters as empty, fails on one with a cut row, and rebuilds
+            // the information; it fails on an object stream with a cut row.
+            let unread = matches!(data, Data::NoFilters | Data::CutRow);
+            if !matches!((data, route), (Data::CutRow, Route::Packed)) {
+                let rebuilt = unread && matches!(route, Route::Stream);
+                assert_eq!(
+                    rotate(&Document::load_mem(&bad).unwrap()),
+                    rebuilt.then_some(Object::Integer(180)),
+                    "{data:?}, {route:?}"
+                );
+            }
+            // Such a cross-reference stream lists nothing.
+            let want = match (data, route) {
+                (Data::CutRow, Route::Packed) => {
+                    ChangeKind::Malformed(format!("LimarePDF can't read object {} reliably", p.0))
+                }
+                (_, Route::Packed) => in_objstm.clone(),
+                _ if unread => ChangeKind::Malformed(format!(
+                    "the cross-reference section at byte {at} is malformed"
+                )),
+                _ => in_xref(at),
+            };
+            assert_eq!(
+                changes(&bad),
+                [(want, Some(Refusal::Never))],
+                "{data:?}, {route:?}"
+            );
+            let opened = Pdf::from_bytes(&bad, None).unwrap();
+            assert!(opened.differs().is_some(), "{data:?}, {route:?}");
+        }
+    }
+    // Unfiltered data and whole Flate data read alike everywhere, and no reader sees the
+    // page listed nowhere.
+    for data in [
+        Data::Flate,
+        Data::FlateInArray,
+        Data::FlateThenNewline,
+        Data::Predicted,
+        Data::FilterNull,
+    ] {
+        for route in [Route::Stream, Route::Hybrid, Route::Packed] {
+            let (ok, _) = behind_a_stream(&b, data, route);
+            assert_eq!(changes(&ok), [], "{data:?}, {route:?}");
+            let opened = Pdf::from_bytes(&ok, None).unwrap();
+            assert!(opened.differs().is_none(), "{data:?}, {route:?}");
+        }
+    }
+    // No reader takes anything from an object stream whose objects are listed elsewhere.
+    for data in [
+        Data::Flate,
+        Data::BadHeader,
+        Data::NoColors,
+        Data::Abbreviated,
+    ] {
+        for route in [Route::Unused, Route::UnusedPacked] {
+            let (ok, _) = behind_a_stream(&b, data, route);
+            assert_eq!(changes(&ok), [], "{data:?}, {route:?}");
+            let opened = Pdf::from_bytes(&ok, None).unwrap();
+            assert!(opened.differs().is_none(), "{data:?}, {route:?}");
+        }
+    }
+}
+
+/// How [`behind_a_stream`] writes its stream's data.
+#[derive(Clone, Copy, Debug)]
+enum Data {
+    /// Whole Flate data, `/Filter /FlateDecode`.
+    Flate,
+    /// The same, `/Filter [/FlateDecode]`.
+    FlateInArray,
+    /// Whole Flate data, a line end after it.
+    FlateThenNewline,
+    /// Whole Flate data with the PNG predictor rows of 7 bytes take.
+    Predicted,
+    /// Unfiltered data, `/Filter null`.
+    FilterNull,
+    /// Flate data with its zlib header garbled, which lopdf decodes as raw deflate data.
+    BadHeader,
+    /// Flate data with a wrong checksum.
+    BadChecksum,
+    /// Flate data ending before its checksum.
+    NoChecksum,
+    /// Flate data cut off part way, after everything the stream holds.
+    CutOff,
+    /// Hexadecimal data (`/ASCIIHexDecode`).
+    Hex,
+    /// Flate data with the PNG predictor and `/Colors 0`, which Poppler drops and lopdf
+    /// takes as one color.
+    NoColors,
+    /// The PNG predictor's data, its last row cut short.
+    CutRow,
+    /// Flate data with the TIFF predictor, which Poppler and pdf.js decode differently
+    /// from lopdf at some widths (16 bits, or rows padded out to a byte).
+    Tiff,
+    /// Flate data with predictor 3, which the spec doesn't define: lopdf and Poppler ignore
+    /// it, and pdf.js fails.
+    OddPredictor,
+    /// Unfiltered data with `/F /FlateDecode`, which Poppler takes as `/Filter` and lopdf
+    /// ignores.
+    Abbreviated,
+    /// Unfiltered data with `/Filter []`, which lopdf decodes as nothing and Poppler as
+    /// unfiltered.
+    NoFilters,
+}
+
+impl Data {
+    /// The stream dictionary's filter entries and its data, holding `plain`.
+    fn write(self, plain: &[u8]) -> (&'static str, Vec<u8>) {
+        use std::io::Write;
+        match self {
+            Data::Hex => {
+                let hex: String = plain.iter().map(|b| format!("{b:02x}")).collect();
+                return ("/Filter /ASCIIHexDecode", format!("{hex}>").into_bytes());
+            }
+            Data::FilterNull => return ("/Filter null", plain.to_vec()),
+            Data::Abbreviated => return ("/F /FlateDecode", plain.to_vec()),
+            Data::NoFilters => return ("/Filter []", plain.to_vec()),
+            _ => {}
+        }
+        let (plain, level) = match self {
+            // Stored and padded, so what is left after a cut still holds all of `plain`.
+            Data::CutOff => ([plain, &[b' '; 64]].concat(), flate2::Compression::none()),
+            // Rows of 7 bytes padded out with spaces, each byte the difference from the one
+            // before it.
+            Data::Tiff => {
+                let mut d = plain.to_vec();
+                d.resize(plain.len().div_ceil(7) * 7, b' ');
+                for row in d.chunks_mut(7) {
+                    for i in (1..row.len()).rev() {
+                        row[i] = row[i].wrapping_sub(row[i - 1]);
+                    }
+                }
+                (d, flate2::Compression::default())
+            }
+            // Rows of 7 bytes padded out with spaces, each the differences from the row
+            // above it (PNG's Up).
+            Data::Predicted | Data::NoColors | Data::CutRow => {
+                let mut padded = plain.to_vec();
+                padded.resize(plain.len().div_ceil(7) * 7, b' ');
+                let mut above = [0; 7];
+                let mut d = Vec::new();
+                for row in padded.chunks(7) {
+                    d.push(2);
+                    d.extend(row.iter().zip(above).map(|(b, a)| b.wrapping_sub(a)));
+                    above.copy_from_slice(row);
+                }
+                if let Data::CutRow = self {
+                    d.truncate(d.len() - 3);
+                }
+                (d, flate2::Compression::default())
+            }
+            _ => (plain.to_vec(), flate2::Compression::default()),
+        };
+        let mut z = flate2::write::ZlibEncoder::new(Vec::new(), level);
+        z.write_all(&plain).unwrap();
+        let mut z = z.finish().unwrap();
+        match self {
+            Data::BadHeader => z[..2].copy_from_slice(&[0, 0]),
+            Data::BadChecksum => *z.last_mut().unwrap() ^= 1,
+            Data::NoChecksum => z.truncate(z.len() - 4),
+            Data::CutOff => z.truncate(z.len() - 4 - 32),
+            Data::FlateThenNewline => z.extend_from_slice(b"\r\n"),
+            _ => {}
+        }
+        let filter = match self {
+            Data::FlateInArray => "/Filter [/FlateDecode]",
+            Data::Predicted | Data::CutRow => {
+                "/Filter /FlateDecode /DecodeParms << /Predictor 12 /Columns 7 >>"
+            }
+            Data::NoColors => {
+                "/Filter /FlateDecode /DecodeParms << /Predictor 12 /Colors 0 /Columns 7 >>"
+            }
+            Data::Tiff => "/Filter /FlateDecode /DecodeParms << /Predictor 2 /Columns 7 >>",
+            Data::OddPredictor => "/Filter /FlateDecode /DecodeParms << /Predictor 3 /Columns 7 >>",
+            _ => "/Filter /FlateDecode",
+        };
+        (filter, z)
+    }
+}
+
+/// Where [`behind_a_stream`] writes its data.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Route {
+    /// In the revision's cross-reference stream.
+    Stream,
+    /// In the cross-reference stream a revision's table names with `/XRefStm`.
+    Hybrid,
+    /// In an object stream holding the page as signed.
+    Packed,
+    /// In an object stream holding the page as signed, which is listed as a plain object.
+    Unused,
+    /// In an object stream holding the page as signed, which is listed in another object
+    /// stream.
+    UnusedPacked,
+}
+
+/// A revision written by hand: page 1 turned and listed nowhere, which a reader rebuilding
+/// the cross-reference information by scanning finds, then a cross-reference stream listing
+/// only itself, its data written as `data`. In a hybrid revision, a table listing the
+/// stream too names it. When packed, the page as signed is in an object stream written as
+/// `data` before the turned copy, and the cross-reference stream, written plainly, lists it
+/// there. When unused, nothing is turned, and the page as signed is listed elsewhere: written
+/// plainly before the object stream holding it, or in an unfiltered object stream after it.
+/// Returns the file and where the cross-reference stream starts.
+fn behind_a_stream(b: &[u8], data: Data, route: Route) -> (Vec<u8>, usize) {
+    let d = Document::load_mem(b).unwrap();
+    let (r, p) = (root(&d), page(&d));
+    let prev = last_startxref(b);
+    let n = d.max_id + 1;
+    let page = dict(&d, p);
+    let mut turned = page.clone();
+    turned.set("Rotate", 180);
+    let mut out = [b, b"\n"].concat();
+    // Rows of type and offset or container (`/W [1 4 2]`, the index 0).
+    let row = |kind: u8, f1: usize| {
+        let mut r = vec![kind];
+        r.extend_from_slice(&u32::try_from(f1).unwrap().to_be_bytes());
+        r.extend_from_slice(&[0, 0]);
+        r
+    };
+    let mut rows = Vec::new();
+    let packed = matches!(route, Route::Packed | Route::Unused | Route::UnusedPacked);
+    let (x, index) = if packed {
+        match route {
+            Route::Unused => {
+                rows.extend(row(1, out.len()));
+                out.extend_from_slice(format!("{} 0 obj\n{page:?}\nendobj\n", p.0).as_bytes());
+            }
+            Route::UnusedPacked => rows.extend(row(2, (n + 1).try_into().unwrap())),
+            _ => rows.extend(row(2, n.try_into().unwrap())),
+        }
+        let at = out.len();
+        let head = format!("{} 0 ", p.0);
+        let body = format!("{head}{page:?}");
+        let (filter, z) = data.write(body.as_bytes());
+        out.extend_from_slice(
+            format!(
+                "{n} 0 obj\n<< /Type /ObjStm /N 1 /First {} {filter} /Length {} >>\n\
+                 stream\n",
+                head.len(),
+                z.len()
+            )
+            .as_bytes(),
+        );
+        out.extend_from_slice(&z);
+        out.extend_from_slice(b"\nendstream\nendobj\n");
+        rows.extend(row(1, at));
+        if route == Route::UnusedPacked {
+            rows.extend(row(1, out.len()));
+            out.extend_from_slice(
+                format!(
+                    "{} 0 obj\n<< /Type /ObjStm /N 1 /First {} /Length {} >>\n\
+                     stream\n{body}\nendstream\nendobj\n",
+                    n + 1,
+                    head.len(),
+                    body.len()
+                )
+                .as_bytes(),
+            );
+            (n + 2, format!("{} 1 {n} 3", p.0))
+        } else {
+            (n + 1, format!("{} 1 {n} 2", p.0))
+        }
+    } else {
+        (n, format!("{n} 1"))
+    };
+    if !matches!(route, Route::Unused | Route::UnusedPacked) {
+        out.extend_from_slice(format!("{} 0 obj\n{turned:?}\nendobj\n", p.0).as_bytes());
+    }
+    let at = out.len();
+    rows.extend(row(1, at));
+    let (filter, rows) = if packed {
+        (String::new(), rows)
+    } else {
+        let (filter, z) = data.write(&rows);
+        (format!(" {filter}"), z)
+    };
+    let size = format!("/Size {}", x + 1);
+    let trailer = format!("{size} /Root {} {} R /Prev {prev}", r.0, r.1);
+    let own = if route == Route::Hybrid {
+        &size
+    } else {
+        &trailer
+    };
+    out.extend_from_slice(
+        format!(
+            "{x} 0 obj\n<< /Type /XRef /W [1 4 2] /Index [{index}] {own}{filter} /Length {} \
+             >>\nstream\n",
+            rows.len()
+        )
+        .as_bytes(),
+    );
+    out.extend_from_slice(&rows);
+    out.extend_from_slice(b"\nendstream\nendobj\n");
+    let mut start = at;
+    if route == Route::Hybrid {
+        start = out.len();
+        out.extend_from_slice(
+            format!("xref\n{x} 1\n{at:010} 00000 n\r\ntrailer\n<< {trailer} /XRefStm {at} >>\n")
+                .as_bytes(),
+        );
+    }
+    out.extend_from_slice(format!("startxref\n{start}\n%%EOF\n").as_bytes());
+    (out, at)
+}
+
+/// lopdf makes a stream of a dictionary followed by `stream` only with a line end after the
+/// keyword, spaces and tabs aside; Poppler and pdf.js make one regardless, and finding no
+/// data where they look, read the file again from its objects, taking any written in the
+/// "data". The page written again as it was after signing, then `stream` and a comment, a
+/// form feed or a letter, passed as unchanged, and they showed another page planted there.
+/// Written again with `endobj`, it changes nothing.
+#[test]
+fn a_dictionary_followed_by_stream_without_a_line_end_is_refused() {
+    let b = approve(&base_pdf());
+    let doc = Document::load_mem(&b).unwrap();
+    let (p, r) = (page(&doc), root(&doc));
+    let want = ChangeKind::Malformed(format!(
+        "other PDF apps may read the document differently from LimarePDF (LimarePDF can't \
+         read its object {} the way they do)",
+        p.0
+    ));
+    let rewritten = |after: &str| {
+        let mut out = b.clone();
+        out.push(b'\n');
+        let at = out.len();
+        let page = dict(&doc, p);
+        out.extend_from_slice(format!("{} {} obj\n{page:?}\n{after}\n", p.0, p.1).as_bytes());
+        let xref = out.len();
+        out.extend_from_slice(
+            format!(
+                "xref\n{} 1\n{at:010} {:05} n \ntrailer\n<< /Size {} /Root {} {} R /Prev {} \
+                 >>\nstartxref\n{xref}\n%%EOF\n",
+                p.0,
+                p.1,
+                doc.max_id + 1,
+                r.0,
+                r.1,
+                last_startxref(&b)
+            )
+            .as_bytes(),
+        );
+        out
+    };
+    for keyword in ["stream %", "stream\x0c", "stream x"] {
+        assert_refused(&rewritten(&format!("{keyword}\nendstream\nendobj")), &want);
+    }
+    assert_eq!(changes(&rewritten("endobj")), vec![]);
+}
+
+/// Checking that other apps read each object as LimarePDF does reads no further than lopdf
+/// reads: not on into a string after an object, a number or where an entry points, which
+/// lopdf reads no further than its first byte, and which, never ended, runs on through the
+/// rest of the file. 20,000 objects so followed took 15 s to open, 300 times as long as with
+/// a letter in place of the string's first byte, and a minute at twice as many; the
+/// signature read as valid.
+#[test]
+fn objects_followed_by_strings_are_read_as_fast_as_others() {
+    const N: u32 = 20_000;
+    let b = approve(&base_pdf());
+    let first = Document::load_mem(&b).unwrap().max_id + 1;
+    // `#` an object's number, `&` its partner's, `@` the string's first byte.
+    let opened = |main: &str, partner: &str, opening: &str| {
+        let text = |t: &str, n: u32| {
+            t.replace('#', &n.to_string())
+                .replace('&', &(n + N).to_string())
+                .replace('@', opening)
+                .into_bytes()
+        };
+        let mut objects: Vec<(u32, Vec<u8>)> =
+            (first..first + N).map(|n| (n, text(main, n))).collect();
+        if !partner.is_empty() {
+            objects.extend((first..first + N).map(|n| (n + N, text(partner, n))));
+        }
+        let f = by_hand(&b, &objects, &[]);
+        let start = std::time::Instant::now();
+        let got = changes(&f);
+        (start.elapsed(), got)
+    };
+    let mut slow = Vec::new();
+    for (main, partner, opening) in [
+        // After a number, looking for `N G R`, and after the object.
+        ("# 0 obj\n5 @\n", "", "<"),
+        ("# 0 obj\n5 @\n", "", "("),
+        // After a dictionary, and after a number or two there, perhaps a header's.
+        ("# 0 obj\n<< /A 5 >> @\n", "", "("),
+        ("# 0 obj\n<< /A 5 >> 7 @\n", "", "("),
+        ("# 0 obj\n<< /A 5 >> 7 0 @\n", "", "("),
+        // In a header.
+        ("# @\n", "", "("),
+        // An object lopdf took from another entry.
+        ("& 0 obj\n5 endobj\n", "& 0 obj\n@\n", "<"),
+        // After an object stream's data, and after the object giving its length.
+        (
+            "# 0 obj\n<< /Type /ObjStm /N 0 /First 0 /Length 0 >>\nstream\n@\nendstream\nendobj\n",
+            "",
+            "(",
+        ),
+        (
+            "# 0 obj\n<< /Type /ObjStm /N 0 /First 0 /Length & 0 R >>\nstream\n\nendstream\n\
+             endobj\n",
+            "& 0 obj\n0 @\n",
+            "(",
+        ),
+    ] {
+        let (took, got) = opened(main, partner, opening);
+        let (twin, want) = opened(main, partner, "x");
+        if took > twin * 20 {
+            slow.push(format!(
+                "{main:?} {partner:?} {opening}: {took:?}, {twin:?} with x"
+            ));
+        }
+        assert_eq!(got, want, "{main:?} {partner:?} {opening}");
+    }
+    assert!(slow.is_empty(), "{slow:#?}");
+}
+
+/// lopdf and pdf.js read each object in an object stream at its offset, and Poppler in
+/// windows as long as from one offset to the next, the first starting at `/First`. A page
+/// turned after signing, written before the page as signed, passed as unchanged, and Poppler
+/// showed it turned; so it did with a comment before the first object and the turned page
+/// where that shifts Poppler's window for the page. Offsets out of order, an object running
+/// past the next offset, `stream` after an object, and an object Poppler's window finds
+/// inside a comment are refused too; white space, comments, `endobj` and a stray object
+/// elsewhere are not. pdf.js reads on past the content, failing on a sign at its end, plain
+/// or packed, on `-.` after packed data, where it reads zeros, and taking the last object
+/// glued to `endstream` as a command. Data `/Length` frames short of a comment, plain or
+/// packed, is refused too: other apps take the data as long as `/Length`, and lopdf on to
+/// `endstream`.
+#[test]
+fn an_object_stream_other_apps_lay_out_differently_is_refused() {
+    let b = approve(&base_pdf());
+    let p = page(&Document::load_mem(&b).unwrap());
+    let want = ChangeKind::Malformed(format!(
+        "other PDF apps may read the document differently from LimarePDF (LimarePDF can't \
+         read its object {} the way they do)",
+        p.0
+    ));
+    for layout in [
+        Layout::Gap,
+        Layout::Shifted,
+        Layout::Unordered,
+        Layout::Overlong,
+        Layout::Stream,
+        Layout::InComment,
+        Layout::SignAtEnd,
+        Layout::PackedSignAtEnd,
+        Layout::PackedPointAtEnd,
+        Layout::Glued,
+        Layout::Short,
+        Layout::PackedCommented,
+    ] {
+        let bad = laid_out(&b, layout);
+        // lopdf reads the page as signed.
+        let d = Document::load_mem(&bad).unwrap();
+        assert_eq!(dict(&d, p).get(b"Rotate").ok(), None, "{layout:?}");
+        assert_eq!(
+            changes(&bad),
+            [(want.clone(), Some(Refusal::Never))],
+            "{layout:?}"
+        );
+        let opened = Pdf::from_bytes(&bad, None).unwrap();
+        assert!(opened.differs().is_some(), "{layout:?}");
+    }
+    for layout in [
+        Layout::Plain,
+        Layout::Spaced,
+        Layout::EndObj,
+        Layout::Stray,
+        Layout::Packed,
+        Layout::PointAtEnd,
+        Layout::MinusInside,
+        Layout::GluedNumber,
+    ] {
+        let ok = laid_out(&b, layout);
+        assert_eq!(changes(&ok), [], "{layout:?}");
+        let opened = Pdf::from_bytes(&ok, None).unwrap();
+        assert!(opened.differs().is_none(), "{layout:?}");
+    }
+}
+
+/// How [`laid_out`] lays out its object stream.
+#[derive(Clone, Copy, Debug)]
+enum Layout {
+    /// The page, then `null`, each at its offset, one space between them.
+    Plain,
+    /// The same with comments and white space before the page and between the two, and a
+    /// reference in place of `null`.
+    Spaced,
+    /// `endobj` between the page and the other object.
+    EndObj,
+    /// A string between the page and the other object.
+    Stray,
+    /// The page turned in a gap before the page's offset, the page as signed at it.
+    Gap,
+    /// A comment as long as the page turned, then the other object, the page turned, and
+    /// the page as signed at its offset, the comment's length past the turned one.
+    Shifted,
+    /// The page turned, as the other object, then the page as signed: the page's offset
+    /// above the other's.
+    Unordered,
+    /// The other object's offset inside the page.
+    Overlong,
+    /// Stream data after the page, which pdf.js reads as the page's.
+    Stream,
+    /// A 4-byte comment, then the other object and a comment ending 4 bytes before the
+    /// page.
+    InComment,
+    /// As [`Layout::Plain`], Flate data.
+    Packed,
+    /// As [`Layout::Plain`], then `-.`, which pdf.js reads as 0 before the line end.
+    PointAtEnd,
+    /// As [`Layout::Plain`], then `-`, which pdf.js reads on to `endstream` and fails.
+    SignAtEnd,
+    /// The same, Flate data, after which pdf.js reads a zero and fails.
+    PackedSignAtEnd,
+    /// As [`Layout::PointAtEnd`], Flate data, after which pdf.js reads a zero and fails.
+    PackedPointAtEnd,
+    /// As [`Layout::Plain`], `endstream` right after it.
+    Glued,
+    /// The page, then `23`, `endstream` right after it, which every reader ends the number at.
+    GluedNumber,
+    /// As [`Layout::Plain`], the other object a real with a minus after its point, which
+    /// every reader skips.
+    MinusInside,
+    /// As [`Layout::Plain`], then a comment `/Length` leaves out. Other apps take the data to
+    /// `/Length`, skipping the comment before `endstream`; lopdf looks for `endstream`.
+    Short,
+    /// As [`Layout::Packed`], a comment after the data `/Length` frames.
+    PackedCommented,
+}
+
+/// A revision written by hand: the page as signed and another object, unused, in an
+/// unfiltered object stream laid out as `layout`, listed by a cross-reference stream. The
+/// index is padded to past the first offset, which Poppler then reads from `/First`.
+fn laid_out(b: &[u8], layout: Layout) -> Vec<u8> {
+    let d = Document::load_mem(b).unwrap();
+    let (r, p) = (root(&d), page(&d));
+    let prev = last_startxref(b);
+    let n = d.max_id + 1;
+    let (q, x) = (n + 1, n + 2);
+    let page = dict(&d, p);
+    let mut turned = page.clone();
+    turned.set("Rotate", 180);
+    let (signed, turned) = (format!("{page:?}"), format!("{turned:?}"));
+    // The objects' data and the page's and the other's offsets.
+    let (body, at_p, at_q) = match layout {
+        Layout::Plain | Layout::Packed | Layout::Glued | Layout::PackedCommented => {
+            (format!("{signed} null"), 0, signed.len() + 1)
+        }
+        Layout::GluedNumber => (format!("{signed} 23"), 0, signed.len() + 1),
+        Layout::MinusInside => (format!("{signed} 0.00-4142502"), 0, signed.len() + 1),
+        Layout::Short => (format!("{signed} null %cut"), 0, signed.len() + 1),
+        Layout::PointAtEnd | Layout::PackedPointAtEnd => {
+            (format!("{signed} null -."), 0, signed.len() + 1)
+        }
+        Layout::SignAtEnd | Layout::PackedSignAtEnd => {
+            (format!("{signed} null\n-"), 0, signed.len() + 1)
+        }
+        Layout::Spaced => {
+            let head = "% packed\n\n";
+            let body = format!("{head}{signed}\n% next\n  1 0 R");
+            (body, head.len(), head.len() + signed.len() + 10)
+        }
+        Layout::EndObj => (format!("{signed}\nendobj\nnull"), 0, signed.len() + 8),
+        Layout::Gap => {
+            let at = turned.len() + 1;
+            (
+                format!("{turned}\n{signed} null"),
+                at,
+                at + signed.len() + 1,
+            )
+        }
+        Layout::Shifted => {
+            let k = turned.len() + 2;
+            let body = format!("%{}\nnull {turned}\n\n{signed}", "-".repeat(k - 2));
+            (body, 2 * k + 5, k)
+        }
+        Layout::Unordered => (format!("{turned}\n{signed}"), turned.len() + 1, 0),
+        Layout::Overlong => (format!("{signed} null"), 0, signed.find('/').unwrap()),
+        Layout::Stray => (format!("{signed} (stray) null"), 0, signed.len() + 9),
+        Layout::Stream => {
+            let body = format!("{signed}stream\nxx\nendstream\nnull");
+            (body, 0, signed.len() + 20)
+        }
+        Layout::InComment => (format!("% a\nnull\n%b\n  {signed}"), 14, 4),
+    };
+    // The page is listed first unless the other object is first in the stream.
+    let q_first = matches!(layout, Layout::Shifted | Layout::InComment);
+    let pairs = if q_first {
+        format!("{q} {at_q} {} {at_p}", p.0)
+    } else {
+        format!("{} {at_p} {q} {at_q}", p.0)
+    };
+    let index = format!("{pairs:<0$}\n", turned.len() + 2);
+    let mut out = [b, b"\n"].concat();
+    let at_c = out.len();
+    let mut data = format!("{index}{body}").into_bytes();
+    let mut filter = "";
+    if matches!(
+        layout,
+        Layout::Packed
+            | Layout::PackedSignAtEnd
+            | Layout::PackedPointAtEnd
+            | Layout::PackedCommented
+    ) {
+        use std::io::Write;
+        let mut z = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        z.write_all(&data).unwrap();
+        data = z.finish().unwrap();
+        filter = " /Filter /FlateDecode";
+    }
+    out.extend_from_slice(
+        format!(
+            "{n} 0 obj\n<< /Type /ObjStm /N 2 /First {} /Length {}{filter} >>\nstream\n",
+            index.len(),
+            data.len()
+                - if matches!(layout, Layout::Short) {
+                    4
+                } else {
+                    0
+                }
+        )
+        .as_bytes(),
+    );
+    out.extend_from_slice(&data);
+    let eol = match layout {
+        Layout::Glued | Layout::GluedNumber => "",
+        Layout::PackedCommented => "%x\n",
+        _ => "\n",
+    };
+    out.extend_from_slice(format!("{eol}endstream\nendobj\n").as_bytes());
+    let at = out.len();
+    // Rows of type, offset or container, and index (`/W [1 4 2]`): the page, the object
+    // stream, the other object, the cross-reference stream.
+    let row = |kind: u8, f1: usize, f2: u16| {
+        let mut r = vec![kind];
+        r.extend_from_slice(&u32::try_from(f1).unwrap().to_be_bytes());
+        r.extend_from_slice(&f2.to_be_bytes());
+        r
+    };
+    let n_at = usize::try_from(n).unwrap();
+    let (i_p, i_q) = if q_first { (1, 0) } else { (0, 1) };
+    let rows = [
+        row(2, n_at, i_p),
+        row(1, at_c, 0),
+        row(2, n_at, i_q),
+        row(1, at, 0),
+    ]
+    .concat();
+    out.extend_from_slice(
+        format!(
+            "{x} 0 obj\n<< /Type /XRef /W [1 4 2] /Index [{} 1 {n} 3] /Size {} /Root {} {} R \
+             /Prev {prev} /Length {} >>\nstream\n",
+            p.0,
+            x + 1,
+            r.0,
+            r.1,
+            rows.len()
+        )
+        .as_bytes(),
+    );
+    out.extend_from_slice(&rows);
+    out.extend_from_slice(format!("\nendstream\nendobj\nstartxref\n{at}\n%%EOF\n").as_bytes());
+    out
+}
+
+/// An unfiltered object stream numbered `n`: `members` (number and offset), then `body`.
+fn object_stream(n: u32, members: &[(u32, usize)], body: &str, n_entry: &str) -> Vec<u8> {
+    let pairs: Vec<String> = members.iter().map(|(m, at)| format!("{m} {at}")).collect();
+    let index = format!("{}\n", pairs.join(" "));
+    let n_entry = if n_entry.is_empty() {
+        members.len().to_string()
+    } else {
+        n_entry.to_string()
+    };
+    format!(
+        "{n} 0 obj\n<< /Type /ObjStm /N {n_entry} /First {} /Length {} >>\nstream\n\
+         {index}{body}\nendstream\nendobj\n",
+        index.len(),
+        index.len() + body.len()
+    )
+    .into_bytes()
+}
+
+/// A revision written by hand: `objects`, each listed under its number where it starts
+/// (its text holds its own header, which may name another number), then `compressed`,
+/// entries of number, container and index, all listed by a cross-reference stream.
+fn by_hand(b: &[u8], objects: &[(u32, Vec<u8>)], compressed: &[(u32, u32, u16)]) -> Vec<u8> {
+    let d = Document::load_mem(b).unwrap();
+    let r = root(&d);
+    let prev = last_startxref(b);
+    let mut out = [b, b"\n"].concat();
+    let mut rows: std::collections::BTreeMap<u32, (u8, u32, u16)> = Default::default();
+    for (n, text) in objects {
+        rows.insert(*n, (1, u32::try_from(out.len()).unwrap(), 0));
+        out.extend_from_slice(text);
+    }
+    for &(n, c, i) in compressed {
+        rows.insert(n, (2, c, i));
+    }
+    let x = rows.keys().copied().max().unwrap().max(d.max_id) + 1;
+    rows.insert(x, (1, u32::try_from(out.len()).unwrap(), 0));
+    let at = out.len();
+    let index: Vec<String> = rows.keys().map(|n| format!("{n} 1")).collect();
+    let mut data = Vec::new();
+    for (kind, f1, f2) in rows.values() {
+        data.push(*kind);
+        data.extend_from_slice(&f1.to_be_bytes());
+        data.extend_from_slice(&f2.to_be_bytes());
+    }
+    out.extend_from_slice(
+        format!(
+            "{x} 0 obj\n<< /Type /XRef /W [1 4 2] /Index [{}] /Size {} /Root {} {} R \
+             /Prev {prev} /Length {} >>\nstream\n",
+            index.join(" "),
+            x + 1,
+            r.0,
+            r.1,
+            data.len()
+        )
+        .as_bytes(),
+    );
+    out.extend_from_slice(&data);
+    out.extend_from_slice(format!("\nendstream\nendobj\nstartxref\n{at}\n%%EOF\n").as_bytes());
+    out
+}
+
+/// A revision written by hand with a cross-reference table: `objects`, each listed under its
+/// number where it starts, then `unlisted`, text no entry leads to; `free` listed free; `more`
+/// added to the trailer.
+fn in_table(
+    b: &[u8],
+    objects: &[(u32, Vec<u8>)],
+    free: &[u32],
+    unlisted: &[u8],
+    more: &str,
+) -> Vec<u8> {
+    let d = Document::load_mem(b).unwrap();
+    let r = root(&d);
+    let prev = last_startxref(b);
+    let mut out = [b, b"\n"].concat();
+    let mut rows = String::new();
+    for (n, text) in objects {
+        rows.push_str(&format!("{n} 1\n{:010} 00000 n\r\n", out.len()));
+        out.extend_from_slice(text);
+    }
+    out.extend_from_slice(unlisted);
+    for n in free {
+        rows.push_str(&format!("{n} 1\n0000000000 00001 f\r\n"));
+    }
+    let numbers = objects.iter().map(|(n, _)| n).chain(free);
+    let size = numbers.copied().max().unwrap_or(0).max(d.max_id) + 1;
+    let at = out.len();
+    out.extend_from_slice(
+        format!(
+            "xref\n{rows}trailer\n<< /Size {size} /Root {} {} R /Prev {prev}{more} >>\n\
+             startxref\n{at}\n%%EOF\n",
+            r.0, r.1
+        )
+        .as_bytes(),
+    );
+    out
+}
+
+/// What [`by_hand`] writes for an object: its header, `body` and `endobj`.
+fn written(n: u32, body: &str) -> Vec<u8> {
+    format!("{n} 0 obj\n{body}\nendobj\n").into_bytes()
+}
+
+/// The page as signed, and turned, as written in an object stream.
+fn page_texts(b: &[u8]) -> (ObjectId, String, String) {
+    let d = Document::load_mem(b).unwrap();
+    let p = page(&d);
+    let mut turned = dict(&d, p);
+    turned.set("Rotate", 90);
+    (p, format!("{:?}", dict(&d, p)), format!("{turned:?}"))
+}
+
+/// The refusal of a later version that other apps read differently, for object `n`.
+fn read_otherwise(n: u32) -> Vec<(ChangeKind, Option<Refusal>)> {
+    vec![(
+        ChangeKind::Malformed(format!(
+            "other PDF apps may read the document differently from LimarePDF (LimarePDF \
+             can't read its object {n} the way they do)"
+        )),
+        Some(Refusal::Never),
+    )]
+}
+
+/// pdf.js takes an object stream's object as its own when the stream's number is the byte
+/// offset the object's entry gives, whatever its generation and index, and keeps it for good:
+/// a turned copy of the page in a stream numbered as the page's offset passed as nothing,
+/// and pdf.js showed the page turned. Under another number it is a stray copy readers ignore.
+#[test]
+fn an_object_stream_numbered_as_an_objects_offset_is_refused() {
+    let b = approve(&base_pdf());
+    let (p, _, turned) = page_texts(&b);
+    let d = Document::load_mem(&b).unwrap();
+    let Some(lopdf::xref::XrefEntry::Normal { offset, .. }) = d.reference_table.get(p.0) else {
+        panic!("the page isn't in an object of its own");
+    };
+    let copy = |c: u32| by_hand(&b, &[(c, object_stream(c, &[(p.0, 0)], &turned, ""))], &[]);
+    let bad = copy(*offset);
+    assert_eq!(changes(&bad), read_otherwise(p.0));
+    assert!(Pdf::from_bytes(&bad, None).unwrap().differs().is_some());
+    let ok = copy(offset + 1);
+    assert_eq!(changes(&ok), []);
+    assert!(Pdf::from_bytes(&ok, None).unwrap().differs().is_none());
+}
+
+/// lopdf keeps an object under the number its header gives. An object stream it can't open
+/// (`/N` a reference), listed under number C, and another whose header names C too, listed
+/// under another number: lopdf took the second as C, other apps the first. With the page
+/// tree's root in C, a signature passed as valid though Poppler and pdf.js showed the first
+/// stream's copy, which turns the page.
+#[test]
+fn an_object_stream_two_entries_lead_to_is_refused() {
+    let base = base_pdf();
+    let d = Document::load_mem(&base).unwrap();
+    let pages = d
+        .catalog()
+        .unwrap()
+        .get(b"Pages")
+        .unwrap()
+        .as_reference()
+        .unwrap();
+    let mut turned = dict(&d, pages);
+    turned.set("Rotate", 90);
+    let (signed, turned) = (format!("{:?}", dict(&d, pages)), format!("{turned:?}"));
+    let n = d.max_id + 1;
+    let (c, k, count) = (n, n + 1, n + 2);
+    let first = object_stream(c, &[(pages.0, 0)], &turned, &format!("{count} 0 R"));
+    let second = object_stream(c, &[(pages.0, 0)], &signed, "");
+    let base = by_hand(
+        &base,
+        &[(c, first), (k, second), (count, written(count, "1"))],
+        &[(pages.0, c, 0)],
+    );
+    let b = approve(&base);
+    let status = sig(&b, "Signature1").status;
+    assert!(
+        matches!(&status, SigStatus::CantCheck(why)
+            if why.starts_with("other PDF apps may read the version")),
+        "{status:?}"
+    );
+    assert!(Pdf::from_bytes(&b, None).unwrap().differs().is_some());
+}
+
+/// lopdf writes a stream's `/Length` as the length it read, so an object other apps may
+/// read differently that serves only as a stream's `/Length` went unused, and its mark was
+/// dropped. Here the number sits in an object stream laid out with something before it.
+#[test]
+fn an_object_read_otherwise_used_as_a_length_is_refused() {
+    let b = approve(&base_pdf());
+    let n = Document::load_mem(&b).unwrap().max_id + 1;
+    let (c, len, s) = (n, n + 1, n + 2);
+    let with = |body: &str, at| {
+        let stream = format!("<< /Length {len} 0 R >>\nstream\nhello\nendstream");
+        by_hand(
+            &b,
+            &[
+                (c, object_stream(c, &[(len, at)], body, "")),
+                (s, written(s, &stream)),
+            ],
+            &[(len, c, 0)],
+        )
+    };
+    let bad = with("7\n5", 2);
+    assert_eq!(changes(&bad), read_otherwise(len));
+    assert!(Pdf::from_bytes(&bad, None).unwrap().differs().is_some());
+    let ok = with("5", 0);
+    assert_eq!(changes(&ok), []);
+    assert!(Pdf::from_bytes(&ok, None).unwrap().differs().is_none());
+}
+
+/// Poppler and pdf.js take an object from an object stream whatever generation a reference
+/// to it gives; lopdf only under generation 0. A page reached as `N 5 R` passed as missing
+/// in lopdf's reading, and the others showed it.
+#[test]
+fn a_reference_to_an_object_in_a_stream_under_another_generation_is_refused() {
+    let b = approve(&base_pdf());
+    let n = Document::load_mem(&b).unwrap().max_id + 1;
+    let (c, q, user) = (n, n + 1, n + 2);
+    let with = |gen: u16| {
+        by_hand(
+            &b,
+            &[
+                (c, object_stream(c, &[(q, 0)], "<< /A 1 >>", "")),
+                (user, written(user, &format!("[{q} {gen} R]"))),
+            ],
+            &[(q, c, 0)],
+        )
+    };
+    let bad = with(5);
+    assert_eq!(changes(&bad), read_otherwise(q));
+    assert!(Pdf::from_bytes(&bad, None).unwrap().differs().is_some());
+    let ok = with(0);
+    assert_eq!(changes(&ok), []);
+    assert!(Pdf::from_bytes(&ok, None).unwrap().differs().is_none());
+}
+
+/// lopdf and pdf.js take a key given twice as its last value, and so does Poppler's lookup
+/// while the dictionary has fewer than 32 entries, the repeats counted; from 32 Poppler sorts
+/// them and may take another, and of a font resource dictionary it takes the first, at any
+/// size. The page written again with other page sizes before its own passed as unchanged, at
+/// 32 entries, in its own object and in an object stream, and so did a trailer naming another
+/// catalog before its own; below 32, the page naming a new font `/F1` before its own did, and
+/// Poppler drew its text in the new font (review round 4). Values written alike read alike.
+#[test]
+fn a_dictionary_giving_a_key_twice_is_refused_unless_written_alike() {
+    let b = approve(&base_pdf());
+    let d = Document::load_mem(&b).unwrap();
+    let (p, signed, _) = page_texts(&b);
+    let own = dict(&d, p).len();
+    let size = format!("{:?}", dict(&d, p).get(b"MediaBox").unwrap());
+    // The page with `/MediaBox`, written `value`, given until it has `entries` entries.
+    let sized = |entries: usize, value: &str| {
+        let sizes = format!(" /MediaBox {value}").repeat(entries - own);
+        format!("<<{sizes}{}", signed.strip_prefix("<<").unwrap())
+    };
+    let c = d.max_id + 1;
+    // The page written again in its own object, or in an object stream when `packed`.
+    let rewritten = |page: &str, packed| {
+        if packed {
+            let objstm = object_stream(c, &[(p.0, 0)], page, "");
+            by_hand(&b, &[(c, objstm)], &[(p.0, c, 0)])
+        } else {
+            by_hand(&b, &[(p.0, written(p.0, page))], &[])
+        }
+    };
+    let differs = |b: &[u8]| Pdf::from_bytes(b, None).unwrap().differs().is_some();
+    for packed in [false, true] {
+        for entries in [own + 1, 31, 32] {
+            let bad = rewritten(&sized(entries, "[0 0 1 1]"), packed);
+            assert_eq!(
+                changes(&bad),
+                read_otherwise(p.0),
+                "{entries}, packed {packed}"
+            );
+            assert!(differs(&bad), "{entries}, packed {packed}");
+            let ok = rewritten(&sized(entries, &size), packed);
+            assert_eq!(changes(&ok), [], "{entries}, packed {packed}");
+            assert!(!differs(&ok), "{entries}, packed {packed}");
+        }
+    }
+    // A revision listing nothing, whose trailer has `entries` entries, the first `/Root`
+    // naming `first`.
+    let r = root(&d);
+    let trailer = |entries: usize, first: ObjectId| {
+        let mut out = [&b[..], b"\n"].concat();
+        let at = out.len();
+        let more: String = (4..entries).map(|i| format!(" /E{i} 0")).collect();
+        out.extend_from_slice(
+            format!(
+                "xref\n0 0\ntrailer\n<< /Size {c} /Prev {}{more} /Root {} {} R /Root {} {} R >>\n\
+                 startxref\n{at}\n%%EOF\n",
+                last_startxref(&b),
+                first.0,
+                first.1,
+                r.0,
+                r.1
+            )
+            .as_bytes(),
+        );
+        (out, at)
+    };
+    let (bad, at) = trailer(32, p);
+    let want = ChangeKind::Malformed(format!(
+        "the cross-reference section at byte {at} is malformed"
+    ));
+    assert_eq!(changes(&bad), [(want, Some(Refusal::Never))]);
+    assert!(differs(&bad));
+    for (entries, first) in [(31, p), (32, r)] {
+        let (ok, _) = trailer(entries, first);
+        assert_eq!(changes(&ok), [], "{entries}");
+        assert!(!differs(&ok), "{entries}");
+    }
+
+    // A page drawing in font `/F1`, signed; then its fonts naming a new font `/F1` (or `/F#31`,
+    // the same) before its own.
+    let mut doc = Document::load_mem(&base_pdf()).unwrap();
+    let helvetica =
+        dictionary! { "Type" => "Font", "Subtype" => "Type1", "BaseFont" => "Helvetica" };
+    let resources = dictionary! { "Font" => dictionary! { "F1" => helvetica } };
+    let mut drawn = dict(&doc, page(&doc));
+    drawn.set("Resources", resources);
+    doc.set_object(page(&doc), drawn);
+    let mut unsigned = Vec::new();
+    doc.save_to(&mut unsigned).unwrap();
+    let b = approve(&unsigned);
+    let d = Document::load_mem(&b).unwrap();
+    let (p, signed, _) = page_texts(&b);
+    assert!(signed.contains("/F1 <<"), "{signed}");
+    let n = d.max_id + 1;
+    let courier = written(n, "<< /Type /Font /Subtype /Type1 /BaseFont /Courier >>");
+    for name in ["F1", "F#31"] {
+        let twice = signed.replacen("/F1 <<", &format!("/F1 {n} 0 R /{name} <<"), 1);
+        let bad = by_hand(
+            &b,
+            &[(p.0, written(p.0, &twice)), (n, courier.clone())],
+            &[],
+        );
+        assert_eq!(changes(&bad), read_otherwise(p.0), "{name}");
+        assert!(differs(&bad), "{name}");
+    }
+    let ok = by_hand(&b, &[(p.0, written(p.0, &signed)), (n, courier)], &[]);
+    assert_eq!(changes(&ok), []);
+    assert!(!differs(&ok));
+}
+
+/// Poppler, when it can't read the object a reference names and the newest cross-reference
+/// section is a table, rebuilds its list of objects by scanning the file and reads every object
+/// from that list; pdf.js reads the whole file again when a reference gives an object another
+/// generation than its own. After signing, a revision whose table left a reference with nothing
+/// to read, with a turned copy of the page after it that no entry lists, passed as nothing, and
+/// Poppler showed the page turned. They follow references from the catalog and the document
+/// information only, not from other keys of the trailer. Poppler follows them in what it draws
+/// too, where its drawing looks in a dictionary: a comment added with its appearance drawing
+/// an inline image whose filter's settings are an object nothing lists, or marking content
+/// with such an object as its text, passed as an added comment (review round 4). A drawing
+/// LimarePDF can't decode may refer to anything.
+#[test]
+fn a_reference_other_apps_read_the_file_again_for_is_refused() {
+    let b = approve(&base_pdf());
+    let d = Document::load_mem(&b).unwrap();
+    let (p, signed, turned) = page_texts(&b);
+    let n = d.max_id + 1;
+    let (user, gone, freed) = (n, n + 1, n + 2);
+    let dead = written(p.0, &turned);
+    // The page as signed, referring to `num` under `gen` too.
+    let page = |num: u32, gen: u16| {
+        let rest = signed.strip_prefix("<<").unwrap();
+        (p.0, written(p.0, &format!("<< /X [{num} {gen} R]{rest}")))
+    };
+    // Why the reading differs, if it does. The page changed is refused as such, which leaves
+    // the reading's own refusal out.
+    let differs = |b: &[u8]| {
+        let pdf = Pdf::from_bytes(b, None).unwrap();
+        pdf.differs().map(str::to_owned)
+    };
+    let read_otherwise = |b: &[u8], n: u32| {
+        let why = format!("LimarePDF can't read its object {n} the way they do");
+        let refused = changes(b).iter().any(|c| c.1 == Some(Refusal::Never));
+        refused && differs(b) == Some(why)
+    };
+    let read_alike = |b: &[u8]| {
+        let malformed = |c: &(ChangeKind, _)| matches!(c.0, ChangeKind::Malformed(_));
+        differs(b).is_none() && !changes(b).iter().any(malformed)
+    };
+    // To a number nothing lists, or one listed free, in a table: refused, from the page or the
+    // document information.
+    let info = written(user, &format!("<< /Title (T) /X [{gone} 0 R] >>"));
+    let as_info = format!(" /Info {user} 0 R");
+    let bad = [
+        (gone, in_table(&b, &[page(gone, 0)], &[], &dead, "")),
+        (freed, in_table(&b, &[page(freed, 0)], &[freed], &dead, "")),
+        (gone, in_table(&b, &[(user, info)], &[], &dead, &as_info)),
+    ];
+    for (i, (to, bad)) in bad.iter().enumerate() {
+        assert!(read_otherwise(bad, *to), "{i}");
+    }
+    // In what a comment added draws, however Poppler reads a reference there: glued to the
+    // numbers, or apart by a comment.
+    let (note, form) = (n + 3, n + 4);
+    let filtered = |data: &str, filter: &str| {
+        let mut on = dict(&d, p);
+        let mut annots = on
+            .get(b"Annots")
+            .ok()
+            .and_then(|a| a.as_array().ok())
+            .cloned()
+            .unwrap_or_default();
+        annots.push(Object::Reference((note, 0)));
+        on.set("Annots", annots);
+        let square = format!(
+            "<< /Type /Annot /Subtype /Square /Rect [0 0 9 9] /P {} 0 R /AP << /N {form} 0 R >> >>",
+            p.0
+        );
+        let len = data.len();
+        let drawn = format!(
+            "<< /Type /XObject /Subtype /Form /BBox [0 0 9 9]{filter} /Length {len} >>\nstream\n\
+             {data}\nendstream"
+        );
+        [
+            (p.0, written(p.0, &format!("{on:?}"))),
+            (note, written(note, &square)),
+            (form, written(form, &drawn)),
+        ]
+    };
+    let commented = |data: &str| filtered(data, "");
+    let drawings = [
+        format!("q BI /W 1 /H 1 /BPC 8 /CS /G /F {gone} 0 R ID x EI Q"),
+        format!("/Span << /ActualText {gone} 0 R >> BDC EMC"),
+        format!("/Span <</ActualText {gone}+0R>> BDC EMC"),
+        format!("/Span <</ActualText {gone} -%c\nR>> BDC EMC"),
+    ];
+    for (i, data) in drawings.iter().enumerate() {
+        let bad = in_table(&b, &commented(data), &[], &dead, "");
+        assert!(read_otherwise(&bad, gone), "{i}");
+        assert!(read_alike(&by_hand(&b, &commented(data), &[])), "{i}");
+    }
+    // To an object only an object stream holds, which no entry lists: the reading drops it, and
+    // says it is used.
+    let (stray, stm) = (n + 5, n + 6);
+    let mut hiding = commented(&format!("/Span << /ActualText {stray} 0 R >> BDC EMC")).to_vec();
+    hiding.push((stm, object_stream(stm, &[(stray, 0)], "(hidden)", "")));
+    let why = format!(
+        "it uses object {stray}, which its cross-reference information deletes or doesn't list"
+    );
+    assert_eq!(differs(&by_hand(&b, &hiding, &[])), Some(why));
+    // To an object the file holds, or no reference (one in a string isn't): read alike.
+    let held = format!("/Span << /ActualText {} 0 R >> BDC EMC", p.0);
+    let alike = [held, format!("{gone} 0 0 RG {gone} 0. R ({gone} 0 R) Tj")];
+    for (i, data) in alike.iter().enumerate() {
+        let ok = in_table(&b, &commented(data), &[], &dead, "");
+        assert!(read_alike(&ok), "{i}");
+    }
+    // Drawn data LimarePDF can't decode: what it refers to isn't known, in either.
+    let unread = filtered("x", " /Filter /JBIG2Decode");
+    let bad = [
+        in_table(&b, &unread, &[], &dead, ""),
+        by_hand(&b, &unread, &[]),
+    ];
+    for (i, bad) in bad.iter().enumerate() {
+        assert!(read_otherwise(bad, form), "{i}");
+    }
+    // In a cross-reference stream Poppler reads nothing there, as lopdf and pdf.js do.
+    assert!(read_alike(&by_hand(&b, &[page(gone, 0)], &[])));
+    // From another key of the trailer, or an object nothing refers to: nothing read.
+    let lone = (user, written(user, &format!("[{gone} 0 R]")));
+    let more = format!(" /AdditionalStreams [/x {gone} 0 R]");
+    let ok = in_table(&b, &[lone], &[], &dead, &more);
+    assert_eq!(changes(&ok), []);
+    assert!(differs(&ok).is_none());
+    // To the page under another generation than its own: refused in either.
+    let other = [page(p.0, p.1 + 1)];
+    let bad = [
+        in_table(&b, &other, &[], &dead, ""),
+        by_hand(&b, &other, &[]),
+    ];
+    for (i, bad) in bad.iter().enumerate() {
+        assert!(read_otherwise(bad, p.0), "{i}");
+    }
+    // To the page as listed: nothing to read again.
+    assert!(read_alike(&in_table(&b, &[page(p.0, p.1)], &[], &dead, "")));
+}
+
+/// lopdf takes a stream's data as long as its `/Length` when a line end at most comes before
+/// `endstream`, and otherwise on to an `endstream` of its own finding; a `/Length` written as
+/// a real, `87.`, it takes whatever follows, and with no `/Length` it takes nothing. Poppler
+/// and pdf.js take the data as long as a whole number `/Length` when `endstream` follows,
+/// white space and comments aside, and otherwise look for `endstream` themselves: pdf.js for
+/// its first eight bytes anywhere in the data, Poppler for the word, skipping comments, past
+/// the first token at the end of the `/Length` it takes, 0 for a real. After signing, the
+/// page's content written again with its `/Length` as a real and a red rectangle before
+/// `endstream` passed as unchanged, and Poppler and pdf.js drew the rectangle (review round
+/// 4); so did the content with its `/Length` ending inside a string, the rest of the line a
+/// comment to them, and they left out the square drawn after it; and so did a `/Length` past
+/// the data. Data differing by white space at its end reads alike.
+#[test]
+fn a_stream_framed_otherwise_is_refused() {
+    let base = base_pdf();
+    let d = Document::load_mem(&base).unwrap();
+    let p = page(&d);
+    let c = d.max_id + 1;
+    // The content stream: `entries` in its dictionary, then `body`, its data and `endstream`.
+    let content =
+        |entries: &str, body: &str| written(c, &format!("<< {entries} >>\nstream\n{body}"));
+    // A blue square with a red one in it, the red marked with a string starting `%`.
+    let marked = "0 0 1 rg 10 10 50 50 re f /Span << /ActualText (";
+    let drawn = format!("{marked}%) >> BDC 1 0 0 rg 20 20 30 30 re f EMC");
+    let length = |n: usize| format!("/Length {n}");
+    let real = |n: usize| format!("/Length {n}.");
+    let l = drawn.len();
+    let mut on = dict(&d, p);
+    on.set("Contents", Object::Reference((c, 0)));
+    let page = written(p.0, &format!("{on:?}"));
+    let signed = content(&length(l), &format!("{drawn}\nendstream"));
+    let b = approve(&by_hand(&base, &[(p.0, page), (c, signed)], &[]));
+    let differs = |b: &[u8]| Pdf::from_bytes(b, None).unwrap().differs().is_some();
+    let red = " 1 0 0 rg 0 0 300 200 re f";
+    let span = |word: &str| format!("/Span << /ActualText ({word}\n) >> BDC{red} EMC");
+    // lopdf reads the squares, and the content as signed; or something else, a change.
+    let same = read_otherwise(c);
+    let changed = vec![(ChangeKind::PageContent, Some(Refusal::Never))];
+    for (i, (entries, body, read)) in [
+        (real(l), format!("{drawn}\n{red}\nendstream"), &same),
+        (length(marked.len()), format!("{drawn}\nendstream"), &same),
+        // Poppler reads on past `endstream`.
+        (length(l + 3), format!("{drawn}\nendstream"), &same),
+        // lopdf takes nothing, the others the squares.
+        (String::new(), format!("{drawn}\nendstream"), &changed),
+        // pdf.js stops in the string, the others draw the rectangle.
+        (
+            length(0),
+            format!("{drawn}\n{}\nendstream", span("endstrea")),
+            &changed,
+        ),
+        (
+            length(0),
+            format!("{drawn}\n{}\nendstream", span("endsteam")),
+            &changed,
+        ),
+        // Poppler takes the rest of the line for a comment, and draws the rectangle.
+        (
+            real(l + 3),
+            format!("{drawn} %c  endstream\n{red}\nendstream"),
+            &changed,
+        ),
+        // Poppler takes only the word `endstream`, and draws the rectangle.
+        (
+            real(l),
+            format!("{drawn}\nendstreamx\n{red}\nendstream"),
+            &same,
+        ),
+        // Poppler's first token, a string, runs past `endstream`; it draws the rectangle.
+        (
+            real(1),
+            format!("(\nendstream\n){red}\nendstream"),
+            &changed,
+        ),
+        // Poppler takes none of the data, a comment.
+        (real(2), "%c\nendstream".into(), &changed),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let bad = by_hand(&b, &[(c, content(entries, body))], &[]);
+        assert_eq!(&changes(&bad), *read, "{i}");
+        assert!(differs(&bad), "{i}");
+    }
+    // Others take the data as long as its `/Length`, lopdf the white space after it too.
+    let mut ok = vec![];
+    for (framing, read) in [("\n", &[]), ("\r\n", &[]), ("\r", &[]), ("", &[])] {
+        ok.push((length(l), format!("{drawn}{framing}endstream"), &read[..]));
+    }
+    for framing in ["\n\n", " \n", "\n\r"] {
+        ok.push((
+            length(l),
+            format!("{drawn}{framing}endstream"),
+            &changed[..],
+        ));
+    }
+    // All look for `endstream`, or take the data as long as a real that ends it; Poppler
+    // takes none of white space.
+    ok.push((length(0), format!("{drawn}\nendstream"), &[]));
+    ok.push((real(l), format!("{drawn}\nendstream"), &[]));
+    ok.push((real(l), format!("{drawn}\n%{red}\nendstream"), &[]));
+    ok.push((real(1), " \nendstream".into(), &changed));
+    for (i, (entries, body, read)) in ok.iter().enumerate() {
+        let ok = by_hand(&b, &[(c, content(entries, body))], &[]);
+        assert_eq!(changes(&ok), *read, "{i}");
+        assert!(!differs(&ok), "{i}");
     }
 }
 
@@ -2077,6 +4513,41 @@ fn filling_in_a_missing_object_is_refused() {
             .any(|(k, r)| matches!(k, ChangeKind::Unrecognised(_)) && r.is_some()),
         "{got:#?}"
     );
+}
+
+/// An object only the data of what is drawn refers to, which Poppler follows where its drawing
+/// looks in a dictionary (marked content's, an inline image's settings), is part of that
+/// drawing: changed later, it changes the page's content, or the comment's appearance. One
+/// nothing refers to changes nothing (review round 4).
+#[test]
+fn an_object_drawn_data_refers_to_is_part_of_the_drawing() {
+    let mut ids = [(0, 0); 3];
+    let base = edit(&base_pdf(), |prev, new| {
+        let text = |s: &str| Object::string_literal(s);
+        ids = ["Pay one hundred", "Approved", "Unused"].map(|s| new.add_object(text(s)));
+        let marked = |id: ObjectId| format!("/Span <</ActualText {} 0 R>> BDC EMC", id.0);
+        let p = dict(prev, page(prev));
+        let c = p.get(b"Contents").unwrap().as_reference().unwrap();
+        let content = Stream::new(Dictionary::new(), marked(ids[0]).into_bytes());
+        new.set_object(c, content);
+        let ap = appearance(new, &marked(ids[1]));
+        let note = new.add_object(dictionary! {
+            "Type" => "Annot", "Subtype" => "Square", "P" => page(prev),
+            "Rect" => vec![0.into(), 0.into(), 9.into(), 9.into()],
+            "AP" => dictionary! { "N" => ap },
+        });
+        add_annot(prev, new, note);
+    });
+    let b = approve(&base);
+    let [text, said, lone] = ids;
+    let changed = |id: ObjectId| {
+        let more = Object::string_literal("Pay one million");
+        edit(&b, |_, new| new.set_object(id, more))
+    };
+    assert_refused(&changed(text), &ChangeKind::PageContent);
+    let comment = [(ChangeKind::CommentChanged, None)];
+    assert_eq!(changes(&changed(said)), comment);
+    assert_eq!(changes(&changed(lone)), []);
 }
 
 /// Truncated or damaged appended data never panics and never passes as unchanged.

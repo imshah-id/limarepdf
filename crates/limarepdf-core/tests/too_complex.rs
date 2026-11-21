@@ -6,7 +6,8 @@
 //! their own `/Rect`. So does reading their points and text: a listing lists those past
 //! it unread, and removing information is refused past it. A text is charged what decoding
 //! it takes, a failure too. Changing one reads it alone, and
-//! is refused past the points it is drawn with rather than write them back cut.
+//! is refused past the points it is drawn with rather than write them back cut. Reading a
+//! form's fields has a budget too, and what relies on reading them all is refused past it.
 
 mod common;
 
@@ -1161,4 +1162,122 @@ fn moving_an_annotation_past_its_points_is_refused() {
     let mut p = zebras(1);
     let id = polygon(&mut p, 100_000);
     p.move_annotation(0, id, to).unwrap();
+}
+
+/// A page with a form of one field titled with 64 KiB, which `kids` text fields "k0", "k1"
+/// and on share: each kid's name holds it. Returns the title.
+fn titled_form(p: &mut Pdf, kids: usize) -> String {
+    let title = "a".repeat(65_536);
+    let parent = p.doc.new_object_id();
+    let kids: Vec<Object> = (0..kids)
+        .map(|i| {
+            let t = Object::string_literal(format!("k{i}"));
+            let kid = dictionary! { "FT" => "Tx", "T" => t, "V" => "v", "Parent" => parent };
+            p.doc.add_object(kid).into()
+        })
+        .collect();
+    let field = dictionary! { "T" => Object::string_literal(title.as_str()), "Kids" => kids };
+    p.doc.objects.insert(parent, field.into());
+    let form = dictionary! { "Fields" => vec![parent.into()] };
+    p.doc.catalog_mut().unwrap().set("AcroForm", form);
+    title
+}
+
+/// Reading a form's fields has a budget of 2²⁶ steps, the bytes of their names among them:
+/// past it, flattening, resetting, removing the values (and listing what removing hidden
+/// information would remove), setting a field it didn't reach and redacting, which looks
+/// for the removed text in every field, are refused with a typed reason, with nothing
+/// changed. Before, a walk held what the fields did: each of 1,100 kids
+/// a copy of the 64 KiB title, 72 MB. 1,000 are read whole.
+#[test]
+fn a_form_holding_more_than_is_read_of_one_is_refused() {
+    use limarepdf_core::{FieldValue, Hidden, TooComplex};
+    let x = || FieldValue::Text("x".into());
+    let page = [0.0, 0.0, 612.0, 792.0];
+    let mut p = zebras(1);
+    let title = titled_form(&mut p, 1_100);
+    let before = p.state_before();
+    let refused = [
+        p.flatten_form(None).err(),
+        p.reset_form().err(),
+        p.set_field(&format!("{title}.k1099"), x()).err(),
+        p.check_remove_hidden(&[Hidden::FormValues]).err(),
+        p.remove_hidden(&[Hidden::FormValues]).err(),
+        p.find_hidden().err(),
+        p.redact(&[(0, page)]).err(),
+    ];
+    let reading = ("reading the form's fields", 1 << 26);
+    for (n, e) in refused.into_iter().enumerate() {
+        let e = e.unwrap_or_else(|| panic!("{n} not refused"));
+        let too = e.downcast_ref::<TooComplex>().expect("too complex");
+        assert_eq!((too.what, too.limit), reading, "{n}");
+    }
+    assert_eq!(p.state_since(&before), []);
+    let mut p = zebras(1);
+    let title = titled_form(&mut p, 1_000);
+    p.set_field(&format!("{title}.k999"), x()).unwrap();
+    p.reset_form().unwrap();
+    p.check_remove_hidden(&[Hidden::FormValues]).unwrap();
+    p.find_hidden().unwrap();
+    p.remove_hidden(&[Hidden::FormValues]).unwrap();
+    p.redact(&[(0, page)]).unwrap();
+    p.flatten_form(None).unwrap();
+}
+
+/// Lists `field` after the fields of the form `titled_form` made.
+fn list_after(p: &mut Pdf, field: Dictionary) {
+    let id = p.doc.add_object(field);
+    let form = p.doc.catalog_mut().unwrap().get_mut(b"AcroForm").unwrap();
+    let fields = form.as_dict_mut().unwrap().get_mut(b"Fields").unwrap();
+    fields.as_array_mut().unwrap().push(id.into());
+}
+
+/// A signature field listed after a form holding more than is read of one is still found, so
+/// a file signed there is taken for signed (the app keeps its bytes, and `limarepdf-cli`
+/// doesn't save it whole without `--break-signatures`): `signature_count` and
+/// `has_signature_fields` look past the walk's steps for it. They missed it, and the file was
+/// taken for unsigned. An empty one is found, and not counted as signed.
+#[test]
+fn a_signature_past_what_is_read_of_a_form_is_found() {
+    let signature = |p: &mut Pdf, signed: bool| {
+        let mut field = dictionary! { "FT" => "Sig", "T" => Object::string_literal("s") };
+        if signed {
+            let sig = dictionary! { "Type" => "Sig", "Filter" => "Adobe.PPKLite" };
+            field.set("V", p.doc.add_object(sig));
+        }
+        list_after(p, field);
+    };
+    for kids in [1_000, 1_100] {
+        let mut p = zebras(1);
+        titled_form(&mut p, kids);
+        assert!(!p.has_signature_fields(), "{kids}");
+        signature(&mut p, true);
+        assert_eq!(p.signature_count(), 1, "{kids}");
+        assert!(p.has_signature_fields(), "{kids}");
+        let mut p = zebras(1);
+        titled_form(&mut p, kids);
+        signature(&mut p, false);
+        assert_eq!(p.signature_count(), 0, "{kids}");
+        assert!(p.has_signature_fields(), "{kids}");
+    }
+}
+
+/// A form with an XFA part (fields in XML, for Adobe Reader) holding more than is read of
+/// one isn't taken for XFA-only when none of the fields read has a widget: the fields after
+/// may have them. It was, and removing scripts kept the XFA part's, as it does an XFA-only
+/// form's, which would be left with nothing. Read whole, with no widget, it is XFA-only.
+#[test]
+fn a_form_holding_more_than_is_read_of_one_is_not_taken_for_xfa_only() {
+    use limarepdf_core::Hidden;
+    for (kids, xfa_only) in [(1_000, true), (1_100, false)] {
+        let mut p = zebras(1);
+        titled_form(&mut p, kids);
+        let form = p.doc.catalog_mut().unwrap().get_mut(b"AcroForm").unwrap();
+        let xfa = Object::string_literal("<xdp:xdp><script/></xdp:xdp>");
+        form.as_dict_mut().unwrap().set("XFA", xfa);
+        assert_eq!(p.xfa_only(), xfa_only, "{kids}");
+        p.remove_hidden(&[Hidden::Scripts]).unwrap();
+        let form = p.doc.catalog().unwrap().get(b"AcroForm").unwrap();
+        assert_eq!(form.as_dict().unwrap().has(b"XFA"), xfa_only, "{kids}");
+    }
 }

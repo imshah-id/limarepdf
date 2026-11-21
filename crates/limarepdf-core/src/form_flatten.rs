@@ -3,7 +3,7 @@
 
 use crate::annots::NO_VIEW;
 use crate::budget::{self, TooComplex, Work};
-use crate::forms::{FieldValue, Reach, MAX_DEPTH};
+use crate::forms::{self, FieldValue, LeftOut, Reach, MAX_DEPTH};
 use crate::matrix::{self as mx, M};
 use crate::{quoted_list, Pdf, Result};
 use anyhow::bail;
@@ -118,8 +118,9 @@ impl Pdf {
     /// no widgets are removed, and the form itself once none are left. Hidden widgets are
     /// removed without being drawn. Every field is drawn, past the 10,000 LimarePDF lists
     /// too. Refuses, with nothing changed, when a shown field's value has no drawing and
-    /// LimarePDF can't draw it, as it would be lost, and when the fields are nested more
-    /// than 32 deep, too deep to follow them all. Returns how many widgets were drawn.
+    /// LimarePDF can't draw it, as it would be lost, when the fields are nested more than 32
+    /// deep, too deep to follow them all, and when they hold more than LimarePDF reads of a
+    /// form ([`crate::TooComplex`]). Returns how many widgets were drawn.
     pub fn flatten_form(&mut self, pages: Option<&[usize]>) -> Result<usize> {
         self.flatten_widgets(pages, flat_widget, true)
     }
@@ -182,13 +183,16 @@ impl Pdf {
         let whole = pages.is_none();
         let pages = self.page_list(pages)?;
         // Every field is drawn, not only those listed: a field left out loses its value
-        // (PB-90). One nested too deep to follow could be lost the same way.
-        if refuse && self.field_nodes(Reach::Every).1 {
-            bail!(
+        // (PB-90). One nested too deep to follow, or past what a walk reads, could be lost
+        // the same way.
+        match self.field_nodes(Reach::Every).1.filter(|_| refuse) {
+            Some(LeftOut::Deep) => bail!(
                 "This form's fields are nested too deeply for LimarePDF to follow (more than \
                  {MAX_DEPTH} levels), so flattening could lose some of them. Nothing was \
                  changed."
-            );
+            ),
+            Some(LeftOut::Large) => return Err(forms::too_large().into()),
+            None => {}
         }
         // A field with a value but no drawing would otherwise vanish. Drawing can't add one
         // for every value, so when one is missing it is tried on a copy first.

@@ -56,7 +56,7 @@ text strips control characters anyway (`display.rs`). `doc::encode_text` writes 
 breaks as they are and anything else as UTF-16BE, so every string reads back unchanged. lopdf's own
 `decode_text_string` isn't used: its table drops tabs and line breaks. Text that is only shown (document
 properties, bookmark titles, comments' contents, authors and subjects, field descriptions) goes through
-`doc::decode_shown_text` instead (`Pdf::shown_text_value`; PB-18): unmarked bytes that are valid UTF-8 with a
+`doc::decode_shown_text` instead (`Pdf::text_charged` with `shown`; PB-18): unmarked bytes that are valid UTF-8 with a
 character of more than one byte read as UTF-8, as the program that wrote them meant; in PDFDocEncoding those would
 be runs like "Ã©". Field names, values and options, page labels and signature details stay on `decode_text`, so a
 field is found by the name every reader finds. Windows-1252 can't be told from PDFDocEncoding (both define 0x80 to
@@ -72,7 +72,25 @@ and `form list`; everything else takes every field
 (`Pdf::every_form_field`, `form_nodes`, `Reach::Every`): finding a field by name (setting, signing, `form fill`),
 reset, removing values, counting and checking signatures, field locks, new signature field names, redaction's
 report, flattening, printing, the pages' pictures (`render_snapshot`, `unshown_fields`), drawing fields before
-signing and telling XFA-only forms apart.
+signing and telling XFA-only forms apart. A walk of the field tree (`field_nodes`) reads within a budget of its own,
+`READ_STEPS` (2²⁶, unrecorded by `budget_seam`, as many operations walk on their way): a step for each node, kid,
+widget and option looked at, and for each byte read and each byte the fields hold, names, values, options,
+tooltips, `/DA` (three times: kept, and read for the text size and font) and `/DV` (`repair::copy_size`). Kids
+hold their parents' names and inherit what they give (`Inherited` borrows it from the file), so a title, value or
+option list given once was held by every kid: 700 kids of one `/DV` held 129 MB, and a title stream decoding to 256
+MiB was held by each. Once the steps are taken the walk stops, the fields after are left out (`LeftOut::Large`,
+over `LeftOut::Deep`), and flattening, reset, removing values (and so `check_remove_hidden` and `find_hidden`),
+redaction (its report looks in every field), setting or finding a field the walk may have left out (`named_node`:
+`set_field`, and `form_field`, which `form fill` asks for a name it didn't list), and checking signatures and
+signing, where signatures may be among the fields left out (`whole_form`: `verify_signatures`, so saving on top of a
+signed file too, and signing's own walks), refuse with a `TooComplex`.
+Flattening and reset refuse fields left out for being nested too deep (`LeftOut::Deep`) too, and removing values
+stops at them (`value_nodes`). Telling a signed file apart (`signature_count`, `has_signature_fields`: whether
+`limarepdf-cli` may save it whole, whether the app keeps its bytes) looks past a walk cut short for signature
+fields, among every node `value_nodes` reads (`signature_nodes`). A form whose walk was cut short isn't taken for
+XFA-only (`xfa_only`), so removing scripts takes its XFA part too. The render
+corpus's dearest form takes 126,118 steps (`pdfjs/issue16081.pdf`, 240 fields; 1,197 files, measured 2026-11-20);
+walks cut at the limit take at most 0.07 s in an optimised build (the `ci-test` profile).
 
 Every dialog in the desktop app is built from the same parts in `crates/limarepdf-gui/src/dialogs.rs`, so they all
 look like Print: `Shell` (the window over the dimmed app, its title and file, and the dialogs' look from
@@ -1237,7 +1255,9 @@ such a list gives by reference once; each node takes its own copy of a list with
 has pages of its own, inheriting from it (sharing one copy left lopdf, which reads no more of a page list than the
 file has objects, short of pages), and a file whose copies would take more than `MAX_SHARED_KIDS_COPIES` (64 MiB) is
 refused: `copy_size` counts what a copy holds on the heap, a dictionary's room for its entries and index too, as
-indexmap and hashbrown keep it (`tests/shared_kids_memory.rs` checks it against a counting allocator). It
+indexmap and hashbrown keep it, each allocation as glibc's malloc takes it, and `kid_copy_size` adds for a page
+written in the list its place among the document's objects and the `/Parent` it is given, with the room its map
+grows to (`tests/shared_kids_memory.rs` checks it against a counting allocator counting as malloc does). It
 reads the bytes' object headers once (`object_lines`) for the kids that aren't page nodes
 (`fields_sharing_their_kids_are_walked_once`, `widgets_shared_by_fields_go_to_the_first`,
 `page_tree_nodes_sharing_their_kids_queue_them_once`,
