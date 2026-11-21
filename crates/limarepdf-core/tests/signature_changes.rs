@@ -1715,6 +1715,73 @@ fn a_dictionary_followed_by_stream_without_a_line_end_is_refused() {
     assert_eq!(changes(&rewritten("endobj")), vec![]);
 }
 
+/// Checking that other apps read each object as LimarePDF does reads no further than lopdf
+/// reads: not on into a string after an object, a number or where an entry points, which
+/// lopdf reads no further than its first byte, and which, never ended, runs on through the
+/// rest of the file. 20,000 objects so followed took 15 s to open, 300 times as long as with
+/// a letter in place of the string's first byte, and a minute at twice as many; the
+/// signature read as valid.
+#[test]
+fn objects_followed_by_strings_are_read_as_fast_as_others() {
+    const N: u32 = 20_000;
+    let b = approve(&base_pdf());
+    let first = Document::load_mem(&b).unwrap().max_id + 1;
+    // `#` an object's number, `&` its partner's, `@` the string's first byte.
+    let opened = |main: &str, partner: &str, opening: &str| {
+        let text = |t: &str, n: u32| {
+            t.replace('#', &n.to_string())
+                .replace('&', &(n + N).to_string())
+                .replace('@', opening)
+                .into_bytes()
+        };
+        let mut objects: Vec<(u32, Vec<u8>)> =
+            (first..first + N).map(|n| (n, text(main, n))).collect();
+        if !partner.is_empty() {
+            objects.extend((first..first + N).map(|n| (n + N, text(partner, n))));
+        }
+        let f = by_hand(&b, &objects, &[]);
+        let start = std::time::Instant::now();
+        let got = changes(&f);
+        (start.elapsed(), got)
+    };
+    let mut slow = Vec::new();
+    for (main, partner, opening) in [
+        // After a number, looking for `N G R`, and after the object.
+        ("# 0 obj\n5 @\n", "", "<"),
+        ("# 0 obj\n5 @\n", "", "("),
+        // After a dictionary, and after a number or two there, perhaps a header's.
+        ("# 0 obj\n<< /A 5 >> @\n", "", "("),
+        ("# 0 obj\n<< /A 5 >> 7 @\n", "", "("),
+        ("# 0 obj\n<< /A 5 >> 7 0 @\n", "", "("),
+        // In a header.
+        ("# @\n", "", "("),
+        // An object lopdf took from another entry.
+        ("& 0 obj\n5 endobj\n", "& 0 obj\n@\n", "<"),
+        // After an object stream's data, and after the object giving its length.
+        (
+            "# 0 obj\n<< /Type /ObjStm /N 0 /First 0 /Length 0 >>\nstream\n@\nendstream\nendobj\n",
+            "",
+            "(",
+        ),
+        (
+            "# 0 obj\n<< /Type /ObjStm /N 0 /First 0 /Length & 0 R >>\nstream\n\nendstream\n\
+             endobj\n",
+            "& 0 obj\n0 @\n",
+            "(",
+        ),
+    ] {
+        let (took, got) = opened(main, partner, opening);
+        let (twin, want) = opened(main, partner, "x");
+        if took > twin * 20 {
+            slow.push(format!(
+                "{main:?} {partner:?} {opening}: {took:?}, {twin:?} with x"
+            ));
+        }
+        assert_eq!(got, want, "{main:?} {partner:?} {opening}");
+    }
+    assert!(slow.is_empty(), "{slow:#?}");
+}
+
 /// lopdf and pdf.js read each object in an object stream at its offset, and Poppler in
 /// windows as long as from one offset to the next, the first starting at `/First`. A page
 /// turned after signing, written before the page as signed, passed as unchanged, and Poppler

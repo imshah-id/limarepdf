@@ -1201,9 +1201,8 @@ impl<'a> Lexer<'a> {
         self.pos >= self.bytes.len()
     }
 
-    /// The next token with its start and end, or `None` at the end or on malformed input.
-    #[allow(clippy::should_implement_trait)]
-    pub(crate) fn next(&mut self) -> Option<(usize, Tok<'a>, usize)> {
+    /// Skips white space and comments.
+    fn skip_blank(&mut self) {
         let b = self.bytes;
         loop {
             while self.pos < b.len() && is_white(b[self.pos]) {
@@ -1217,6 +1216,26 @@ impl<'a> Lexer<'a> {
             }
             break;
         }
+    }
+
+    /// The next token if it is a word, such as a number or a keyword; `None`, without reading
+    /// on, at the end or where the next token is anything else. Where only a word will do, this
+    /// reads no further into a string than its first byte, as lopdf does, and so never on to the
+    /// end of the file for each object a string that is never ended follows.
+    pub(crate) fn next_word(&mut self) -> Option<(usize, Tok<'a>, usize)> {
+        self.skip_blank();
+        let &ch = self.bytes.get(self.pos)?;
+        if is_delim(ch) {
+            return None;
+        }
+        self.next()
+    }
+
+    /// The next token with its start and end, or `None` at the end or on malformed input.
+    #[allow(clippy::should_implement_trait)]
+    pub(crate) fn next(&mut self) -> Option<(usize, Tok<'a>, usize)> {
+        let b = self.bytes;
+        self.skip_blank();
         let start = self.pos;
         let tok = match *b.get(start)? {
             b'<' if b.get(start + 1) == Some(&b'<') => {
@@ -1228,14 +1247,15 @@ impl<'a> Lexer<'a> {
                 Tok::DictClose
             }
             b'<' => {
-                let len = b[start..].iter().position(|&ch| ch == b'>')?;
-                if !b[start + 1..start + len]
+                // Ends at the first byte that is neither a digit nor white space, as lopdf's
+                // does, rather than searching on for a `>`.
+                let len = b[start + 1..]
                     .iter()
-                    .all(|&ch| ch.is_ascii_hexdigit() || is_white(ch))
-                {
+                    .position(|&ch| !(ch.is_ascii_hexdigit() || is_white(ch)))?;
+                if b[start + 1 + len] != b'>' {
                     return None;
                 }
-                self.pos = start + len + 1;
+                self.pos = start + len + 2;
                 Tok::Hex
             }
             b'[' => {
@@ -1521,6 +1541,43 @@ mod tests {
         assert!(ends_revision(b"...%%EOF\r\n"));
         assert!(!ends_revision(b"...%%EOF\r\nxref"));
         assert!(!ends_revision(b"...endobj\n"));
+    }
+
+    #[test]
+    fn words_alone_and_hex_strings_read_no_further_than_lopdf() {
+        let toks = |s: &'static str| {
+            let mut lx = Lexer::new(s.as_bytes(), 0);
+            std::iter::from_fn(move || lx.next())
+                .map(|(_, t, _)| t)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(toks("<0a 1F> <>"), [Tok::Hex, Tok::Hex]);
+        for bad in ["<0g>", "<0a", "<0a<", "<0a( >", "<0a x>"] {
+            assert!(toks(bad).is_empty(), "{bad}");
+        }
+
+        let word = |s: &'static str| {
+            let mut lx = Lexer::new(s.as_bytes(), 0);
+            (lx.next_word(), lx.pos(), lx.at_end())
+        };
+        assert_eq!(
+            word(" % c\n 12 "),
+            (Some((6, Tok::Word(b"12"), 8)), 8, false)
+        );
+        assert_eq!(
+            word("endobj("),
+            (Some((0, Tok::Word(b"endobj"), 6)), 6, false)
+        );
+        for (s, at) in [
+            ("  (never ended", 2),
+            ("<0a>", 0),
+            ("<<", 0),
+            ("/N", 0),
+            ("{", 0),
+        ] {
+            assert_eq!(word(s), (None, at, false), "{s}");
+        }
+        assert_eq!(word(" % c"), (None, 4, true));
     }
 
     /// A later version, signed by a signature that couldn't be checked, that other apps may

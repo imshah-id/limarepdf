@@ -1086,8 +1086,8 @@ fn object(lx: &mut Lexer, depth: usize, keep: bool) -> Option<Object> {
                 // Perhaps `N G R`; lopdf takes one only after digits alone, where
                 // other readers take `+1 0 R` too.
                 let mut look = lx.clone();
-                let gen: Option<u16> = word_num(look.next());
-                let r = matches!(look.next(), Some((_, Tok::Word(b"R"), _)));
+                let gen: Option<u16> = word_num(look.next_word());
+                let r = matches!(look.next_word(), Some((_, Tok::Word(b"R"), _)));
                 match (gen, r, u32::try_from(n)) {
                     (Some(g), true, Ok(num)) => {
                         *lx = look;
@@ -1163,12 +1163,12 @@ fn header_id(bytes: &[u8], offset: usize) -> Option<ObjectId> {
 /// [`header_id`], and a lexer past the header.
 fn header(bytes: &[u8], offset: usize) -> Option<(ObjectId, Lexer<'_>)> {
     let mut lx = Lexer::new(bytes, offset);
-    let first = lx.next();
+    let first = lx.next_word();
     if !first.is_some_and(|(s, _, _)| bytes[offset..s].iter().all(|&c| is_white(c))) {
         return None;
     }
-    let id = (word_num(first)?, word_num(lx.next())?);
-    matches!(lx.next(), Some((_, Tok::Word(b"obj"), _))).then_some((id, lx))
+    let id = (word_num(first)?, word_num(lx.next_word())?);
+    matches!(lx.next_word(), Some((_, Tok::Word(b"obj"), _))).then_some((id, lx))
 }
 
 /// Where stream data starts, `at` just past the `stream` keyword: lopdf, like pdf.js, takes
@@ -1192,7 +1192,7 @@ fn stream_data(bytes: &[u8], at: usize, spec: &HashMap<u32, Entry>) -> Option<Ra
     let Object::Dictionary(dict) = read_object(&mut lx, 0)? else {
         return None;
     };
-    let (_, Tok::Word(b"stream"), keyword) = lx.next()? else {
+    let (_, Tok::Word(b"stream"), keyword) = lx.next_word()? else {
         return None;
     };
     let start = data_start(bytes, keyword)?;
@@ -1204,7 +1204,7 @@ fn stream_data(bytes: &[u8], at: usize, spec: &HashMap<u32, Entry>) -> Option<Ra
                 let Object::Integer(n) = read_object(&mut lx, 0)? else {
                     return None;
                 };
-                if found != *id || !matches!(lx.next()?, (_, Tok::Word(b"endobj"), _)) {
+                if found != *id || !matches!(lx.next_word()?, (_, Tok::Word(b"endobj"), _)) {
                     return None;
                 }
                 n
@@ -1216,8 +1216,8 @@ fn stream_data(bytes: &[u8], at: usize, spec: &HashMap<u32, Entry>) -> Option<Ra
     let end = start.checked_add(usize::try_from(len).ok()?)?;
     let mut tail = Lexer::new(bytes, end);
     (end <= bytes.len()
-        && matches!(tail.next()?, (_, Tok::Word(b"endstream"), _))
-        && matches!(tail.next()?, (_, Tok::Word(b"endobj"), _)))
+        && matches!(tail.next_word()?, (_, Tok::Word(b"endstream"), _))
+        && matches!(tail.next_word()?, (_, Tok::Word(b"endobj"), _)))
     .then_some(start..end)
 }
 
@@ -1538,7 +1538,8 @@ pub(crate) fn compare_reading(bytes: &[u8], doc: &Document) -> Result<Reading, S
                         .filter(|(found, _)| *found == id)
                         .and_then(|(_, mut lx)| {
                             let o = read_object(&mut lx, 0)?;
-                            Some((o, matches!(lx.next(), Some((_, Tok::Word(b"stream"), _)))))
+                            let stream = lx.next_word();
+                            Some((o, matches!(stream, Some((_, Tok::Word(b"stream"), _)))))
                         });
                     match read {
                         Some((o, stream)) => {
@@ -1663,7 +1664,7 @@ fn whole_object(mut lx: Lexer, lengths: &mut HashSet<ObjectId>) -> bool {
             Tok::DictOpen | Tok::ArrayOpen | Tok::Name(_) | Tok::Hex | Tok::Literal
         )
     });
-    let next = lx.next();
+    let next = lx.next_word();
     match next {
         Some((_, Tok::Word(b"endobj"), _)) => true,
         Some((_, Tok::Word(b"stream"), keyword)) => {
@@ -1680,8 +1681,8 @@ fn whole_object(mut lx: Lexer, lengths: &mut HashSet<ObjectId>) -> bool {
         None => lx.at_end(),
         _ => {
             word_num::<u32>(next).is_some()
-                && word_num::<u16>(lx.next()).is_some()
-                && matches!(lx.next(), Some((_, Tok::Word(b"obj"), _)))
+                && word_num::<u16>(lx.next_word()).is_some()
+                && matches!(lx.next_word(), Some((_, Tok::Word(b"obj"), _)))
         }
     }
 }
@@ -6002,6 +6003,46 @@ mod tests {
         let string = dictionary! { "A" => vec![Object::string_literal("x")] };
         assert!(unsure(string.into()));
         assert!(unsure(Stream::new(dictionary! {}, b"x".to_vec()).into()));
+    }
+
+    /// Looking for `stream` after an object the encryption dictionary names reads no further
+    /// into a string there than its first byte, as lopdf does: never ended, it runs on through
+    /// the rest of the file. 20,000 objects so followed took seconds, where a letter in place
+    /// of the string's first byte takes milliseconds.
+    #[test]
+    fn objects_the_encryption_dictionary_names_followed_by_strings_are_read_as_fast_as_others() {
+        let mut d = Document::with_version("1.7");
+        let kids = Vec::<Object>::new();
+        let pages = d.add_object(dictionary! { "Type" => "Pages", "Kids" => kids, "Count" => 0 });
+        let root = d.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages });
+        d.trailer.set("Root", root);
+        let named: Vec<Object> = (0..20_000)
+            .map(|_| d.add_object(dictionary! { "A" => 1 }).into())
+            .collect();
+        let encrypt = encrypt_with_identity(&mut d);
+        let e = d.get_object_mut(encrypt).unwrap().as_dict_mut().unwrap();
+        e.set("X", named);
+        let mut base = Vec::new();
+        d.save_to(&mut base).unwrap();
+        let read = Document::load_mem(&base).unwrap();
+        let timed = |opening: &[u8; 6]| {
+            // As long as `endobj`, so that the offsets hold; not after the cross-reference
+            // stream.
+            let mut b = base.clone();
+            let mut at = 0;
+            while let Some(k) = b[at..read.xref_start]
+                .windows(6)
+                .position(|w| w == b"endobj")
+            {
+                b[at + k..at + k + 6].copy_from_slice(opening);
+                at += k + 6;
+            }
+            let start = std::time::Instant::now();
+            let _ = compare_reading(&b, &read);
+            start.elapsed()
+        };
+        let (took, twin) = (timed(b"(     "), timed(b"x     "));
+        assert!(took < twin * 20, "{took:?}, {twin:?} with x");
     }
 
     /// Encrypts `d`, which has no `/ID` yet, with the Identity crypt filter, which leaves strings
