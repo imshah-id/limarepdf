@@ -671,11 +671,14 @@ refuses as malformed:
   its own generation is read as null by every app, and other apps don't follow the trailer's other keys. Poppler
   follows references in what it draws too (a page's content, an annotation's appearance, a form, a pattern, a Type 3
   font's glyphs) where its drawing looks in a dictionary, such as an inline image's settings or marked content's:
-  LimarePDF reads that data as Poppler's lexer does and takes every `N G R` it reads, in a dictionary or not, as
-  followed, and as used by the objects an object stream or a deleted entry hides. From an inline image on, Poppler
-  finds where it reads on only as it decodes the image, so there every `N G R` written counts, in strings and the
-  image's data too. Drawn data it can't decode, a drawing larger than 256 MiB, or what is drawn past a gigabyte read
-  or 65,536 references found in all, may refer to anything, so it is refused where it is used.
+  LimarePDF decodes that data as Poppler reads its filters (from `/F` and `/DP` where `/Filter` and `/DecodeParms`
+  are missing, by short names such as `/Fl` too, through references), reads it as Poppler's lexer does and takes
+  every `N G R` it reads, in a dictionary or not, as followed, and as used by the objects an object stream or a
+  deleted entry hides. From an inline image on, Poppler finds where it reads on only as it decodes the image, so
+  there every `N G R` written counts, in strings and the image's data too. Drawn data it can't decode, data whose
+  `/Filter` and `/F`, or `/DecodeParms` and `/DP`, differ (pdf.js reads the other), a drawing larger than 256 MiB,
+  or what is drawn past a gigabyte read or 65,536 references found in all, may refer to anything, so it is refused
+  where it is used.
 
 An object deleted while still in use, and an object the signed version referred to but didn't have, are refused
 too. These are the shapes of the published shadow (hide, replace, hide-and-replace) and incremental-saving attacks.

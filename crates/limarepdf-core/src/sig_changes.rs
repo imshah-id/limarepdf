@@ -24,6 +24,7 @@ use crate::sig_verify::{
 use crate::Pdf;
 use lopdf::xref::XrefEntry;
 use lopdf::{Dictionary, Document, Object, ObjectId, Stream, StringFormat};
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::ops::Range;
@@ -2267,7 +2268,11 @@ fn draw(
         let Some(Object::Stream(s)) = doc.objects.get(id) else {
             continue;
         };
-        match work.decode(s) {
+        let decoded = match as_poppler_decodes(doc, s) {
+            Some(s) => work.decode(&s),
+            None => Ok(None),
+        };
+        match decoded {
             Ok(Some(d)) if data.len() + d.len() <= within.data => {
                 breaks.push(data.len());
                 data.extend(d);
@@ -2286,6 +2291,86 @@ fn draw(
         out.unread.extend(&drawing);
     }
     read.insert(drawing);
+}
+
+/// Stream `s` with its filters as Poppler reads them, for lopdf to decode: each through a
+/// reference (the filter, the list, each filter in it, their settings and each setting), from
+/// `/F` and `/DP` where `/Filter` and `/DecodeParms` are missing, by their short names too, with
+/// settings for several filters only from a list. A list with something other than a name in it
+/// leaves no data. `None` when `/Filter` and `/F`, or `/DecodeParms` and `/DP`, are both written
+/// and differ: pdf.js and hayro read the other one.
+fn as_poppler_decodes<'a>(doc: &'a Document, s: &'a Stream) -> Option<Cow<'a, Stream>> {
+    const NULL: Object = Object::Null;
+    let one = |o: &'a Object| -> &'a Object {
+        match o {
+            Object::Reference(id) => doc.objects.get(id).unwrap_or(&NULL),
+            o => o,
+        }
+    };
+    let get = |k: &[u8]| s.dict.get(k).map_or(&NULL, one);
+    let differ = |a: &[u8], b: &[u8]| s.dict.has(a) && s.dict.has(b) && get(a) != get(b);
+    if differ(b"Filter", b"F") || differ(b"DecodeParms", b"DP") {
+        return None;
+    }
+    let or = |a: &[u8], b: &[u8]| match get(a) {
+        Object::Null => get(b),
+        o => o,
+    };
+    let settings = |o: &'a Object| match o {
+        Object::Dictionary(d) => {
+            Object::Dictionary(d.iter().map(|(k, v)| (k.clone(), one(v).clone())).collect())
+        }
+        _ => NULL,
+    };
+    let name = |n: &[u8]| Object::Name(filter_name(n).to_vec());
+    let parms = or(b"DecodeParms", b"DP");
+    let (filter, parms) = match or(b"Filter", b"F") {
+        Object::Name(n) => (name(n), settings(parms)),
+        Object::Array(a) => {
+            let mut names = Vec::new();
+            for o in a {
+                let Object::Name(n) = one(o) else {
+                    return Some(Cow::Owned(Stream::new(Dictionary::new(), Vec::new())));
+                };
+                names.push(name(n));
+            }
+            let each: Vec<Object> = match parms {
+                Object::Array(p) => (0..names.len())
+                    .map(|i| p.get(i).map_or(NULL, |o| settings(one(o))))
+                    .collect(),
+                _ => Vec::new(),
+            };
+            match (names.is_empty(), each.iter().all(|o| *o == NULL)) {
+                // lopdf gives nothing for an empty list, Poppler the data.
+                (true, _) => (NULL, NULL),
+                (false, true) => (Object::Array(names), NULL),
+                (false, false) => (Object::Array(names), Object::Array(each)),
+            }
+        }
+        _ => return Some(Cow::Borrowed(s)),
+    };
+    let raw = |k: &[u8]| s.dict.get(k).unwrap_or(&NULL);
+    if *raw(b"Filter") == filter && *raw(b"DecodeParms") == parms {
+        return Some(Cow::Borrowed(s));
+    }
+    let mut d = Dictionary::new();
+    d.set("Filter", filter);
+    d.set("DecodeParms", parms);
+    Some(Cow::Owned(Stream::new(d, s.content.clone())))
+}
+
+/// The full name of a filter Poppler reads by its short name too (`/Fl`).
+fn filter_name(n: &[u8]) -> &[u8] {
+    match n {
+        b"AHx" => b"ASCIIHexDecode",
+        b"A85" => b"ASCII85Decode",
+        b"LZW" => b"LZWDecode",
+        b"RL" => b"RunLengthDecode",
+        b"CCF" => b"CCITTFaxDecode",
+        b"DCT" => b"DCTDecode",
+        b"Fl" => b"FlateDecode",
+        n => n,
+    }
 }
 
 /// The references Poppler may read in drawn data `data`, written in parts that start at
@@ -7139,5 +7224,83 @@ mod tests {
             let why = format!("{steps} {data} {refs}");
             assert_eq!(unread(steps, data, refs), BTreeSet::from([(9, 0)]), "{why}");
         }
+    }
+
+    /// A drawing is decoded as Poppler reads its filters: by their short names, through
+    /// references, from `/F` and `/DP` where `/Filter` and `/DecodeParms` are missing, with
+    /// settings for several filters only from a list; a filter in a list that isn't a name
+    /// leaves nothing, an empty list the data as written. One whose `/Filter` and `/F`, or
+    /// `/DecodeParms` and `/DP`, differ, which pdf.js reads the other way round, is unread.
+    #[test]
+    fn a_drawing_is_decoded_as_poppler_reads_its_filters() {
+        use std::io::Write;
+        let r = |id: u32| Object::Reference((id, 0));
+        let hex = |s: &str| {
+            let hex: String = s.bytes().map(|b| format!("{b:02x}")).collect();
+            format!("{hex}>").into_bytes()
+        };
+        let flate = |data: &[u8]| {
+            let mut z = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+            z.write_all(data).unwrap();
+            z.finish().unwrap()
+        };
+        let mut doc = Document::with_version("1.7");
+        doc.objects.insert((20, 0), Object::Name(b"AHx".to_vec()));
+        doc.objects
+            .insert((21, 0), Object::Name(b"ASCIIHexDecode".to_vec()));
+        doc.objects.insert((22, 0), Object::Integer(12));
+        let (up, direct, wider) = (
+            dictionary! { "Predictor" => r(22), "Columns" => 5 },
+            dictionary! { "Predictor" => 12, "Columns" => 5 },
+            dictionary! { "Predictor" => r(22), "Columns" => 6 },
+        );
+        let names = |n: &[&str]| n.iter().map(|&n| Object::from(n)).collect::<Vec<_>>();
+        let forms = [
+            (dictionary! { "Filter" => "AHx" }, hex("5 0 R")),
+            (dictionary! { "F" => "AHx" }, hex("6 0 R")),
+            (dictionary! { "Filter" => r(20) }, hex("7 0 R")),
+            (dictionary! { "Filter" => vec![r(21)] }, hex("8 0 R")),
+            // Each row of predicted data starts with its predictor, here 2.
+            (
+                dictionary! { "Filter" => "Fl", "DP" => up },
+                flate(b"\x029 0 R"),
+            ),
+            (
+                dictionary! { "Filter" => names(&["FlateDecode"]), "DecodeParms" => direct },
+                flate(b"10 0 R"),
+            ),
+            (
+                dictionary! { "Filter" => vec!["AHx".into(), 1.into()] },
+                b"11 0 R".to_vec(),
+            ),
+            (
+                dictionary! { "Filter" => "ASCIIHexDecode", "F" => "FlateDecode" },
+                hex("12 0 R"),
+            ),
+            (
+                dictionary! { "Filter" => "ASCIIHexDecode", "DecodeParms" => dictionary! {},
+                "DP" => dictionary! { "Predictor" => 1 } },
+                hex("13 0 R"),
+            ),
+            (
+                dictionary! { "Filter" => names(&["FlateDecode"]), "DecodeParms" => vec![wider.into()] },
+                flate(b"\x0214 0 R"),
+            ),
+            (dictionary! { "Filter" => names(&[]) }, b"15 0 R".to_vec()),
+        ];
+        let mut drawn = Vec::new();
+        for (i, (mut d, data)) in forms.into_iter().enumerate() {
+            d.set("Subtype", "Form");
+            let id = (30 + i as u32, 0);
+            doc.objects.insert(id, Object::Stream(Stream::new(d, data)));
+            drawn.push(Object::Reference(id));
+        }
+        doc.objects
+            .insert((1, 0), dictionary! { "X" => drawn }.into());
+        doc.trailer.set("Root", r(1));
+        let all = reached(&doc);
+        let drawn: BTreeSet<u32> = all.drawn.iter().map(|id| id.0).collect();
+        assert_eq!(drawn, (5..=10).chain([14, 15]).collect());
+        assert_eq!(all.unread, BTreeSet::from([(37, 0), (38, 0)]));
     }
 }
