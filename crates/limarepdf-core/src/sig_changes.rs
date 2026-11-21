@@ -1095,47 +1095,64 @@ fn object(lx: &mut Lexer, depth: usize, read: Read) -> Option<Object> {
     Some(match tok {
         Tok::DictOpen => {
             let mut d = Dictionary::new();
-            // Each key once, with its first value as written, and the entries so far.
-            let mut keys: HashMap<Vec<u8>, &[u8]> = HashMap::new();
+            // The keys with their values as written, and the entries so far. A key without a
+            // `#` escape, as most are, is held as written: every open checks every object, and
+            // copying each key made opening a file of large dictionaries slower. The keys are
+            // sorted, each kept once, at the end and whenever they reach `fold_at`, twice as
+            // many as kept then: a key given again and again is held a few times at most.
+            let mut keys: Vec<(Cow<[u8]>, &[u8])> = Vec::new();
+            let mut fold_at = 64;
             let mut entries = 0;
             // A key given again with its value written differently; `/Contents` given again.
             let (mut unlike, mut contents) = (false, false);
             loop {
-                match lx.next()? {
-                    (_, Tok::DictClose, _) => break,
+                let end = match lx.next()? {
+                    (_, Tok::DictClose, _) => true,
                     (_, Tok::Name(k), _) => {
                         let mut from = lx.pos();
                         let v = object(lx, depth + 1, read)?;
-                        let k = decode_name(k)?;
+                        let k = if k.contains(&b'#') {
+                            #[cfg(test)]
+                            tests::KEYS_COPIED.set(tests::KEYS_COPIED.get() + 1);
+                            Cow::Owned(decode_name(k)?)
+                        } else {
+                            Cow::Borrowed(k)
+                        };
                         let bytes = lx.bytes();
                         while is_white(bytes[from]) {
                             from += 1;
                         }
-                        let written = &bytes[from..lx.pos()];
                         entries += 1;
-                        match keys.get(&k) {
-                            Some(&first) => {
-                                unlike |= first != written;
-                                contents |= k == b"Contents";
-                            }
-                            None => {
-                                keys.insert(k.clone(), written);
-                            }
+                        if keep {
+                            d.set(k.to_vec(), v);
                         }
+                        keys.push((k, &bytes[from..lx.pos()]));
                         #[cfg(test)]
                         tests::HELD.set(tests::HELD.get().max(keys.len()));
-                        let refused = match read {
-                            Read::Keep => unlike && entries >= 32,
-                            Read::Check { decrypted } => unlike || (decrypted && contents),
-                        };
-                        if refused {
-                            return None;
-                        }
-                        if keep {
-                            d.set(k, v);
-                        }
+                        false
                     }
                     _ => return None,
+                };
+                if end || keys.len() == fold_at {
+                    // Sorted with their values, a key's values differ only if neighbours do.
+                    keys.sort_unstable();
+                    keys.dedup_by(|again, first| {
+                        let same = again.0 == first.0;
+                        unlike |= same && again.1 != first.1;
+                        contents |= same && first.0[..] == b"Contents"[..];
+                        same
+                    });
+                    fold_at = 2 * keys.len().max(32);
+                    let refused = match read {
+                        Read::Keep => unlike && entries >= 32,
+                        Read::Check { decrypted } => unlike || (decrypted && contents),
+                    };
+                    if refused {
+                        return None;
+                    }
+                }
+                if end {
+                    break;
                 }
             }
             if keep {
@@ -4620,6 +4637,8 @@ mod tests {
         pub(super) static NAMES_COPIED: Cell<usize> = const { Cell::new(0) };
         /// Bytes looked at telling whether a revision ends at a version's end, on this thread.
         pub(super) static SCANNED: Cell<usize> = const { Cell::new(0) };
+        /// Keys a dictionary read (`object`) copied to check them, on this thread.
+        pub(super) static KEYS_COPIED: Cell<usize> = const { Cell::new(0) };
         /// The most keys a dictionary read (`object`) held at once, on this thread.
         pub(super) static HELD: Cell<usize> = const { Cell::new(0) };
     }
@@ -6694,12 +6713,30 @@ mod tests {
         assert!(!skip(&format!("[<< /A {contents} >>]"), true));
     }
 
-    /// A dictionary read holds each key once, however often it is given: it held each entry's
-    /// key to the end, about 50 bytes for each 4 of the file, on every open (round 4's c16).
-    /// One given again written differently stops the read where it is refused: in
-    /// cross-reference information at the 32nd entry, in an object at once.
+    /// Checking a dictionary copies none of its keys written without a `#` escape, as most are:
+    /// every open checks every object, and copying each key twice took a file of large resource
+    /// dictionaries (pdf.js's issue6961.pdf) from 94 to 115 ms to open.
     #[test]
-    fn a_dictionary_read_holds_each_key_once() {
+    fn a_dictionary_check_copies_no_plain_key() {
+        let check = |w: &str| {
+            KEYS_COPIED.set(0);
+            let read = skip_object(&mut Lexer::new(w.as_bytes(), 0), false);
+            (read, KEYS_COPIED.get())
+        };
+        let plain: String = (0..300).map(|i| format!(" /RE{i} {i} 0 R")).collect();
+        assert_eq!(check(&format!("<<{plain} >>")), (true, 0));
+        // A key with an escape is decoded, and is the same key written plainly.
+        assert_eq!(check("<< /A#42 1 /AB 1 >>"), (true, 1));
+        assert_eq!(check("<< /A#42 1 /AB 2 >>"), (false, 1));
+    }
+
+    /// A dictionary read holds a key given again and again a few times at most: it held each
+    /// entry's key to the end, about 50 bytes for each 4 of the file, on every open (round 4's
+    /// c16). The keys are sorted, each kept once, at 64 entries and whenever they double, so
+    /// one given again written differently stops the read there, building or skipping; one
+    /// given again after a sort is still compared.
+    #[test]
+    fn a_dictionary_read_holds_a_key_given_again_a_few_times_at_most() {
         let repeated = |value: &str| format!("<< /K 1{} >>", format!(" /K {value}").repeat(10_000));
         // Whether it reads, and how far.
         let read = |w: &str| {
@@ -6714,11 +6751,16 @@ mod tests {
         let alike = repeated("1");
         assert_eq!(read(&alike), (true, alike.len()));
         assert_eq!(skip(&alike), (true, alike.len()));
-        assert_eq!(HELD.get(), 1);
+        assert_eq!(HELD.get(), 64);
         let unlike = repeated("2");
-        assert_eq!(read(&unlike), (false, "<< /K 1".len() + 31 * " /K 2".len()));
-        assert_eq!(skip(&unlike), (false, "<< /K 1 /K 2".len()));
-        assert_eq!(HELD.get(), 1);
+        let sorted = "<< /K 1".len() + 63 * " /K 2".len();
+        assert_eq!(read(&unlike), (false, sorted));
+        assert_eq!(skip(&unlike), (false, sorted));
+        assert_eq!(HELD.get(), 64);
+        let distinct: String = (0..100).map(|i| format!(" /K{i} 1")).collect();
+        let again = |value: &str| format!("<<{distinct} /K7 {value} >>");
+        assert!(read(&again("1")).0 && skip(&again("1")).0);
+        assert!(!read(&again("2")).0 && !skip(&again("2")).0);
     }
 
     /// Other apps take a stream's data as long as its `/Length`, written in its dictionary or
