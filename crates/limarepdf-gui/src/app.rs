@@ -2825,7 +2825,9 @@ impl App {
             return;
         };
         let mut pdf = Pdf::new();
-        match insert_images(&mut pdf, 0, &data) {
+        // Guarded, as adding them to an open document is (`Tab::edit`): a damaged picture
+        // could panic the decoders.
+        match crate::guard(|| insert_images(&mut pdf, 0, &data)) {
             Ok(()) => {
                 self.add_tab(ctx, pdf, None, None, true);
             }

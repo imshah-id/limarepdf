@@ -1,9 +1,11 @@
 //! A new blank document (NEW-09's stage 1): Insert > Blank document, ☰ > New blank document,
 //! the start screen, the command search and Ctrl+N (⌘N) open an "Untitled" tab of one blank
 //! page on the region's paper. Untouched, it closes without asking, as Word's does; changed,
-//! closing asks, and Save saves it as a new file.
+//! closing asks, and Save saves it as a new file. Make a PDF from images that can't be added
+//! says why and opens nothing.
 
 use super::*;
+use limarepdf_core::import_seam;
 
 fn test_ctx() -> egui::Context {
     let ctx = egui::Context::default();
@@ -101,4 +103,25 @@ fn an_untouched_one_closes_without_asking() {
     assert_eq!(pages_in(&dir.join("new.pdf")), 2, "not saved as a file");
     assert!(app.tabs.is_empty());
     std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A panic adding the pictures (png 0.18.1's on a palette ending partway through a colour)
+/// says why and opens nothing: it closed the app, losing what wasn't saved in other tabs.
+#[test]
+fn make_a_pdf_from_images_survives_a_panic() {
+    let ctx = test_ctx();
+    let mut app = empty_app();
+    let picture = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/images/icon.png");
+    import_seam::panic_here(true);
+    app.new_from_images(&ctx, std::slice::from_ref(&picture));
+    import_seam::panic_here(false);
+    assert!(app.tabs.is_empty(), "a tab opened");
+    let Dialog::Message(title, text) = &app.dialog else {
+        panic!("no message");
+    };
+    assert_eq!(title, "Cannot import images");
+    assert!(text.contains("internal error"), "{text}");
+    app.dialog = Dialog::None;
+    app.new_from_images(&ctx, &[picture]);
+    assert_eq!(app.tabs.len(), 1, "the picture itself didn't open");
 }

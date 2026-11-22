@@ -582,6 +582,8 @@
   opened, and LimarePDF says its list of pages is too complex to rebuild. A damaged form whose fields share one
   list of fields is read through that list once, a widget several fields list going to the first. Before, both
   took time and memory growing with the square of the branches or fields sharing the list, without limit.
+- Make a PDF from images says why and opens nothing when adding a picture fails with an internal error, as Insert
+  images… already did. Before, such an error closed LimarePDF, losing what wasn't saved in other documents.
 
 ### Changed
 

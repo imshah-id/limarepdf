@@ -880,6 +880,8 @@ impl Pdf {
         let mut work = Work::new("adding the pictures", crate::budget::limit(MOST_DECODED));
         let mut rasters = Vec::new();
         for (i, f) in files.iter().enumerate() {
+            #[cfg(any(test, feature = "test-seams"))]
+            import_seam::here();
             rasters.extend(decode(f, &mut work).map_err(|e| {
                 if e.is::<PicturesTooLarge>() {
                     e
@@ -925,6 +927,30 @@ impl Pdf {
         let mut p = Pdf::new();
         p.insert_image_pages(0, files, opts)?;
         Ok(p)
+    }
+}
+
+/// A test seam: adding pictures as pages panics on a thread a test turns it on for, so the
+/// app's tests reach its panic guard (png 0.18.1 panicked on a palette ending partway through a
+/// colour; no file is known to make adding pictures panic since that is refused). Built only
+/// for tests, as [`crate::sync_seam`] is.
+#[cfg(any(test, feature = "test-seams"))]
+pub mod import_seam {
+    use std::cell::Cell;
+
+    thread_local! {
+        static PANICS: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// Make adding pictures as pages panic on this thread, or stop it.
+    pub fn panic_here(on: bool) {
+        PANICS.set(on);
+    }
+
+    pub(super) fn here() {
+        if PANICS.get() {
+            panic!("a test made adding pictures panic");
+        }
     }
 }
 

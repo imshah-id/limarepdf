@@ -1763,7 +1763,9 @@ and CI's "No test seam" steps check the release programs for the variable's name
 for the CLI, `render::panic_seam`: with `LIMAREPDF_TEST_DRAW_PANICS` set, drawing a page panics, so its tests reach
 the CLI's panic guard now that no file is known to make hayro panic. A third, `budget::budget_seam`, gives a
 thread's operations another limit; with `LIMAREPDF_TEST_BUDGET` set (`budget_seam::VAR`), every operation the CLI
-does has that limit, so its tests reach a budget's refusal. Writes of LimarePDF's own files say what happened too (BUG-14): `IdStore::create` and `import` return a
+does has that limit, so its tests reach a budget's refusal. A fourth, `imgs::import_seam`, makes adding pictures
+as pages panic on the thread a test turns it on for, so the app's tests reach the guard around Make a PDF from images
+now that no file is known to make that panic. Writes of LimarePDF's own files say what happened too (BUG-14): `IdStore::create` and `import` return a
 `Stored` (the ID and warnings) once the ID's file is written, so a default that can't be noted, or a sync not
 confirmed, is a warning, never a failure that a second try would repeat; `IdStore::remove` returns its warnings;
 the app's ID window shows them (`Said::Warning`), the CLI prints `warning:` lines and succeeds, and the trust list,
