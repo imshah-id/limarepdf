@@ -35,6 +35,9 @@
 - Exporting the text of a long document, and finding text to redact across it, is faster. Each page was looked up
   by going through the document's list of pages up to it, so the time grew with the square of the pages: the
   command line's `text` took 1.9 s for 1,000 pages, and now takes 0.2 s, reading pages on all cores.
+- Applying redactions and removing hidden information say so in the status bar (**Applying redactions…**,
+  **Removing hidden information…**) as soon as you confirm. Before, the question stayed on screen with nothing
+  moving until the work was done, which on a 120-page document took up to half a second.
 - A shape that sets a clipping path as it is filled or outlined (`W f` or `W S` in the file) clips what is drawn
   after it, as in other readers. Before, it was only filled or outlined, and what it should have hidden showed.
 - Text in a font whose embedded program is OpenType, kept where a Type 1 font's program goes (`/FontFile3`), is

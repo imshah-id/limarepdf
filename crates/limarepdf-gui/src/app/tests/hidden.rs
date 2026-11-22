@@ -41,6 +41,32 @@ fn app_with(ctx: &egui::Context, pdf: Pdf) -> App {
     app
 }
 
+/// PB-163: Remove hidden information, answered, says so in the status bar first; the
+/// removal runs the frame after, with that sign on screen.
+#[test]
+fn removing_hidden_information_shows_a_busy_sign_first() {
+    let ctx = egui::Context::default();
+    let (mut p, _) = make("BT /F1 12 Tf 30 100 Td (Visible text) Tj ET");
+    let title = Some("Walrus".to_string());
+    let info = limarepdf_core::Info {
+        title: title.clone(),
+        ..Default::default()
+    };
+    p.set_info(&info).unwrap();
+    let mut app = app_with(&ctx, p);
+    app.act(&ctx, Act::RemoveHidden);
+    click(&mut app, &ctx, "Remove");
+    let tree = window(&mut app, &ctx, 1400.0, vec![]);
+    let sign = "Removing hidden information…";
+    assert!(status_says(&tree, sign), "no busy sign");
+    let kept = app.tabs[0].pdf.info().title;
+    assert_eq!(kept, title, "removed before its sign");
+    let tree = window(&mut app, &ctx, 1400.0, vec![]);
+    assert_eq!(app.tabs[0].pdf.info().title, None, "not removed");
+    assert!(!status_says(&tree, sign), "the sign stays");
+    assert_eq!(message(&app).0, "Hidden information removed");
+}
+
 #[test]
 fn content_only_a_layer_rule_hides_is_counted_in_the_dialog() {
     let ctx = egui::Context::default();
