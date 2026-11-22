@@ -7170,12 +7170,17 @@ pub(crate) mod tests {
     /// Reading an encrypted file, lopdf cuts each object at the first `endobj` after its
     /// header and reads only what it cut, where other apps read on: a stream's data as long as
     /// its `/Length` past an `endobj` in it, a reference or a stream past a comment holding
-    /// one. Such an object is unsure; one whose first `endobj` ends it isn't.
+    /// one, a dictionary's entries past a string holding one. Such an object is unsure; one
+    /// whose first `endobj` ends it isn't.
     #[test]
     fn an_encrypted_object_lopdf_cuts_at_an_endobj_inside_it_is_unsure() {
         let unsure = object_added_to_an_encrypted_file();
         let content = |o: Option<Object>| o.unwrap().as_stream().unwrap().content.clone();
 
+        // What it cuts of the dictionary doesn't read, so it holds nothing there.
+        let (cut, held) = unsure("<< /A (x endobj y) /B 12 0 R >>");
+        assert!(cut);
+        assert_eq!(held, None);
         let data = "AB\nendstream\nendobj\nCD";
         let (cut, held) = unsure(&format!(
             "<< /Length {} >>\nstream\n{data}\nendstream",

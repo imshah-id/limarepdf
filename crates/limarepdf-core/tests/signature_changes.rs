@@ -2893,6 +2893,10 @@ fn a_stream_framed_otherwise_is_refused() {
     ok.push((real(l), format!("{drawn}\nendstream"), &[]));
     ok.push((real(l), format!("{drawn}\n%{red}\nendstream"), &[]));
     ok.push((real(1), " \nendstream".into(), &changed));
+    // In a file that isn't encrypted, lopdf doesn't cut the object at an `endobj` in its data:
+    // all take the data as long as its `/Length`.
+    let past = format!("{drawn}\nendstream\nendobj\n{red}");
+    ok.push((length(past.len()), format!("{past}\nendstream"), &changed));
     for (i, (entries, body, read)) in ok.iter().enumerate() {
         let ok = by_hand(&b, &[(c, content(entries, body))], &[]);
         assert_eq!(changes(&ok), *read, "{i}");
