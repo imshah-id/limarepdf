@@ -18603,6 +18603,49 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// While a task runs, the inspector's tasks wait for it, Split's too: one started
+    /// alongside it, ending first, would say nothing was running any more (WP-06).
+    #[test]
+    fn the_inspectors_tasks_wait_for_the_one_running() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        theme::install(&ctx);
+        let mut app = App::with(Settings::from_file(None), Recent::from_file(None));
+        pages_tab(&mut app, &ctx, 3);
+        let tasks = [
+            (Section::Ocr, "Recognise"),
+            (Section::Scans, "Optimise"),
+            (Section::Export, "Choose folder…"),
+            (Section::Split, "Choose folder…"),
+        ];
+        // Whether each control called `name` is greyed: the band's Optimise is the
+        // inspector's too.
+        let greyed = |tree: &egui::accesskit::TreeUpdate, name: &str| -> Vec<bool> {
+            (tree.nodes.iter())
+                .filter(|(_, n)| n.label() == Some(name))
+                .map(|(_, n)| n.is_disabled())
+                .collect()
+        };
+        let (go, gate) = channel();
+        app.job_gate = Some(gate);
+        app.act(&ctx, Act::RemoveBlank);
+        assert!(app.busy, "no task running");
+        for (s, name) in tasks {
+            app.reveal(s);
+            let all = greyed(&settle(&mut app, &ctx), name);
+            let waits = !all.is_empty() && !all.contains(&false);
+            assert!(waits, "{s:?}: {name} {all:?}");
+        }
+        go.send(()).unwrap();
+        wait_for(&mut app, &ctx, |a| !a.busy);
+        app.dialog = Dialog::None;
+        for (s, name) in tasks {
+            app.reveal(s);
+            let all = greyed(&settle(&mut app, &ctx), name);
+            assert!(all.contains(&false), "{s:?}: {name} still greyed");
+        }
+    }
+
     /// A fresh folder of its own for test `name`.
     fn test_dir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("limarepdf-app-{}-{name}", std::process::id()));
