@@ -1423,7 +1423,10 @@ fn encryption_lopdf_reads(bytes: &[u8]) -> Option<Vec<u8>> {
     text.push_str("\nendobj\n");
     out.extend_from_slice(text.as_bytes());
     let xref = out.len() - header;
-    let mut text = format!("xref\n{n} 1\n{at:010} {g:05} n\r\ntrailer\n");
+    // Object 0 listed, as other apps' tables list it, or the copy would differ where the file
+    // doesn't (`whole_xref` in `crate::sig_changes`).
+    let mut text =
+        format!("xref\n0 1\n0000000000 65535 f\r\n{n} 1\n{at:010} {g:05} n\r\ntrailer\n");
     crate::repair::write_object(&mut text, &Object::Dictionary(trailer), 0);
     text.push_str(&format!("\nstartxref\n{xref}\n%%EOF\n"));
     out.extend_from_slice(text.as_bytes());
