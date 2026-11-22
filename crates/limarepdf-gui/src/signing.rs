@@ -404,9 +404,8 @@ impl Previews {
             .or_insert_with(|| {
                 let why = |e: &dyn std::fmt::Display| capital(&e.to_string());
                 let bytes = saved.bytes().map_err(|e| why(&e))?;
-                let bmp = saved
-                    .stamp(&bytes, role, color)
-                    .preview("", 2.0)
+                // Guarded: the Create signature window runs outside the tab's guard.
+                let bmp = crate::guard(|| saved.stamp(&bytes, role, color).preview("", 2.0))
                     .map_err(|e| why(&e))?;
                 let img =
                     egui::ColorImage::from_rgba_unmultiplied([bmp.width, bmp.height], &bmp.rgba);
@@ -426,7 +425,8 @@ impl Previews {
             .entry(path.to_path_buf())
             .or_insert_with(|| {
                 let bytes = std::fs::read(path).map_err(|e| capital(&e.to_string()))?;
-                let (w, h, rgba) = limarepdf_core::picture_view(&bytes, VIEW)
+                // Guarded: the Create signature window runs outside the tab's guard.
+                let (w, h, rgba) = crate::guard(|| limarepdf_core::picture_view(&bytes, VIEW))
                     .map_err(|e| capital(&e.to_string()))?;
                 let img = egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &rgba);
                 Ok(ctx.load_texture(format!("sign-view-{n}"), img, TextureOptions::LINEAR))
