@@ -15,6 +15,8 @@
   versions too, new major versions included. A signature made with an RSA key shorter than 1,024 bits, as some
   old signers made, is still checked and flagged as too short to be safe; the new library doesn't read such keys
   by itself, so LimarePDF reads them.
+- The web-address library is updated (`url` 2.5.9), which fixes a crash on a `blob:` address nested in itself
+  (RUSTSEC-2026-0592). LimarePDF doesn't use the part that crashed.
 - A page filled with a pattern repeated at very wide spacing is drawn. Before, drawing it asked for gigabytes of
   memory at once, which on Windows could close the app, and from 150 dpi it failed with an internal error. A
   pattern that would still take gigabytes of memory or hours to draw, at any zoom and wherever it is used (in a
