@@ -38,6 +38,7 @@ mod installed_fonts;
 mod ipp;
 mod labels;
 mod layout;
+mod linearized;
 mod links;
 mod matrix;
 mod merge;
@@ -132,6 +133,8 @@ pub use ids::{
     password_problem, DigitalId, IdList, IdStore, NewId, Stored, UnlockedId, WrongPassword,
     MIN_PASSWORD,
 };
+#[cfg(any(test, feature = "test-seams"))]
+pub use imgs::import_seam;
 pub use imgs::{image_dimensions, picture_preview, ImageImport, PicturesTooLarge};
 pub use labels::{LabelRange, LabelStyle};
 pub use layout::{fallback_faces, fallbacks, set_in, warm_fallbacks, SetIn};

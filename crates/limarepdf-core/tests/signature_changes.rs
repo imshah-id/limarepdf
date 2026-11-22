@@ -437,8 +437,8 @@ fn object_one_in_a_stream(b: &[u8], body: &str, zero: (u8, u32, u16), named: boo
 }
 
 /// A hybrid revision written by hand: object 1 as `body` in a new object stream, listed in
-/// a cross-reference stream that a table names with `/XRefStm`. The table lists a new
-/// number N with `table_n`, rows of type and offset (`f` or `n`), and the stream with
+/// a cross-reference stream that a table names with `/XRefStm`. The table lists object 0, a
+/// new number N with `table_n`, rows of type and offset (`f` or `n`), and the stream with
 /// `stream_n`, rows of type and fields (`/W [1 4 2]`). Returns the file and N.
 fn hybrid_revision(
     b: &[u8],
@@ -486,7 +486,9 @@ fn hybrid_revision(
     out.extend_from_slice(&rows);
     out.extend_from_slice(b"\nendstream\nendobj\n");
     let at_t = out.len();
-    let mut table = format!("xref\n{stm} 2\n{at_stm:010} 00000 n\r\n{at_x:010} 00000 n\r\n");
+    let mut table = format!(
+        "xref\n0 1\n0000000000 65535 f\r\n{stm} 2\n{at_stm:010} 00000 n\r\n{at_x:010} 00000 n\r\n"
+    );
     for &(kind, offset) in table_n {
         table.push_str(&format!("{n} 1\n{offset:010} 00000 {kind}\r\n"));
     }
@@ -925,7 +927,7 @@ fn a_cross_reference_stream_with_narrow_rows_is_refused() {
 
 /// A revision written by hand: object 1 as `body`, listed in a cross-reference stream with
 /// `/W [w[0] w[1] 0]`: type 1 in `w[0]` bytes (none or one) and its offset in `w[1]`. When
-/// `hybrid`, a table lists only that stream and names it with `/XRefStm`.
+/// `hybrid`, a table lists only object 0 and that stream, and names it with `/XRefStm`.
 fn object_one_in_rows(b: &[u8], body: &str, w: [usize; 2], hybrid: bool) -> Vec<u8> {
     let rows = |at_1: u32| {
         assert!(at_1 < 1 << (8 * w[1]));
@@ -940,8 +942,8 @@ fn object_one_in_rows(b: &[u8], body: &str, w: [usize; 2], hybrid: bool) -> Vec<
 /// A revision written by hand: object 1 as `body`, then `more` (number and text), listed in a
 /// cross-reference stream whose dictionary holds `keys` (`/W`, `/Index` and any other) and
 /// whose data `rows` makes from where object 1 and each of `more` start, `tail` written after
-/// the data, before the line end and `endstream`. When `hybrid`, a table lists only that
-/// stream and names it with `/XRefStm`.
+/// the data, before the line end and `endstream`. When `hybrid`, a table lists only object 0
+/// and that stream, and names it with `/XRefStm`.
 fn object_one_listed(
     b: &[u8],
     body: &str,
@@ -980,8 +982,8 @@ fn object_one_listed(
     if hybrid {
         out.extend_from_slice(
             format!(
-                "xref\n{x} 1\n{at_x:010} 00000 n\r\ntrailer\n<< {size} {links} /XRefStm \
-                 {at_x} >>\n"
+                "xref\n0 1\n0000000000 65535 f\r\n{x} 1\n{at_x:010} 00000 n\r\ntrailer\n<< \
+                 {size} {links} /XRefStm {at_x} >>\n"
             )
             .as_bytes(),
         );
@@ -1300,14 +1302,16 @@ fn a_subsection_other_apps_number_from_0_is_refused() {
     assert!(!d.objects.contains_key(&(1, 0)));
     let (p, _, turned) = page_texts(&b);
     let (r, prev, last) = (root(&d), last_startxref(&b), root(&d).0 + 1);
-    // Object 1's entry: as given, or in use for a new object 1 when none is given.
+    // Object 1's entry: as given, or in use for a new object 1 when none is given; with no
+    // `head`, in object 0's subsection.
     let free = Some("0000000000 65535 f\r\n");
     let odd = Some("0000000007 00003 f\r\n");
+    let reused = Some("0000000000 00001 f\r\n");
     for (head, one, mid, refused) in [
         (format!("1 {last}\n"), free, "", true),
         (format!("1 {last}\n"), odd, "", true),
         (format!("1 {last}\n"), None, "", false),
-        (String::new(), Some(""), "2 _\n", false),
+        (String::new(), reused, "2 _\n", false),
         ("1 1\n".into(), free, "2 _\n", false),
     ] {
         let stray = format!("{} 0 obj {turned} endobj\n", p.0);
@@ -1331,12 +1335,19 @@ fn a_subsection_other_apps_number_from_0_is_refused() {
             f.extend_from_slice(&obj[..end]);
             f.push(b'\n');
         }
+        // lopdf's save drops the cross-reference stream it loaded but not its number, which no
+        // section lists and Poppler would scan the file for: listed free.
+        let gaps: String = (last + 1..=d.max_id)
+            .filter(|&num| d.reference_table.get(num).is_none())
+            .map(|num| format!("{num} 1\n0000000000 00001 f\r\n"))
+            .collect();
         let at = f.len();
         let mid = mid.replace('_', &(last - 1).to_string());
+        let zero = if head.is_empty() { 2 } else { 1 };
         f.extend_from_slice(
             format!(
-                "xref\n0 1\n0000000000 65535 f\r\n{head}{one}{mid}{rows}trailer\n<< /Size {} \
-                 /Root {} {} R /Prev {prev} >>\nstartxref\n{at}\n%%EOF\n",
+                "xref\n0 {zero}\n0000000000 65535 f\r\n{head}{one}{mid}{rows}{gaps}trailer\n<< \
+                 /Size {} /Root {} {} R /Prev {prev} >>\nstartxref\n{at}\n%%EOF\n",
                 d.max_id + 1,
                 r.0,
                 r.1
@@ -1521,7 +1532,7 @@ fn behind_a_decoy(b: &[u8], decoy: Decoy, rotate: bool, near: bool) -> (Vec<u8>,
                 );
                 let at = decoy_then(&mut out, format!("/Size {size}/Root {} 0 R/Prev {s}", r.0));
                 out.extend_from_slice(if near { &[b' '; 70][..] } else { b"\n" });
-                let mut table = format!("xref\n{c} 3\n");
+                let mut table = format!("xref\n0 1\n0000000000 65535 f\r\n{c} 3\n");
                 for o in &offsets {
                     table += &format!("{o:010} 00000 n\r\n");
                 }
@@ -1544,8 +1555,9 @@ fn behind_a_decoy(b: &[u8], decoy: Decoy, rotate: bool, near: bool) -> (Vec<u8>,
             let t = out.len();
             out.extend_from_slice(
                 format!(
-                    "xref\n{n} 1\n{x:010} 00000 n\r\ntrailer\n<< /Size {} /Root {} 0 R /Prev \
-                     {prev} /XRefStm {at} >>\nstartxref\n{t}\n%%EOF\n",
+                    "xref\n0 1\n0000000000 65535 f\r\n{n} 1\n{x:010} 00000 n\r\ntrailer\n<< \
+                     /Size {} /Root {} 0 R /Prev {prev} /XRefStm {at} >>\nstartxref\n{t}\n\
+                     %%EOF\n",
                     n + 1,
                     r.0
                 )
@@ -1573,8 +1585,8 @@ fn behind_a_decoy(b: &[u8], decoy: Decoy, rotate: bool, near: bool) -> (Vec<u8>,
             let t = out.len() + 10 + x.to_string().len() + 7;
             out.extend_from_slice(
                 format!(
-                    "startxref\n{x}\n%%EOF\nxref\n0 0\ntrailer\n<< /Size {} /Root {} 0 R /Prev \
-                     {at} >>\nstartxref\n{t}\n%%EOF\n",
+                    "startxref\n{x}\n%%EOF\nxref\n0 1\n0000000000 65535 f\r\ntrailer\n<< /Size \
+                     {} /Root {} 0 R /Prev {at} >>\nstartxref\n{t}\n%%EOF\n",
                     n + 1,
                     r.0
                 )
@@ -1926,8 +1938,11 @@ fn behind_a_stream(b: &[u8], data: Data, route: Route) -> (Vec<u8>, usize) {
     if route == Route::Hybrid {
         start = out.len();
         out.extend_from_slice(
-            format!("xref\n{x} 1\n{at:010} 00000 n\r\ntrailer\n<< {trailer} /XRefStm {at} >>\n")
-                .as_bytes(),
+            format!(
+                "xref\n0 1\n0000000000 65535 f\r\n{x} 1\n{at:010} 00000 n\r\ntrailer\n<< \
+                 {trailer} /XRefStm {at} >>\n"
+            )
+            .as_bytes(),
         );
     }
     out.extend_from_slice(format!("startxref\n{start}\n%%EOF\n").as_bytes());
@@ -1959,8 +1974,8 @@ fn a_dictionary_followed_by_stream_without_a_line_end_is_refused() {
         let xref = out.len();
         out.extend_from_slice(
             format!(
-                "xref\n{} 1\n{at:010} {:05} n \ntrailer\n<< /Size {} /Root {} {} R /Prev {} \
-                 >>\nstartxref\n{xref}\n%%EOF\n",
+                "xref\n0 1\n0000000000 65535 f \n{} 1\n{at:010} {:05} n \ntrailer\n<< /Size {} \
+                 /Root {} {} R /Prev {} >>\nstartxref\n{xref}\n%%EOF\n",
                 p.0,
                 p.1,
                 doc.max_id + 1,
@@ -2356,9 +2371,9 @@ fn by_hand(b: &[u8], objects: &[(u32, Vec<u8>)], compressed: &[(u32, u32, u16)])
     out
 }
 
-/// A revision written by hand with a cross-reference table: `objects`, each listed under its
-/// number where it starts, then `unlisted`, text no entry leads to; `free` listed free; `more`
-/// added to the trailer.
+/// A revision written by hand with a cross-reference table listing object 0: `objects`, each
+/// listed under its number where it starts, then `unlisted`, text no entry leads to; `free`
+/// listed free; `more` added to the trailer.
 fn in_table(
     b: &[u8],
     objects: &[(u32, Vec<u8>)],
@@ -2370,7 +2385,7 @@ fn in_table(
     let r = root(&d);
     let prev = last_startxref(b);
     let mut out = [b, b"\n"].concat();
-    let mut rows = String::new();
+    let mut rows = "0 1\n0000000000 65535 f\r\n".to_string();
     for (n, text) in objects {
         rows.push_str(&format!("{n} 1\n{:010} 00000 n\r\n", out.len()));
         out.extend_from_slice(text);
@@ -2574,7 +2589,7 @@ fn a_dictionary_giving_a_key_twice_is_refused_unless_written_alike() {
             assert!(!differs(&ok), "{entries}, packed {packed}");
         }
     }
-    // A revision listing nothing, whose trailer has `entries` entries, the first `/Root`
+    // A revision listing only object 0, whose trailer has `entries` entries, the first `/Root`
     // naming `first`.
     let r = root(&d);
     let trailer = |entries: usize, first: ObjectId| {
@@ -2583,8 +2598,8 @@ fn a_dictionary_giving_a_key_twice_is_refused_unless_written_alike() {
         let more: String = (4..entries).map(|i| format!(" /E{i} 0")).collect();
         out.extend_from_slice(
             format!(
-                "xref\n0 0\ntrailer\n<< /Size {c} /Prev {}{more} /Root {} {} R /Root {} {} R >>\n\
-                 startxref\n{at}\n%%EOF\n",
+                "xref\n0 1\n0000000000 65535 f\r\ntrailer\n<< /Size {c} /Prev {}{more} /Root {} \
+                 {} R /Root {} {} R >>\nstartxref\n{at}\n%%EOF\n",
                 last_startxref(&b),
                 first.0,
                 first.1,
@@ -2878,6 +2893,10 @@ fn a_stream_framed_otherwise_is_refused() {
     ok.push((real(l), format!("{drawn}\nendstream"), &[]));
     ok.push((real(l), format!("{drawn}\n%{red}\nendstream"), &[]));
     ok.push((real(1), " \nendstream".into(), &changed));
+    // In a file that isn't encrypted, lopdf doesn't cut the object at an `endobj` in its data:
+    // all take the data as long as its `/Length`.
+    let past = format!("{drawn}\nendstream\nendobj\n{red}");
+    ok.push((length(past.len()), format!("{past}\nendstream"), &changed));
     for (i, (entries, body, read)) in ok.iter().enumerate() {
         let ok = by_hand(&b, &[(c, content(entries, body))], &[]);
         assert_eq!(changes(&ok), *read, "{i}");

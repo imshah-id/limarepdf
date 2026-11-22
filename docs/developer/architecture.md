@@ -1616,7 +1616,15 @@ appended revisions' cross-reference sections itself (lopdf corrects bad offsets 
 would hide changes), checks that lopdf reads the same objects (in number order, so a revision with several faults
 always gives the same reason: saving compares the reasons before and after, and one naming another object would
 count as a new change; object 0 aside, which lopdf lists as free after reading a table but not a stream, so a
-table after a stream was refused, `a_table_after_a_cross_reference_stream_changes_nothing_by_itself`), then compares
+table after a stream was refused, `a_table_after_a_cross_reference_stream_changes_nothing_by_itself`), and, in
+`linearized.rs`, that Poppler and pdf.js read a file they take as linearized the same way: both read the
+cross-references from after its first object, pdf.js opens the first page at `/O` and counts `/N` pages, and Poppler
+looks a number the newest table doesn't list up in the main table row by row and takes the pages its hint tables
+give, without what they inherit (a hint stream's `/Length` in another object, and an encrypted file's hint stream,
+read as lopdf holds them when the readings agree on that object); where they may start elsewhere, count or find
+other pages, the file is refused, and an object whose row Poppler reads otherwise is one the readings may disagree
+on (`a_file_read_from_after_its_first_object_differs`, `a_main_table_row_poppler_reads_otherwise_is_unsure`,
+`hinted_pages_must_be_the_page_tree_s`, `an_encrypted_file_s_hint_tables_are_read_decrypted`). It then compares
 each signed version with the next (a later signature's version is one when only
 white space lies between its end and a revision's, either way round: one ending at `%%EOF`, before the end of line
 the revision's end takes in, wasn't, so a change made before it and undone after was missed,
@@ -1755,7 +1763,9 @@ and CI's "No test seam" steps check the release programs for the variable's name
 for the CLI, `render::panic_seam`: with `LIMAREPDF_TEST_DRAW_PANICS` set, drawing a page panics, so its tests reach
 the CLI's panic guard now that no file is known to make hayro panic. A third, `budget::budget_seam`, gives a
 thread's operations another limit; with `LIMAREPDF_TEST_BUDGET` set (`budget_seam::VAR`), every operation the CLI
-does has that limit, so its tests reach a budget's refusal. Writes of LimarePDF's own files say what happened too (BUG-14): `IdStore::create` and `import` return a
+does has that limit, so its tests reach a budget's refusal. A fourth, `imgs::import_seam`, makes adding pictures
+as pages panic on the thread a test turns it on for, so the app's tests reach the guard around Make a PDF from images
+now that no file is known to make that panic. Writes of LimarePDF's own files say what happened too (BUG-14): `IdStore::create` and `import` return a
 `Stored` (the ID and warnings) once the ID's file is written, so a default that can't be noted, or a sync not
 confirmed, is a warning, never a failure that a second try would repeat; `IdStore::remove` returns its warnings;
 the app's ID window shows them (`Said::Warning`), the CLI prints `warning:` lines and succeeds, and the trust list,
