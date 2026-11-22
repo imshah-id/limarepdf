@@ -859,7 +859,7 @@ fn tool_ui(ui: &mut Ui, s: Section, f: &mut Forms, p: &Parts) -> Option<Apply> {
             scan_ui(ui, &mut f.scan_pages, &mut f.scan, p.busy).then_some(Apply::Scans)
         }
         Section::Export => export_ui(ui, &mut f.export, p.busy).then_some(Apply::Export),
-        Section::Split => split_ui(ui, f).then_some(Apply::Split),
+        Section::Split => split_ui(ui, f, p.busy).then_some(Apply::Split),
         Section::Labels => {
             let page = f.label_page;
             label_ui(ui, &mut f.label, page, p.labelled, &mut f.typing)
@@ -868,8 +868,8 @@ fn tool_ui(ui: &mut Ui, s: Section, f: &mut Forms, p: &Parts) -> Option<Apply> {
 }
 
 /// Splitting into files: so many pages to a file, or at the bookmarks down to a level.
-/// Returns true when Choose folder… is pressed.
-fn split_ui(ui: &mut Ui, f: &mut Forms) -> bool {
+/// Returns true when Choose folder… is pressed; while a task runs, it waits for it.
+fn split_ui(ui: &mut Ui, f: &mut Forms, busy: bool) -> bool {
     ui.horizontal(|ui| {
         ui.radio_value(&mut f.split_at_marks, false, "Pages per file");
         let pages = Spin::new(&mut f.split, 1..=100_000).name("Pages per file");
@@ -880,7 +880,8 @@ fn split_ui(ui: &mut Ui, f: &mut Forms) -> bool {
         let levels = Spin::new(&mut f.split_level, 1..=9).name("Bookmark levels");
         ui.add_enabled(f.split_at_marks, levels);
     });
-    ui.button("Choose folder…").clicked()
+    ui.add_enabled(!busy, egui::Button::new("Choose folder…"))
+        .clicked()
 }
 
 /// What the document is: its pages and their paper, how it is protected (as it will be
