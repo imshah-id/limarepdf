@@ -1183,9 +1183,9 @@ fn simple_widths(doc: &Document, dict: &Dictionary) -> Vec<Option<f32>> {
     let (Some(widths), true) = (widths, first >= 0.0 && last >= first) else {
         return out;
     };
-    let count = (last - first) as usize + 1;
+    let count = ((last - first) as usize).saturating_add(1);
     for (i, w) in widths.iter().take(count).enumerate() {
-        let code = first as usize + i;
+        let code = (first as usize).saturating_add(i);
         if let (Some(slot), Ok((_, w))) = (out.get_mut(code), doc.dereference(w)) {
             *slot = w.as_float().ok();
         }
@@ -1890,5 +1890,20 @@ mod tests {
         assert_eq!(fonts[0].refused(), None);
         assert_eq!(fonts[0].code('a'), Ok(vec![b'a']));
         assert_eq!(fonts[0].code('W'), Ok(vec![b'W']));
+    }
+
+    /// A `/LastChar` past any number gives the widths from `/FirstChar` to the end of
+    /// `/Widths` (PB-136). Before, counting them overflowed, which stopped reading the
+    /// line's font.
+    #[test]
+    fn a_last_char_past_any_number_gives_every_width() {
+        let p = walrus(
+            "WinAnsiEncoding".into(),
+            &[("LastChar", Object::Real(1e30))],
+        );
+        let fonts = p.line_fonts(0, 0).unwrap();
+        assert_eq!(fonts[0].refused(), None);
+        assert_eq!(fonts[0].code('W'), Ok(vec![b'W']));
+        assert_eq!(fonts[0].advance('W'), Some(pdf_width('W')));
     }
 }
