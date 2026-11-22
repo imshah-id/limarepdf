@@ -1159,7 +1159,7 @@ fn differences(doc: &Document, e: &Dictionary) -> HashMap<u8, String> {
                 if let Ok(c) = u8::try_from(code) {
                     out.insert(c, String::from_utf8_lossy(n).into_owned());
                 }
-                code += 1;
+                code = code.saturating_add(1);
             }
             _ => {}
         }
@@ -1802,21 +1802,25 @@ mod tests {
         fn close(&mut self) {}
     }
 
-    /// A line's preview font holds the characters the font can write, each drawn as the
-    /// program draws its glyph, at the PDF's width (here 1% more than the program's, which
-    /// the checks allow), and nothing the font has no code for.
-    #[test]
-    fn a_preview_font_draws_the_program_s_glyphs_at_the_pdf_s_widths() {
+    /// A character's width in the PDF: 1% more than the program's, which the checks allow.
+    fn pdf_width(c: char) -> f32 {
+        crate::text_width(&c.to_string(), 1000.0) * 1.01
+    }
+
+    /// A blank page showing "Walrus" in Liberation Sans with `/Encoding` `encoding`, its
+    /// printable ASCII's widths given, with each of `changes` made to the font.
+    fn walrus(encoding: Object, changes: &[(&str, Object)]) -> Pdf {
         let mut p = Pdf::new();
         p.insert_blank(0, 300.0, 200.0).unwrap();
         let program = ("FontFile2", Dictionary::new(), sans());
-        let encoding = Some("WinAnsiEncoding".into());
-        let mut font = simple(&mut p, "TrueType", program, 32, encoding);
-        let pdf_width = |c: char| crate::text_width(&c.to_string(), 1000.0) * 1.01;
+        let mut font = simple(&mut p, "TrueType", program, 32, Some(encoding));
         let widths: Vec<Object> = (32u8..=126).map(|b| pdf_width(b as char).into()).collect();
         font.set("FirstChar", 32);
         font.set("LastChar", 126);
         font.set("Widths", widths);
+        for (key, value) in changes {
+            font.set(*key, value.clone());
+        }
         let font = p.doc.add_object(font);
         let content = b"BT /F1 10 Tf 10 100 Td (Walrus) Tj ET".to_vec();
         let s = p.doc.add_object(Stream::new(Dictionary::new(), content));
@@ -1827,6 +1831,14 @@ mod tests {
             "Resources",
             dictionary! { "Font" => dictionary! { "F1" => font } },
         );
+        p
+    }
+
+    /// A line's preview font holds the characters the font can write, each drawn as the
+    /// program draws its glyph, at the PDF's width, and nothing the font has no code for.
+    #[test]
+    fn a_preview_font_draws_the_program_s_glyphs_at_the_pdf_s_widths() {
+        let p = walrus("WinAnsiEncoding".into(), &[]);
         let fonts = p.line_fonts(0, 0).unwrap();
         let bytes = fonts[0].preview().unwrap();
         let preview = FontRef::new(&bytes).unwrap();
@@ -1855,5 +1867,28 @@ mod tests {
         // One font on lines showing the same codes has one preview.
         let again = p.line_fonts(0, 0).unwrap();
         assert_eq!(fonts[0].preview_key(), again[0].preview_key());
+    }
+
+    /// Names in `/Differences` from a code past any number are at no code, and the names
+    /// after the next number are read as ever (PB-136). Before, the next name's code
+    /// overflowed, which stopped reading the line's font.
+    #[test]
+    fn differences_from_a_code_past_any_number_are_at_no_code() {
+        let name = |n: &str| Object::Name(n.as_bytes().to_vec());
+        let list = vec![
+            Object::Real(1e30),
+            name("a"),
+            name("l"),
+            87.into(),
+            name("W"),
+        ];
+        let encoding = dictionary! {
+            "Type" => "Encoding", "BaseEncoding" => "WinAnsiEncoding", "Differences" => list,
+        };
+        let p = walrus(encoding.into(), &[]);
+        let fonts = p.line_fonts(0, 0).unwrap();
+        assert_eq!(fonts[0].refused(), None);
+        assert_eq!(fonts[0].code('a'), Ok(vec![b'a']));
+        assert_eq!(fonts[0].code('W'), Ok(vec![b'W']));
     }
 }
