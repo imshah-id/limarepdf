@@ -902,7 +902,7 @@ impl Ps {
                         let (a, s) = (int(a), int(b));
                         match s >= 0 {
                             true => a.checked_shl(s.min(63) as u32)? as f64,
-                            false => a.checked_shr((-s).min(63) as u32)? as f64,
+                            false => a.checked_shr(s.unsigned_abs().min(63) as u32)? as f64,
                         }
                     }
                 };
@@ -1147,6 +1147,42 @@ mod tests {
         let f = calc("{ pop pop }", 1);
         assert_eq!(f.eval(&[0.5]), None);
         assert!(Ps::program(b"{ 1 { 2 } }").is_none(), "a block no if takes");
+    }
+
+    /// A calculator's `bitshift` right by more than any whole number shifts right by 63,
+    /// and a page choosing a spot colour whose tint transform does that is read (PB-136).
+    /// Before, negating the shift overflowed, which stopped reading the page.
+    #[test]
+    fn a_calculator_shift_right_past_any_number_shifts_by_63() {
+        let tint = Stream::new(
+            dictionary! {
+                "FunctionType" => 4, "Domain" => vec![0.into(), 1.into()],
+                "Range" => vec![0.into(), 1.into()],
+            },
+            b"{ -1e30 bitshift }".to_vec(),
+        );
+        let mut p = crate::Pdf::new();
+        p.insert_blank(0, 100.0, 100.0).unwrap();
+        let spot: Vec<Object> = vec![
+            "Separation".into(),
+            "Spot".into(),
+            "DeviceGray".into(),
+            p.doc.add_object(tint.clone()).into(),
+        ];
+        let content = b"/CS0 cs 1 scn 10 10 50 50 re f".to_vec();
+        let content = p.doc.add_object(Stream::new(Dictionary::new(), content));
+        let page = p.page_ids()[0];
+        let d = p.doc.get_dictionary_mut(page).unwrap();
+        d.set("Contents", content);
+        d.set(
+            "Resources",
+            dictionary! { "ColorSpace" => dictionary! { "CS0" => spot } },
+        );
+        let objects = p.page_objects(0).unwrap();
+        assert_eq!(objects[0].fill, Some([0.0; 3]), "{objects:?}");
+        let mut doc = Document::with_version("1.7");
+        let f = function(&mut doc, tint.into());
+        assert!(near(&f.eval(&[1.0]).unwrap(), &[0.0]));
     }
 
     /// What running a function takes, as showing a colour is charged it ([`Space::cost`]): a
