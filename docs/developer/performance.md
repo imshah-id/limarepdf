@@ -335,8 +335,8 @@ the rounds differed, both are shown.
 In the app, PB-44's case with `tools/perf/drive.py redact` (one line marked on page 1 of the reference set's
 text-10000.pdf and applied; release build of 875242e, warm, 10 runs after one discarded; set up as in
 [The release check, 12 November 2026](#the-release-check-12-november-2026)): **4,307.4 / 4,798.4 ms built, 4,399.3
-/ 4,892.6 ms shown** (median / worst), from S2-16's 87.9 / 89.5 s and 88.3 / 89.9 s. It is still one frame, with
-no busy sign first (PB-163), so it still fails the 100 ms.
+/ 4,892.6 ms shown** (median / worst), from S2-16's 87.9 / 89.5 s and 88.3 / 89.9 s. It was then still one
+frame, with no busy sign first, so it failed the 100 ms; PB-163, below, added the sign.
 
 Where the time goes, traced with a throwaway test of the tab's steps (not kept; a `ci-test` build, where the
 whole edit took 5.1 s): nearly all of it is core's `apply_redactions`, as redrawing, the copy for undo and
@@ -353,6 +353,23 @@ at every length (one line marked on page 1):
 
 A made-up document's page holds one line, against the reference files' 48, which is why `redact` takes 0.18 s
 there.
+
+PB-163, on 22 November 2026, the same machine and set-up, release builds of 57f60d4 before the change and with it,
+warm, 10 runs after one discarded, at sizes people use: one line marked on page 1 of text-120.pdf and of the render
+corpus's html5checker.pdf (122 pages), and every "document" in html5checker.pdf (`redact html5checker.pdf document`,
+the app's search marking them all). Before, the question stayed on screen until the apply's one frame was done, and
+every case failed the 100 ms. Now the status bar says **Applying redactions…** the frame after the answer, and the
+apply runs once that frame is on screen (median / worst):
+
+| Case | Before: applied (shown) | After: busy sign (shown) | After: applied (built) |
+| --- | --- | --- | --- |
+| text-120.pdf, one line | 114.0 / 117.1 ms | 49.1 / 54.8 ms | 100.7 / 106.2 ms |
+| html5checker.pdf, one line | 172.5 / 179.6 ms | 50.5 / 59.2 ms | 151.9 / 166.2 ms |
+| html5checker.pdf, every "document" | 427.3 / 458.8 ms | 54.4 / 61.8 ms | 386.8 / 404.1 ms |
+
+Remove hidden information shows **Removing hidden information…** the same way. At 10,000 pages (one check run on
+text-10000.pdf) the sign is shown at 62.9 ms, and the window then stands still behind it for the 3.5 s the apply
+takes, as it runs on the window's thread; GitHub issue #130 records that.
 
 ## Reading underlines and strike-throughs
 

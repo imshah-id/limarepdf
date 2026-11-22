@@ -22,7 +22,7 @@ themselves, so they can be checked first, by you or by someone else in another a
 2. Check the marks. They are listed in the Comments view as "Redaction mark". A mark that isn't quite where it
    should be can be moved or resized (below).
 3. Choose **Apply redactions…** in the notice above the pages, or **Protect > Apply redactions…** (or ☰ > Protect >
-   Apply redactions…), and confirm.
+   Apply redactions…), and confirm. The status bar says **Applying redactions…** while it works.
 4. Read the report, then save. Save As (Ctrl+Shift+S) keeps the original as it was.
 
 After marking one area, the Redact tool gives way to the read tool; pin it to mark several areas in a row (see
@@ -160,7 +160,8 @@ A file can carry information that isn't on any page, such as its author's name o
    document carries besides its pages, with how many of each, in two groups: what is removed by default (ticked),
    and what is kept by default (often wanted, so not ticked). Kinds the document has none of are greyed out and
    unticked.
-2. Tick what to remove, and press **Remove**. A summary follows.
+2. Tick what to remove, and press **Remove**. The status bar says **Removing hidden information…** while it works;
+   a summary follows.
 3. Save.
 
 Undo brings it back until you close the document. On the command line: `limarepdf-cli sanitise`.

@@ -77,6 +77,15 @@ fn press_key(app: &mut App, ctx: &egui::Context, key: Key, held: egui::Modifiers
     settle(app, ctx);
 }
 
+/// Click `label` in the open question, then let the removal it answers run, two frames
+/// later, as the window does once its busy sign is shown (PB-163).
+fn click_removing(app: &mut App, ctx: &egui::Context, label: &str) {
+    click(app, ctx, label);
+    for _ in 0..2 {
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| app.remove_now(ui.ctx()));
+    }
+}
+
 /// PF-37: a redaction mark selected with the read tool moves with a drag from inside it,
 /// as other comments do, its area with it, in one Undo step; Undo and Redo take it back
 /// and do it again; Apply then removes what is under it where it now is, not where it was.
@@ -101,7 +110,7 @@ fn a_redaction_mark_moves_with_a_drag() {
     assert!(same(areas(&app)[0], TWO), "Redo: {:?}", areas(&app));
     // Applied, the question answered: "Walrus two" goes, "Walrus one" stays.
     app.act(&ctx, Act::ApplyRedactions);
-    click(&mut app, &ctx, "Apply redactions");
+    click_removing(&mut app, &ctx, "Apply redactions");
     let text = app.tabs[0].pdf.page_text(0);
     assert!(
         app.tabs[0].pdf.redaction_marks().unwrap().is_empty(),
@@ -110,6 +119,26 @@ fn a_redaction_mark_moves_with_a_drag() {
     assert!(text.contains("Walrus one"), "{text:?}");
     assert!(text.contains("Walrus three"), "{text:?}");
     assert!(!text.contains("Walrus two"), "{text:?}");
+}
+
+/// PB-163: Apply redactions, answered, says so in the status bar first; what is under the
+/// marks goes the frame after, with that sign on screen while it is removed.
+#[test]
+fn applying_redactions_shows_a_busy_sign_first() {
+    let ctx = test_ctx();
+    let (mut app, _) = marked(&ctx, &[ONE]);
+    app.act(&ctx, Act::ApplyRedactions);
+    click(&mut app, &ctx, "Apply redactions");
+    let tree = window(&mut app, &ctx, 1400.0, vec![]);
+    let sign = "Applying redactions…";
+    assert!(status_says(&tree, sign), "no busy sign");
+    let text = app.tabs[0].pdf.page_text(0);
+    assert!(text.contains("Walrus one"), "removed early: {text:?}");
+    let tree = window(&mut app, &ctx, 1400.0, vec![]);
+    let text = app.tabs[0].pdf.page_text(0);
+    assert!(!text.contains("Walrus one"), "not removed: {text:?}");
+    assert!(!status_says(&tree, sign), "the sign stays");
+    assert_eq!(message(&app).0, "Redactions applied");
 }
 
 /// A mark with one area resizes by its box's handles, as a rectangle does; its area stays
@@ -459,7 +488,7 @@ fn one_undo_takes_back_applied_redactions() {
     assert!(all.iter().all(|l| was.contains(l)), "{was:?}");
     let before = steps(&app);
     app.act(&ctx, Act::ApplyRedactions);
-    click(&mut app, &ctx, "Apply redactions");
+    click_removing(&mut app, &ctx, "Apply redactions");
     let gone = |app: &App, when: &str| {
         let now = text(app);
         assert!(!now.contains("two"), "{when}: {now:?}");
@@ -538,7 +567,7 @@ fn applying_says_where_an_original_picture_is_still_drawn() {
     });
     let mut app = marked_tab(&ctx, pdf, &[[10.0, 50.0, 60.0, 100.0]]);
     app.act(&ctx, Act::ApplyRedactions);
-    click(&mut app, &ctx, "Apply redactions");
+    click_removing(&mut app, &ctx, "Apply redactions");
     let (title, text) = message(&app);
     assert_eq!(title, "Redactions applied");
     let notice = "An original picture affected by redaction is still drawn elsewhere on page 1 \
@@ -600,7 +629,7 @@ fn applying_what_the_tag_tree_would_keep_changes_nothing() {
     let mut app = marked_tab(&ctx, pdf, &boxes);
     let (was, before) = (app.tabs[0].state(), app.tabs[0].pdf.state_before());
     app.act(&ctx, Act::ApplyRedactions);
-    click(&mut app, &ctx, "Apply redactions");
+    click_removing(&mut app, &ctx, "Apply redactions");
     let t = &mut app.tabs[0];
     let said = t.error.take().unwrap_or_default();
     let why = "removed content may still be in the file, through the tag tree";

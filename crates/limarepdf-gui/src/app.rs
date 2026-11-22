@@ -450,6 +450,27 @@ impl Asked {
     }
 }
 
+/// Apply redactions or Remove hidden information answered (PB-163): run on the window's
+/// thread once the status bar's busy sign for it is on screen ([`App::remove_now`]).
+struct Removing {
+    asked: Asked,
+    /// The kinds of hidden information to remove; none for the redactions.
+    hidden: Option<Vec<limarepdf_core::Hidden>>,
+    /// The frame it was answered in; the next one shows the sign.
+    frame: u64,
+}
+
+impl Removing {
+    /// The busy sign's text, with the frame it was answered in.
+    fn sign(&self) -> (u64, &'static str) {
+        let text = match self.hidden {
+            Some(_) => "Removing hidden information…",
+            None => "Applying redactions…",
+        };
+        (self.frame, text)
+    }
+}
+
 /// Closing a tab, or quitting, with Save chosen for a document (ENH-01): what happens once
 /// its save is done ([`App::close_step`]). A save cancelled, refused or failed, or not
 /// confirmed on disk, leaves the document open with its changes, and closing or quitting
@@ -851,6 +872,8 @@ pub struct App {
     /// The frame in which Paste asked the system for its clipboard, waiting for what it
     /// holds; nothing coming the next frame is said.
     paste_asked: Option<u64>,
+    /// Redactions or hidden information to remove once the busy sign is shown.
+    removing: Option<Removing>,
     /// The Undo and Redo buttons, as last drawn: a click on them leaves the keyboard in
     /// the text box that has it.
     undo_buttons: Vec<egui::Rect>,
@@ -1040,6 +1063,7 @@ impl App {
             copied_pages: None,
             picture_copies: 0,
             paste_asked: None,
+            removing: None,
             undo_buttons: Vec::new(),
             undo_held: false,
             undo_in_box: None,
@@ -4433,6 +4457,39 @@ impl App {
         t.placed(at, t.page_count() - before);
     }
 
+    /// Applies the active tab's redactions, or removes its hidden information `hidden`, once
+    /// the status bar has said so: the work runs on the window's thread, which draws nothing
+    /// meanwhile, and the frame answering the question still shows it (PB-163).
+    fn remove_soon(&mut self, ctx: &egui::Context, hidden: Option<Vec<limarepdf_core::Hidden>>) {
+        self.removing = Some(Removing {
+            asked: self.asked(),
+            hidden,
+            frame: ctx.cumulative_frame_nr(),
+        });
+        ctx.request_repaint();
+    }
+
+    /// Runs the removal answered two frames ago, its busy sign now on screen, on the tab
+    /// still as it was; it waits while a question is open, as what it says would replace it.
+    fn remove_now(&mut self, ctx: &egui::Context) {
+        let now = ctx.cumulative_frame_nr();
+        let free = matches!(self.dialog, Dialog::None);
+        let Some(r) = self.removing.take_if(|r| free && r.frame + 1 < now) else {
+            if self.removing.is_some() {
+                ctx.request_repaint();
+            }
+            return;
+        };
+        timing::mark("removal start", String::new);
+        if self.still(&r.asked) {
+            match &r.hidden {
+                Some(what) => self.remove_hidden(ctx, what),
+                None => self.apply_redactions(ctx),
+            }
+        }
+        timing::mark("removal end", String::new);
+    }
+
     /// Removes everything under the active tab's redaction marks, once its recovery copies
     /// are withdrawn (recovery design, section 4).
     fn apply_redactions(&mut self, ctx: &egui::Context) {
@@ -5504,7 +5561,7 @@ impl App {
             ) {
                 Outcome::Apply => {
                     if self.still(asked) {
-                        self.apply_redactions(ctx);
+                        self.remove_soon(ctx, None);
                     }
                     done = true;
                 }
@@ -5573,7 +5630,7 @@ impl App {
                         .map(|(h, _, _)| *h)
                         .collect();
                     if self.still(asked) {
-                        self.remove_hidden(ctx, &what);
+                        self.remove_soon(ctx, Some(what));
                     }
                     done = true;
                 }
@@ -7714,6 +7771,7 @@ impl eframe::App for App {
         // them (BUG-42).
         crate::present::set(frame);
         self.poll_loads(&ctx);
+        self.remove_now(&ctx);
         // Interface text the interface's own fonts can't draw (Chinese, Japanese, Korean,
         // emoji) in installed fonts, found on another thread at start (ENH-33).
         crate::typing_fonts::interface_fallback(&ctx);
@@ -8191,6 +8249,7 @@ impl eframe::App for App {
                 regions::name(ui, Region::Status);
                 let t = self.tabs.get(self.active);
                 let busy = self.busy_sign();
+                let removing = self.removing.as_ref().map(Removing::sign);
                 let quitting = self.quit_sign();
                 let muted = theme::muted(ui.visuals().dark_mode);
                 let small = |text: &str| egui::RichText::new(text).size(12.0).color(muted);
@@ -8226,6 +8285,12 @@ impl eframe::App for App {
                         ui.add(egui::Spinner::new().size(12.0));
                         said.push(text.clone());
                         timing::once("save shown", || n.to_string());
+                    }
+                    // The busy sign while redactions or hidden information are removed.
+                    if let Some((n, text)) = removing {
+                        ui.add(egui::Spinner::new().size(12.0));
+                        said.push(text.into());
+                        timing::once("removal shown", || n.to_string());
                     }
                     ui.label(small(&said.join(" · ")));
                 };
@@ -18037,6 +18102,13 @@ mod tests {
         tree.nodes
             .iter()
             .any(|(_, n)| n.value().is_some_and(|v| v.starts_with(text)))
+    }
+
+    /// Whether the status bar says `text`, among what else it says.
+    fn status_says(tree: &egui::accesskit::TreeUpdate, text: &str) -> bool {
+        tree.nodes
+            .iter()
+            .any(|(_, n)| n.value().is_some_and(|v| v.split(" · ").any(|s| s == text)))
     }
 
     /// A notice's Undo takes back its own change only: after a page is deleted in one

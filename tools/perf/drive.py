@@ -27,7 +27,10 @@ Modes:
                          page 1 deleted, undone and redone
   edits                  PB-43 on artwork.pdf, each edit in a launch of its own: a shape nudged with the
                          arrow key, a picture placed, a redaction applied
-  redact                 PB-44: a redaction applied on text-10000.pdf
+  redact FILE [WORD]     PB-44 and PB-163: a line of FILE's first page marked for redaction and applied, timed
+                         to the busy sign and to the applied frame; with WORD, WORD searched for and every
+                         match marked with Mark all for redaction instead. FILE is text-120.pdf or
+                         text-10000.pdf, or html5checker.pdf from the render corpus
   select FILE            PB-52: the first line clicked in Edit text, on a corpus file (issue2618.pdf,
                          issue2956.pdf)
   ideograph              PB-61: 中 typed into a new Add text box set in Times, on letter.pdf
@@ -36,11 +39,11 @@ Modes:
                          p:SECONDS wait   s:NAME
 
 The documents come from --set (target/tmp/perf/refset; make it with `crates/limarepdf-core/tools/measure.py
---refset`); select's from the render corpus (tools/fetch-render-samples.sh). Each mode's run makes a folder
-in --out (target/tmp/perf) named for it and the time, with result.json and summary.txt; each launch is a new
-app there with settings, state and data folders of its own (light theme, recovery copies off) and copies of
-the documents it changes. One Xvfb serves a mode's runs: 1600 x 1000, 24-bit, no window manager; the window
-is 1200 x 850 at scale 1, at 0,0 (the points below are window pixels).
+--refset`); select's and html5checker.pdf from the render corpus (tools/fetch-render-samples.sh). Each mode's
+run makes a folder in --out (target/tmp/perf) named for it and the time, with result.json and summary.txt; each
+launch is a new app there with settings, state and data folders of its own (light theme, recovery copies off)
+and copies of the documents it changes. One Xvfb serves a mode's runs: 1600 x 1000, 24-bit, no window manager;
+the window is 1200 x 850 at scale 1, at 0,0 (the points below are window pixels).
 
 Warm: --runs N (10) after one discarded. --cold: N (5), the page cache dropped before each launch, which
 needs root: run `sudo -v` first (this runs `sudo -n`). --check: one run, a picture of the window after
@@ -100,6 +103,7 @@ AT = {
     "mark redaction": (113, 108),
     "apply redactions": (266, 108),
     "apply button": (653, 547),
+    "mark all": (124, 267),
     "close notice": (952, 170),
     "thumbnail 1": (94, 240),
     "recent 1": (447, 531),
@@ -117,7 +121,8 @@ AT = {
     "issue2956.pdf": (453, 269),
 }
 # Redaction marks dragged out, from one corner to the other.
-MARK = {"artwork": ((300, 300), (420, 360)), "text-10000": ((280, 400), (500, 422))}
+MARK = {"artwork": ((300, 300), (420, 360)), "text-10000": ((280, 400), (500, 422)),
+        "text-120": ((270, 408), (760, 425)), "html5checker": ((395, 383), (700, 399))}
 # The areas pictured, as x, y, width, height.
 AREA = {
     "view": (185, 135, 790, 690),
@@ -1204,34 +1209,62 @@ def edits(s, res):
         res.gate(f"{edit} (shown)", "worst", 100, "shown")
 
 
-def redact(s, res):
+def redact(s, res, name, word=None):
+    path = s.opts.set / name
+    if not path.is_file():
+        path = CORPUS / "pdfjs" / name
+    if path.stem not in MARK:
+        raise Failed(f"redact takes text-120.pdf, text-10000.pdf or html5checker.pdf, not {name}")
+    if not path.is_file():
+        raise Failed(f"no {path}: make the set, or run tools/fetch-render-samples.sh first")
     for counted in s.runs():
         res.begin(counted)
-        app = App(s, [s.doc("text-10000.pdf", copy=True)], AREA["view"])
+        app = App(s, [s.doc(str(path), copy=True)], AREA["status"])
         try:
             app.wait(lambda: app.log.find("page drawn"), "page 1 drawn", 120)
             app.settle()
-            # With this notice and the unapplied mark's both up, the app draws without end: closed first.
-            app.step("close notice")
-            app.step("protect tab")
-            app.step("mark redaction")
-            app.drag(*MARK["text-10000"])
-            app.settle()
+            if path.stem == "text-10000":
+                # With this notice and the unapplied mark's both up, the app draws without end: closed first.
+                app.step("close notice")
+            if word:
+                app.step("ctrl+f")
+                start = len(app.log.lines)
+                last = app.type(word, 0.05)
+                app.wait(lambda: app.log.find("search end", start, last), "the search's end", 120)
+                app.settle()
+                app.step("mark all")
+                app.step("protect tab")
+            else:
+                app.step("protect tab")
+                app.step("mark redaction")
+                app.drag(*MARK[path.stem])
+                app.settle()
             app.picture("marked")
             app.step("apply redactions")
             before = app.memory()
+            began = len(app.log.lines)
             r = app.click(*AT["apply button"], timeout=600)
+            end = app.wait(lambda: app.log.find("removal end", began), "the removal's end", 600)
             app.settle(1.5, 600)
             after = app.memory()
             app.caps.stop()
             app.picture("applied")
-            res.add("apply (built)", app.built(r))
-            res.add("apply (shown)", app.shown(r))
+            sign = app.log.find("removal shown", began)
+            frame = lambda i: app.log.at(app.log.frame_end(i))
+            if sign is not None:
+                res.add("to the busy sign (built)", (frame(sign) - r["sent"]) / 1000)
+                seen = app.caps.changed(frame(sign))
+                res.add("to the busy sign (shown)", None if seen is None else (seen - r["sent"]) / 1000)
+            else:
+                res.notes.append("  an apply showed no busy sign")
+            res.add("to the applied frame (built)", (frame(end) - r["sent"]) / 1000)
+            res.add("removing", (app.log.at(end) - app.log.at(app.log.find("removal start", began))) / 1000)
             res.samples[-1].update(before=before, after=after)
             res.captures(app)
         finally:
             app.close()
-    res.gate("apply (shown)", "worst", 100, "shown")
+    res.gate("to the busy sign (built)", "worst", 100, "built")
+    res.gate("to the busy sign (shown)", "worst", 100, "shown")
 
 
 def select(s, res, name):
@@ -1326,7 +1359,7 @@ def explore(s, res, name, *steps):
 MODES = {
     "startup": (startup, 1), "typing": (typing, 1), "search": (search, 1), "working": (working, 1),
     "print": (print_dialog, 0), "save": (save, 1), "memory": (memory, 0), "pages": (pages, 0),
-    "edits": (edits, 0), "redact": (redact, 0), "select": (select, 1), "ideograph": (ideograph, 0),
+    "edits": (edits, 0), "redact": (redact, (1, 2)), "select": (select, 1), "ideograph": (ideograph, 0),
     "try": (explore, None),
 }
 CHOICES = {"typing": ("field", "text", "line", "paragraph"), "search": ("120", "300"),
@@ -1364,15 +1397,17 @@ def main(argv):
     # The app starts in its launch's folder: paths given relative to this one wouldn't reach it.
     opts.bin, opts.set, opts.out = opts.bin.resolve(), opts.set.resolve(), opts.out.resolve()
     run, count = MODES[opts.mode]
-    if count is not None and len(opts.args) != count:
-        p.error(f"{opts.mode} takes {count} argument{'s' if count != 1 else ''}")
+    counts = count if isinstance(count, tuple) else (count,)
+    if count is not None and len(opts.args) not in counts:
+        p.error(f"{opts.mode} takes {' or '.join(map(str, counts))} argument{'s' if counts != (1,) else ''}")
     if opts.mode in CHOICES and opts.args[0] not in CHOICES[opts.mode]:
         p.error(f"{opts.mode} takes one of {', '.join(CHOICES[opts.mode])}")
     if not opts.bin.is_file():
         p.error(f"no app at {opts.bin}: build it (cargo build --release) or name it with --bin")
     X11.XInitThreads()
     X11.XSetErrorHandler(IGNORE)
-    name = "-".join([opts.mode, *(Path(a).stem for a in opts.args[:1])] + (["cold"] if opts.cold else [])
+    named = opts.args[:2 if opts.mode == "redact" else 1]
+    name = "-".join([opts.mode, *(Path(a).stem for a in named)] + (["cold"] if opts.cold else [])
                     + (["check"] if opts.check else []))
     about = setup(opts)
     s = Session(opts, name)

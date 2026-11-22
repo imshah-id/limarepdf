@@ -57,7 +57,7 @@ unicode-script = "0.5.8"
 # The addresses new links are written with (links.rs): a web address typed in other alphabets
 # put in the ASCII form a link holds (IDNA, percent-encoding). Already in the tree through
 # other crates.
-url = "2.5.8"
+url = "2.5.9"
 # Spelling (spelling.rs): checking words and suggesting others with Hunspell dictionaries, the
 # bundled ones and those added. Pure Rust; MPL-2.0, used unmodified.
 spellbook = "0.4.2"
