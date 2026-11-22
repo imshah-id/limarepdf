@@ -275,6 +275,9 @@
   app's guard against internal errors. Should reading one fail that way, the window shows the error where the
   picture would be, and the watermark shows no preview, rather than LimarePDF closing or the tab being marked
   broken.
+- Split into files' Choose folder… in the inspector now waits, greyed, while another task runs, as Export pages as
+  images' does. A split started alongside a task such as Recognise text, ending first, took the busy sign away
+  while that task still ran, so editing could start again and the task's result was then discarded.
 - A fax picture stating more than 131,072 pixels across, and more than 16 million in all, is now left out of the
   page as it is shown, printed as a picture or read with OCR, with the page's notice, rather than making
   LimarePDF ask for memory for every pixel; a blank fax row takes a bit however wide it is, so its data can't
