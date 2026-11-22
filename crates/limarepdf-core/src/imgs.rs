@@ -201,7 +201,7 @@ fn header(bytes: &[u8]) -> Result<(u32, u32, Orientation)> {
                 .into_dimensions()
                 .map_err(|e| anyhow!("cannot decode the image: {e}"))?;
             let o = if fmt == image::ImageFormat::Png {
-                png_meta(bytes).1
+                png_meta(bytes)?.1
             } else {
                 Orientation::NoTransforms
             };
@@ -568,6 +568,12 @@ fn jpeg_info(b: &[u8]) -> Option<JpegInfo> {
 }
 
 fn decode_other(bytes: &[u8], fmt: image::ImageFormat) -> Result<Raster> {
+    // Read first, so a palette png panics on is refused before it's decoded.
+    let (dpi, orientation) = if fmt == image::ImageFormat::Png {
+        png_meta(bytes)?
+    } else {
+        (None, Orientation::NoTransforms)
+    };
     let img = image::load_from_memory_with_format(bytes, fmt)
         .map_err(|e| anyhow!("cannot decode the image: {e}"))?;
     let (w, h) = (img.width(), img.height());
@@ -584,11 +590,6 @@ fn decode_other(bytes: &[u8], fmt: image::ImageFormat) -> Result<Raster> {
     } else {
         (img.to_rgb8().into_raw(), None)
     };
-    let (dpi, orientation) = if fmt == image::ImageFormat::Png {
-        png_meta(bytes)
-    } else {
-        (None, Orientation::NoTransforms)
-    };
     Ok(Raster {
         w,
         h,
@@ -603,9 +604,12 @@ fn decode_other(bytes: &[u8], fmt: image::ImageFormat) -> Result<Raster> {
     })
 }
 
-/// Resolution (pHYs) and orientation (eXIf) chunks of a PNG file.
-fn png_meta(b: &[u8]) -> (Option<(f32, f32)>, Orientation) {
+/// Resolution (pHYs) and orientation (eXIf) chunks of a PNG file, those before its pixels. A
+/// PNG of palette colours whose palette ends partway through a colour is refused as damaged,
+/// as libpng refuses it: png 0.18.1 panics decoding it (PB-11's list).
+fn png_meta(b: &[u8]) -> Result<(Option<(f32, f32)>, Orientation)> {
     let (mut dpi, mut orientation) = (None, Orientation::NoTransforms);
+    let (mut indexed, mut pixels) = (false, false);
     let mut i = 8;
     while let Some(head) = b.get(i..i + 8) {
         let len = u32::from_be_bytes([head[0], head[1], head[2], head[3]]) as usize;
@@ -613,23 +617,29 @@ fn png_meta(b: &[u8]) -> (Option<(f32, f32)>, Orientation) {
             break;
         };
         match &head[4..8] {
-            b"pHYs" if len >= 9 && data[8] == 1 => {
+            b"IHDR" if len >= 10 => indexed = data[9] == 3,
+            // Past the pixels too: png reads a palette there.
+            b"PLTE" if indexed && !len.is_multiple_of(3) => {
+                bail!("the PNG is damaged: its palette ends partway through a colour")
+            }
+            b"pHYs" if !pixels && len >= 9 && data[8] == 1 => {
                 let ppm = |k: usize| {
                     u32::from_be_bytes([data[k], data[k + 1], data[k + 2], data[k + 3]]) as f32
                 };
                 dpi = Some((ppm(0) * 0.0254, ppm(4) * 0.0254));
             }
-            b"eXIf" => {
+            b"eXIf" if !pixels => {
                 if let Some(o) = Orientation::from_exif_chunk(data) {
                     orientation = o;
                 }
             }
-            b"IDAT" | b"IEND" => break,
+            b"IDAT" => pixels = true,
+            b"IEND" => break,
             _ => {}
         }
         i += 12 + len;
     }
-    (dpi, orientation)
+    Ok((dpi, orientation))
 }
 
 /// A TIFF's pages: every one, each charged to `work` by its decoded size before it is
@@ -1058,5 +1068,38 @@ pub(crate) mod tests {
             );
         });
         assert_eq!(n, 0);
+    }
+
+    /// A 1 × 1 indexed PNG whose palette is `palette`'s bytes, however many.
+    fn indexed_png(palette: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut e = png::Encoder::new(&mut out, 1, 1);
+        e.set_color(png::ColorType::Indexed);
+        e.set_depth(png::BitDepth::Eight);
+        e.set_palette(palette);
+        let mut w = e.write_header().unwrap();
+        w.write_image_data(&[0]).unwrap();
+        w.finish().unwrap();
+        out
+    }
+
+    /// An indexed PNG whose palette ends partway through a colour is refused as damaged
+    /// wherever a picture is read, as libpng refuses it: png 0.18.1 panicked decoding it (the
+    /// fuzzer's `images` target).
+    #[test]
+    fn a_png_whose_palette_ends_partway_through_a_colour_is_refused() {
+        Pdf::from_images(&[indexed_png(&[0, 0, 0])], &ImageImport::default()).unwrap();
+        for palette in [&[0, 0, 0, 255][..], &[0, 0, 0, 255, 255]] {
+            let cut = indexed_png(palette);
+            let damaged = |r: Result<()>| {
+                let e = format!("{:#}", r.unwrap_err());
+                assert!(e.contains("the PNG is damaged"), "{e}");
+            };
+            damaged(picture_preview(&cut, 100).map(drop));
+            damaged(crate::sign::picture_view(&cut, 100).map(drop));
+            damaged(Pdf::new().add_upright_image(&cut).map(drop));
+            damaged(image_dimensions(&cut).map(drop));
+            damaged(Pdf::from_images(&[cut], &ImageImport::default()).map(drop));
+        }
     }
 }

@@ -584,6 +584,9 @@
   took time and memory growing with the square of the branches or fields sharing the list, without limit.
 - Make a PDF from images says why and opens nothing when adding a picture fails with an internal error, as Insert
   images… already did. Before, such an error closed LimarePDF, losing what wasn't saved in other documents.
+- A damaged PNG whose palette of colours ends partway through a colour is refused, saying it is damaged, wherever
+  a picture is read, as libpng (which many apps read PNGs with) refuses it. Before, the PNG library LimarePDF uses
+  failed on it with an internal error, which closed LimarePDF when making a PDF from images.
 
 ### Changed
 

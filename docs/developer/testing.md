@@ -310,7 +310,12 @@ that drawing asked for more memory than there is and ended the app. PB-173 is fi
 without the guess, and clippy.toml refuses lopdf's page list elsewhere; `repair.rs`'s three page-list count tests,
 failing first). Run again on that fix (b5203a5, the same limits): all ten found nothing, `open` (6,787 inputs),
 `readers` (6,001), `content` (332,076), `draw` (224,269), `images` (311,167), `verify` (35,259), `signature`
-(76,802), `trustfiles` (1,990,202), `pkcs12` (2,104,583) and `ipp` (6,110,994).
+(76,802), `trustfiles` (1,990,202), `pkcs12` (2,104,583) and `ipp` (6,110,994). Run by hand on PR #129 (b8267c1,
+the same limits): `images` found a PNG of palette colours whose palette ends partway through a colour after about
+258,000 inputs (3 minutes). png 0.18.1 panics decoding it, and Make a PDF from images closed the app (PB-11's list).
+It is refused as damaged (`imgs.rs`'s `a_png_whose_palette_ends_partway_through_a_colour_is_refused`, failing first
+on png's panic), and Make a PDF from images runs guarded (`new_document.rs`, above, failing first); the other nine
+found nothing.
 
 The desktop app's startup and responsiveness figures in
 [Performance](performance.md#startup-and-responsiveness) (REL-07) come from the app's
