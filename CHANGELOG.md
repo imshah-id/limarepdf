@@ -267,6 +267,14 @@
 - Some damaged or made-up files no longer fail with an internal error while LimarePDF reads or draws them: a Lab
   colour space with its ranges out of order or not numbers (now drawn with the usual ranges), and an inline
   picture stating a size too large to count.
+- Some damaged or made-up files no longer fail with an internal error while LimarePDF reads, draws or edits a
+  page: a font whose `/Differences`, `/LastChar` or, in a Type 3 font, `/FirstChar` holds a number past any
+  character code (the font is read with the codes and widths it does give), and a spot colour whose calculator
+  shifts by a number too large to count.
+- The pictures shown in the Create signature window, and the watermark's picture preview, are read under the
+  app's guard against internal errors. Should reading one fail that way, the window shows the error where the
+  picture would be, and the watermark shows no preview, rather than LimarePDF closing or the tab being marked
+  broken.
 - A fax picture stating more than 131,072 pixels across, and more than 16 million in all, is now left out of the
   page as it is shown, printed as a picture or read with OCR, with the page's notice, rather than making
   LimarePDF ask for memory for every pixel; a blank fax row takes a bit however wide it is, so its data can't

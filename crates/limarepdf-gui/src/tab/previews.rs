@@ -156,9 +156,11 @@ impl Tab {
                 return;
             };
             if self.wm_picture.as_ref().map(|(p, _)| p) != Some(&path) {
+                // Guarded itself: a picture that can't be read is no preview, not a broken tab.
+                let read = |b: Vec<u8>| limarepdf_core::picture_preview(&b, PREVIEW_MAX);
                 let texture = std::fs::read(&path)
                     .ok()
-                    .and_then(|b| limarepdf_core::picture_preview(&b, PREVIEW_MAX).ok())
+                    .and_then(|b| crate::guard(|| read(b)).ok())
                     .map(|(w, h, px)| {
                         let size = [w as usize, h as usize];
                         let img = egui::ColorImage::from_rgba_unmultiplied(size, &px);

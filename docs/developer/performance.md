@@ -371,6 +371,10 @@ Remove hidden information shows **Removing hidden information…** the same way.
 text-10000.pdf) the sign is shown at 62.9 ms, and the window then stands still behind it for the 3.5 s the apply
 takes, as it runs on the window's thread; GitHub issue #130 records that.
 
+On the command line, the whole command, opening and saving included (a release build the same day, six runs
+each), took about 9 ms on text-120.pdf and 28 ms on html5checker.pdf for `limarepdf-cli sanitise`, and 0.54 s and
+0.47 s for `limarepdf-cli redact --text document`.
+
 ## Reading underlines and strike-throughs
 
 Batch 46's stage 4a (NEW-07) reads other apps' underlines and strike-throughs whenever a page's objects are read

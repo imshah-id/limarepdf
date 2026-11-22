@@ -1011,7 +1011,7 @@ impl<'a> FontCtx<'a> {
         if d <= 0.0 {
             return 1.0;
         }
-        let codes = (self.first..).zip(&self.widths);
+        let codes = (self.first..=u32::MAX).zip(&self.widths);
         let mut ems: Vec<f32> = Vec::new();
         let mut widths: Vec<f32> = Vec::new();
         for (code, &w) in codes.filter(|(_, w)| **w > 0.0 && w.is_finite()) {
@@ -1291,7 +1291,7 @@ impl<'a> FontCtx<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use lopdf::dictionary;
+    use lopdf::{dictionary, Stream};
 
     /// A Type 0 font whose descendant has `/W` `w` and `/DW` 500.
     fn widths(w: Vec<Object>) -> (Document, Dictionary) {
@@ -1342,6 +1342,39 @@ mod tests {
         assert_eq!(ctx.width(u32::MAX, 4), 500.0);
         assert!(ctx.wmap.len() <= MAX_CID as usize + 1, "{}", ctx.wmap.len());
         assert!(ctx.wmap.keys().all(|&c| c <= MAX_CID));
+    }
+
+    /// A page showing a Type 3 font whose `/FirstChar` is the highest code there can be is
+    /// read, the font measured by its one width there (PB-136). Before, counting codes from
+    /// it overflowed, which stopped reading the page.
+    #[test]
+    fn a_type3_font_from_the_highest_code_is_read() {
+        let mut p = crate::Pdf::new();
+        p.insert_blank(0, 200.0, 100.0).unwrap();
+        let glyph = b"300 0 d0 0 0 300 600 re f".to_vec();
+        let glyph = p.doc.add_object(Stream::new(Dictionary::new(), glyph));
+        let nums = |v: &[f32]| v.iter().map(|&x| Object::Real(x)).collect::<Vec<_>>();
+        let font = p.doc.add_object(dictionary! {
+            "Type" => "Font", "Subtype" => "Type3",
+            "FontBBox" => nums(&[0.0, 0.0, 300.0, 600.0]),
+            "FontMatrix" => nums(&[0.001, 0.0, 0.0, 0.001, 0.0, 0.0]),
+            "CharProcs" => dictionary! { "g" => glyph },
+            "Encoding" => dictionary! {
+                "Type" => "Encoding", "Differences" => vec![97.into(), Object::Name(b"g".to_vec())],
+            },
+            "FirstChar" => u32::MAX, "LastChar" => u32::MAX, "Widths" => vec![300.into()],
+        });
+        let content = b"BT /T3 20 Tf 10 10 Td (a) Tj ET".to_vec();
+        let content = p.doc.add_object(Stream::new(Dictionary::new(), content));
+        let page = p.page_ids()[0];
+        let d = p.doc.get_dictionary_mut(page).unwrap();
+        d.set("Contents", content);
+        d.set(
+            "Resources",
+            dictionary! { "Font" => dictionary! { "T3" => font } },
+        );
+        let objects = p.page_objects(0).unwrap();
+        assert!(objects.iter().any(|o| o.text.is_some()), "{objects:?}");
     }
 
     /// Text is written back in a font of the file as ASCII only where codes mean their ASCII
