@@ -315,7 +315,9 @@ the same limits): `images` found a PNG of palette colours whose palette ends par
 258,000 inputs (3 minutes). png 0.18.1 panics decoding it, and Make a PDF from images closed the app (PB-11's list).
 It is refused as damaged (`imgs.rs`'s `a_png_whose_palette_ends_partway_through_a_colour_is_refused`, failing first
 on png's panic), and Make a PDF from images runs guarded (`new_document.rs`, above, failing first); the other nine
-found nothing.
+found nothing. Run again on that fix (5b9ee3e, the same limits): all ten found nothing, `open` (10,911 inputs),
+`readers` (3,161), `content` (239,984), `draw` (122,752), `images` (205,476), `verify` (2,018), `signature`
+(63,023), `trustfiles` (1,365,368), `pkcs12` (2,036,564) and `ipp` (6,834,155).
 
 The desktop app's startup and responsiveness figures in
 [Performance](performance.md#startup-and-responsiveness) (REL-07) come from the app's
