@@ -626,6 +626,17 @@ refuses as malformed:
   long string, or for stream data it can't frame), it reads the oldest section last, doesn't find that number there
   either, and scans the whole file for objects, as for a reference to a missing object (below). A signed file whose
   own sections are like this shows *can't check*;
+- a file other apps take as linearized (its first object a linearization dictionary whose `/L` is the file's
+  length) that they may read otherwise than LimarePDF: Poppler and pdf.js then read the cross-references from just
+  after that first object rather than from the end of the file and count the `/N` pages it gives, pdf.js opens the
+  first page at the object `/O` names, and Poppler, when the newest section is a table, looks a number that section
+  doesn't list up in the main table, 20 bytes a row from `/T`, and, when its hint tables read cleanly, takes each
+  page at the object they give, without the page size, crop, rotation or resources it inherits. So such a file is
+  refused when they may start reading elsewhere (or its first object doesn't end in its first 1,024 bytes), count
+  other pages, open another first page, take other pages from the hint tables or pages inheriting any of those, or
+  read the hint tables, or a number in that dictionary, otherwise; and with bytes before the header, when `/L` is
+  its length counted from either, as their offsets may count from another place. An object whose main-table row
+  Poppler reads otherwise is refused where it is used. A signed file that is like this shows *can't check*;
 - an object whose cross-reference entry points into the signed part, outside its own revision, or at another
   object (the published "shadow" attacks that re-point objects at content hidden in the signed file);
 - an object that can't be read, or that LimarePDF and its PDF library read differently;

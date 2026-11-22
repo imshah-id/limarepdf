@@ -551,6 +551,21 @@
   differently from LimarePDF is refused for every signature before it. A later signature signing a part of the
   file that isn't one of its versions is refused too. Before, a change other apps show, signed by a second
   signature LimarePDF couldn't check and then undone, left the first signature valid with only allowed changes.
+- Checking a signed document refuses, as a malformed addition, a number below the size that no cross-reference
+  section lists when the newest section is a table: Poppler, looking such a number up (as it does for a long
+  string, or for stream data it can't frame), reads every older section, doesn't find it, and scans the whole
+  file for objects, taking the last copy of each it finds. A signed file whose own sections are like this shows
+  *can't check*. Before, a copy of a page that no section listed could show in Poppler while LimarePDF called the
+  signature valid.
+- Checking a signed document refuses, as a malformed addition, a file other PDF apps take as linearized (its first
+  object a linearization dictionary giving the file's length) when they may read it otherwise than LimarePDF.
+  Poppler and pdf.js read such a file's cross-references from just after its first object rather than from its
+  end and count the pages that dictionary gives, pdf.js opens the first page at the object it names, and Poppler
+  looks a number the newest table doesn't list up in the main table, row by row, and may take the pages from the
+  file's hint tables, without what they inherit from the page tree. An object whose row Poppler reads otherwise is
+  refused where it is used, and a signed file that is like this shows *can't check*. Before, a change after
+  signing that brought the file to that length could show another page, or another first page, in Poppler and
+  pdf.js while LimarePDF called the signature valid.
 - Reading a form's fields has a limit, as reading pages and comments does: a form whose fields hold more (their
   names, values and options taking tens of megabytes, as no real form's do) is read only that far. Listing shows
   the fields read. Flatten form, Reset form, removing form values with Remove hidden information, redaction,
