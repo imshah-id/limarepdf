@@ -1616,7 +1616,15 @@ appended revisions' cross-reference sections itself (lopdf corrects bad offsets 
 would hide changes), checks that lopdf reads the same objects (in number order, so a revision with several faults
 always gives the same reason: saving compares the reasons before and after, and one naming another object would
 count as a new change; object 0 aside, which lopdf lists as free after reading a table but not a stream, so a
-table after a stream was refused, `a_table_after_a_cross_reference_stream_changes_nothing_by_itself`), then compares
+table after a stream was refused, `a_table_after_a_cross_reference_stream_changes_nothing_by_itself`), and, in
+`linearized.rs`, that Poppler and pdf.js read a file they take as linearized the same way: both read the
+cross-references from after its first object, pdf.js opens the first page at `/O` and counts `/N` pages, and Poppler
+looks a number the newest table doesn't list up in the main table row by row and takes the pages its hint tables
+give, without what they inherit (a hint stream's `/Length` in another object, and an encrypted file's hint stream,
+read as lopdf holds them when the readings agree on that object); where they may start elsewhere, count or find
+other pages, the file is refused, and an object whose row Poppler reads otherwise is one the readings may disagree
+on (`a_file_read_from_after_its_first_object_differs`, `a_main_table_row_poppler_reads_otherwise_is_unsure`,
+`hinted_pages_must_be_the_page_tree_s`, `an_encrypted_file_s_hint_tables_are_read_decrypted`). It then compares
 each signed version with the next (a later signature's version is one when only
 white space lies between its end and a revision's, either way round: one ending at `%%EOF`, before the end of line
 the revision's end takes in, wasn't, so a change made before it and undone after was missed,

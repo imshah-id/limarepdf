@@ -18,6 +18,7 @@
 
 use crate::budget;
 use crate::forms;
+use crate::linearized;
 use crate::sig_verify::{
     is_delim, is_white, too_many_versions, FieldLock, Lexer, Permissions, Tok, Versions,
 };
@@ -475,7 +476,7 @@ const MAX_SECTIONS: usize = 2000;
 const MAX_XREF_STREAM: usize = 64 << 20;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Entry {
+pub(crate) enum Entry {
     Free,
     InUse { offset: usize, gen: u16 },
     Compressed { container: u32, index: u32 },
@@ -650,7 +651,7 @@ fn decoded_alike(read: &ReadSection, at: usize) -> Result<(), String> {
 /// rebuild the cross-reference information by scanning the file, finding objects no
 /// section lists. lopdf reads neither indirect parameters nor the abbreviated keys some
 /// apps take for `/Filter` and `/DecodeParms`. Other filters aren't relied on.
-fn decodes_alike(s: &Stream, limit: usize) -> bool {
+pub(crate) fn decodes_alike(s: &Stream, limit: usize) -> bool {
     let d = &s.dict;
     if [&b"F"[..], b"DP", b"FFilter", b"FDecodeParms"]
         .into_iter()
@@ -763,7 +764,7 @@ fn malformed(at: usize) -> String {
     format!("the cross-reference section at byte {at} is malformed")
 }
 
-fn skipped(num: u32) -> String {
+pub(crate) fn skipped(num: u32) -> String {
     format!(
         "no cross-reference section lists object {num}, and some look for it and then scan the \
          file for objects instead"
@@ -848,7 +849,7 @@ fn lopdf_header(b: &[u8]) -> bool {
     header(b).is_some()
 }
 
-fn word_num<T: std::str::FromStr>(t: Option<(usize, Tok, usize)>) -> Option<T> {
+pub(crate) fn word_num<T: std::str::FromStr>(t: Option<(usize, Tok, usize)>) -> Option<T> {
     match t? {
         (_, Tok::Word(w), _) if w.iter().all(u8::is_ascii_digit) => {
             std::str::from_utf8(w).ok()?.parse().ok()
@@ -1066,7 +1067,7 @@ fn revision_end(bytes: &[u8], after: usize, at: usize) -> Option<usize> {
 
 /// One direct object, enough for cross-reference dictionaries: numbers, names (with
 /// `#xx` escapes), references, arrays, dictionaries. Strings are kept empty.
-fn read_object(lx: &mut Lexer, depth: usize) -> Option<Object> {
+pub(crate) fn read_object(lx: &mut Lexer, depth: usize) -> Option<Object> {
     object(lx, depth, Read::Keep)
 }
 
@@ -1242,7 +1243,7 @@ fn number(w: &[u8]) -> Option<Object> {
 
 /// A name's bytes: lopdf reads `#` and two hexadecimal digits as one byte and ends the name
 /// at any other `#`, where Poppler and pdf.js keep it, so such a name doesn't read alike.
-fn decode_name(n: &[u8]) -> Option<Vec<u8>> {
+pub(crate) fn decode_name(n: &[u8]) -> Option<Vec<u8>> {
     let mut out = Vec::with_capacity(n.len());
     let mut i = 0;
     while i < n.len() {
@@ -1267,7 +1268,7 @@ fn header_at(bytes: &[u8], offset: usize, id: ObjectId) -> bool {
 }
 
 /// The object whose header (`N G obj`) starts at `offset`, perhaps after white space.
-fn header_id(bytes: &[u8], offset: usize) -> Option<ObjectId> {
+pub(crate) fn header_id(bytes: &[u8], offset: usize) -> Option<ObjectId> {
     header(bytes, offset).map(|(id, _)| id)
 }
 
@@ -1475,7 +1476,7 @@ pub(crate) fn check_appended(
 // ---------------------------------------------------------------- the whole file
 
 /// The largest decoded object stream read when comparing readings (bytes).
-const MAX_OBJECT_STREAM: usize = 256 << 20;
+pub(crate) const MAX_OBJECT_STREAM: usize = 256 << 20;
 
 /// How lopdf's reading of a file differs from that of a reader following the PDF
 /// specification (Acrobat, pdfium, poppler). lopdf takes every object an object stream
@@ -1497,9 +1498,9 @@ pub(crate) struct Reading {
     /// their place, so its reading no longer uses them, while other apps' does.
     pub(crate) lengths: HashSet<ObjectId>,
     /// The entry each object number has for other apps.
-    spec: HashMap<u32, Entry>,
+    pub(crate) spec: HashMap<u32, Entry>,
     /// Whether the newest cross-reference section is a table (a hybrid one too).
-    table: bool,
+    pub(crate) table: bool,
 }
 
 impl Reading {
@@ -1533,16 +1534,24 @@ impl Reading {
 pub(crate) fn compare_reading(bytes: &[u8], doc: &Document) -> Result<Reading, String> {
     // lopdf reads from the header on, and its offsets count from there.
     let start = bytes.windows(5).position(|w| w == b"%PDF-").unwrap_or(0);
+    let lin = linearized::params(bytes, start)?;
     let bytes = &bytes[start..];
     let pointer = last_startxref(bytes);
+    let at = pointer.unwrap_or(doc.xref_start);
+    lin.starts_alike(bytes, at)?;
     let WholeXref {
         spec,
         deleted,
         trailer,
         table: newest_table,
         skipped: skipped_num,
-    } = whole_xref(bytes, pointer.unwrap_or(doc.xref_start))?;
-    if let Some(num) = skipped_num {
+        newest,
+        size_lo,
+        size_hi,
+    } = whole_xref(bytes, at)?;
+    // Poppler looks such a number up in a linearized file's main table instead (below).
+    let t_mode = lin.t_mode(newest_table);
+    if let Some(num) = skipped_num.filter(|_| !t_mode) {
         return Err(skipped(num));
     }
     // lopdf must take the newest trailer too: its catalog, and its encryption dictionary,
@@ -1828,6 +1837,9 @@ pub(crate) fn compare_reading(bytes: &[u8], doc: &Document) -> Result<Reading, S
             }
         }
     }
+    if t_mode {
+        lin.main_rows(bytes, &spec, &newest, size_lo, &mut unsure);
+    }
     // Other apps may read none of the objects an object stream holds as lopdf does when they
     // may read the stream otherwise.
     let streams: Vec<u32> = (listed_in.keys())
@@ -1841,14 +1853,17 @@ pub(crate) fn compare_reading(bytes: &[u8], doc: &Document) -> Result<Reading, S
     if encrypt_num.is_some_and(|n| unsure.contains(&n)) {
         return Err("they may decrypt it with another encryption dictionary".into());
     }
-    Ok(Reading {
+    let encrypted = trailer.has(b"Encrypt");
+    let mut reading = Reading {
         hidden,
         unsure,
         ends_cleanly: pointer.is_some(),
         lengths,
         spec,
         table: newest_table,
-    })
+    };
+    lin.check(bytes, doc, &mut reading, size_lo..size_hi, encrypted)?;
+    Ok(reading)
 }
 
 /// Whether `o` holds a string, at any depth.
@@ -1960,6 +1975,22 @@ struct WholeXref {
     table: bool,
     /// The number Poppler looks up past every section, when it does: see [`whole_xref`].
     skipped: Option<u32>,
+    /// The numbers the newest section lists, with its `/XRefStm`'s.
+    newest: HashSet<u32>,
+    /// Poppler's size as it reads the newest section: the larger of the newest trailer's
+    /// `/Size`, its `/XRefStm`'s, and the highest number they list plus 1.
+    size_lo: u64,
+    /// The largest size Poppler may grow to reading older sections: also each one's highest
+    /// number plus 1, and each cross-reference stream's `/Size`.
+    size_hi: u64,
+}
+
+/// A trailer's or cross-reference stream's `/Size`, or 0.
+fn trailer_size(d: &Dictionary) -> u64 {
+    match d.get(b"Size") {
+        Ok(&Object::Integer(n)) => u64::try_from(n).unwrap_or(0),
+        _ => 0,
+    }
 }
 
 /// The cross-reference entry each object number has for a reader following the
@@ -1985,19 +2016,23 @@ fn whole_xref(bytes: &[u8], mut at: usize) -> Result<WholeXref, String> {
     // size: the newest trailer's, made larger for any number listed past it.
     let (mut younger, mut last) = (HashSet::new(), HashSet::new());
     let mut size = 0u64;
+    let mut newest = HashSet::new();
+    let (mut size_lo, mut size_hi) = (0u64, 0u64);
     loop {
         if !seen.insert(at) || seen.len() > MAX_SECTIONS {
             return Err("its chain of revisions loops or is too long".into());
         }
         let read = read_section(bytes, at)?;
         decoded_alike(&read, at)?;
-        if seen.len() == 1 {
+        let first = seen.len() == 1;
+        if first {
             newest_has_room(&read, at)?;
-            if let Ok(&Object::Integer(n)) = read.trailer.get(b"Size") {
-                size = u64::try_from(n).unwrap_or(0);
-            }
+            size = trailer_size(&read.trailer);
+            size_lo = size;
             trailer = read.trailer;
             table = read.kind == SectionKind::Table;
+        } else if read.kind == SectionKind::Stream {
+            size_hi = size_hi.max(trailer_size(&read.trailer));
         }
         let mut entries = read.entries;
         if let Some(stm) = read.xref_stm {
@@ -2006,12 +2041,21 @@ fn whole_xref(bytes: &[u8], mut at: usize) -> Result<WholeXref, String> {
                 return Err("a hybrid revision's stream isn't a cross-reference stream".into());
             }
             decoded_alike(&extra, stm)?;
+            size_hi = size_hi.max(trailer_size(&extra.trailer));
+            if first {
+                size_lo = size_lo.max(trailer_size(&extra.trailer));
+            }
             entries.extend(extra.entries);
         }
         younger.extend(last.drain());
         for (num, e) in entries {
             last.insert(num);
             size = size.max(u64::from(num) + 1);
+            size_hi = size_hi.max(u64::from(num) + 1);
+            if first {
+                newest.insert(num);
+                size_lo = size_lo.max(u64::from(num) + 1);
+            }
             if *spec.entry(num).or_insert(e) == Entry::Free && e != Entry::Free {
                 deleted.entry(num).or_insert(e);
             }
@@ -2029,6 +2073,9 @@ fn whole_xref(bytes: &[u8], mut at: usize) -> Result<WholeXref, String> {
                     trailer,
                     table,
                     skipped,
+                    newest,
+                    size_lo,
+                    size_hi: size_hi.max(size_lo),
                 });
             }
         }
@@ -4651,7 +4698,7 @@ fn sign_seen(f: &FieldInfo, new_visible: Option<bool>) -> Seen {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::budget::budget_seam;
     use crate::forms::FieldKind;
@@ -7255,7 +7302,7 @@ mod tests {
 
     /// Encrypts `d`, which has no `/ID` yet, with the Identity crypt filter, which leaves strings
     /// and data as they are. The encryption dictionary.
-    fn encrypt_with_identity(d: &mut Document) -> ObjectId {
+    pub(crate) fn encrypt_with_identity(d: &mut Document) -> ObjectId {
         use lopdf::encryption::crypt_filters::CryptFilter;
         let id = Object::String(vec![7; 16], lopdf::StringFormat::Hexadecimal);
         d.trailer.set("ID", vec![id.clone(), id]);

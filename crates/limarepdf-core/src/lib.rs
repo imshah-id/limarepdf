@@ -38,6 +38,7 @@ mod installed_fonts;
 mod ipp;
 mod labels;
 mod layout;
+mod linearized;
 mod links;
 mod matrix;
 mod merge;
