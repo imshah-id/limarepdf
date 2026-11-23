@@ -768,6 +768,9 @@ const SPLIT_JOB: &str = "Split into files";
 /// Title of Replace all's review and messages (NEW-04b).
 const REPLACE_ALL: &str = "Replace all";
 
+/// Said when something is pasted while a task is under way.
+const PASTE_WAITS: &str = "Paste waits until the task under way finishes";
+
 /// Ends what a job wrote, printed or failed with when its tab was closed meanwhile (PB-87).
 fn closed_meanwhile(name: &str) -> String {
     format!("(This was for \"{name}\", which was closed while it ran.)")
@@ -4723,10 +4726,15 @@ impl App {
     /// ([`Tab::insert_at`]), in one step, selected (PF-48): pages cut in it move; pages cut
     /// in another tab are added, then taken out of their own, as text cut in one document
     /// and pasted in another moves; pages copied are added, each time. Pages with form
-    /// fields are asked about first, as Append PDFs asks.
+    /// fields are asked about first, as Append PDFs asks. Like the band's Paste, it waits
+    /// for the task under way.
     fn paste_pages(&mut self, ctx: &egui::Context) {
         let i = self.active;
         let t = &mut self.tabs[i];
+        if self.busy {
+            t.info = Some(PASTE_WAITS.into());
+            return;
+        }
         if t.has_cut() {
             if let Some(said) = t.paste_pages(ctx) {
                 t.info = Some(said.into());
@@ -6389,7 +6397,7 @@ impl App {
             if t.organising() {
                 t.info = Some("To paste the picture, go back to the page view first".into());
             } else if busy {
-                t.info = Some("Paste waits until the task under way finishes".into());
+                t.info = Some(PASTE_WAITS.into());
             } else {
                 // The clipboard holds one thing: a picture copied after pages replaces them.
                 self.let_go_of_pages();

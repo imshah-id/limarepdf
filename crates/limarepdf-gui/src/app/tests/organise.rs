@@ -1450,6 +1450,35 @@ fn cross_check_typing_moved_with_its_page_with_poppler() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Ctrl+V waits for the task under way to paste pages, as the band's Paste (greyed then) and
+/// a picture pasted do: nothing is pasted or taken out, and it says why. Once the task has
+/// ended, Ctrl+V moves them.
+#[test]
+fn ctrl_v_pastes_pages_once_the_task_under_way_ends() {
+    let ctx = test_ctx();
+    let ty = Typist::new(&ctx);
+    let mut app = grid_tab(&ctx, 3);
+    app.tabs[0].ed.selection = Selection::pages_from([0].into());
+    copied_by(&mut app, &ctx, vec![egui::Event::Cut]);
+    text_tab(&mut app, &ctx, &["Otter one", "Otter two"]);
+    let (go, gate) = channel();
+    app.job_gate = Some(gate);
+    app.act(&ctx, Act::RemoveBlank);
+    assert!(app.busy, "no task under way");
+    paste_keys(&mut app, &ty);
+    assert_eq!(app.tabs[1].page_count(), 2, "pasted while the task ran");
+    let said = toast(&app).expect("nothing said");
+    let waits = "Paste waits until the task under way finishes";
+    assert!(said.contains(waits), "{said}");
+    assert_eq!(app.tabs[0].cut_pages().len(), 1, "no longer cut");
+    go.send(()).unwrap();
+    wait_for(&mut app, &ctx, |a| !a.busy);
+    app.dialog = Dialog::None;
+    paste_keys(&mut app, &ty);
+    assert_eq!(app.tabs[1].page_count(), 3, "not pasted once it ended");
+    assert_eq!(app.tabs[0].page_count(), 2, "not taken out");
+}
+
 /// A click between cards puts the insertion bar there, as a slide sorter's, letting go of
 /// the pages selected: the place new pages go. Insert blank page puts its page there, the
 /// size of the page before, selected, and the bar goes. A click before the first card puts
