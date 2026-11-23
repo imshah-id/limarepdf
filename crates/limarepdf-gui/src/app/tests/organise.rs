@@ -1530,6 +1530,79 @@ fn pages_asked_about_are_not_pasted_once_their_tab_is_read_again() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Pages "Seal one" and "Seal two" sharing their resources, the first drawing a form that
+/// can't be read, the second a form only it draws: the second can be copied out, but not
+/// removed, as the form that can't be read may draw what it drew.
+fn removal_refused() -> Pdf {
+    use lopdf::{dictionary, Object, Stream};
+    let mut p = Pdf::new();
+    for i in 0..2 {
+        p.insert_blank(i, 612.0, 792.0).unwrap();
+    }
+    let font = p.doc.add_object(dictionary! {
+        "Type" => "Font", "Subtype" => "Type1", "BaseFont" => "Helvetica",
+        "Encoding" => "WinAnsiEncoding",
+    });
+    let bbox = || Object::Array(vec![0.into(), 0.into(), 100.into(), 20.into()]);
+    let bad = p.doc.add_object(Stream::new(
+        dictionary! {
+            "Type" => "XObject", "Subtype" => "Form", "BBox" => bbox(),
+            "Filter" => "JBIG2Decode",
+        },
+        b"not a drawing".to_vec(),
+    ));
+    let own = p.doc.add_object(Stream::new(
+        dictionary! {
+            "Type" => "XObject", "Subtype" => "Form", "BBox" => bbox(),
+            "Resources" => dictionary! { "Font" => dictionary! { "F1" => font } },
+        },
+        b"BT /F1 8 Tf 2 5 Td (Seal form) Tj ET".to_vec(),
+    ));
+    let res = p.doc.add_object(dictionary! {
+        "Font" => dictionary! { "F1" => font },
+        "XObject" => dictionary! { "Bad" => bad, "Own" => own },
+    });
+    let contents = [
+        "q /Bad Do Q BT /F1 20 Tf 72 692 Td (Seal one) Tj ET",
+        "q /Own Do Q BT /F1 20 Tf 72 692 Td (Seal two) Tj ET",
+    ];
+    for (page, content) in p.page_ids().into_iter().zip(contents) {
+        let content = Stream::new(dictionary! {}, content.into());
+        let c = p.doc.add_object(content);
+        let page = p.doc.get_dictionary_mut(page).unwrap();
+        page.set("Resources", res);
+        page.set("Contents", c);
+    }
+    p
+}
+
+/// Pages cut in one tab and pasted in another that can't be taken out of their own are
+/// copied, and the paste says so and why, rather than leaving them in both unsaid.
+#[test]
+fn pages_cut_that_cant_be_taken_out_are_copied_and_it_says_why() {
+    let ctx = test_ctx();
+    let ty = Typist::new(&ctx);
+    let mut app = App::with(Settings::from_file(None), Recent::from_file(None));
+    let seal = removal_refused();
+    assert!(seal.extract(&[1]).is_ok(), "can't be copied out");
+    assert!(seal.clone().delete_pages(&[1]).is_err(), "can be taken out");
+    assert!(app.add_tab(&ctx, seal, None, None, false));
+    app.tabs[0].ed.selection = Selection::pages_from([1].into());
+    copied_by(&mut app, &ctx, vec![egui::Event::Cut]);
+    text_tab(&mut app, &ctx, &["Otter one"]);
+    paste_keys(&mut app, &ty);
+    let otter = &app.tabs[1];
+    assert_eq!(otter.page_count(), 2, "not pasted");
+    let text = otter.pdf.page_text(1);
+    assert!(text.contains("Seal two"), "not the page cut: {text:?}");
+    let said = toast(&app).expect("nothing said");
+    assert!(said.contains("Pasted a copy"), "{said}");
+    assert!(said.contains("couldn't be read"), "not why: {said}");
+    let seal = &app.tabs[0];
+    assert_eq!(seal.page_count(), 2, "taken out");
+    assert!(seal.cut_pages().is_empty(), "still cut");
+}
+
 /// A click between cards puts the insertion bar there, as a slide sorter's, letting go of
 /// the pages selected: the place new pages go. Insert blank page puts its page there, the
 /// size of the page before, selected, and the bar goes. A click before the first card puts

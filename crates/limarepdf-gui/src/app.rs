@@ -4803,7 +4803,8 @@ impl App {
 
     /// Takes pages cut in one tab out of it once they are pasted in another (PF-48), in
     /// one step there. When they are all its pages it keeps them, as a document needs at
-    /// least one: the paste was a copy, and the tab in front says so.
+    /// least one: the paste was a copy, and the tab in front says so; and so when they
+    /// can't be taken out, with why.
     fn take_out_cut(&mut self, ctx: &egui::Context, from: Option<CutFrom>) {
         let Some(from) = from else {
             return;
@@ -4825,8 +4826,17 @@ impl App {
             ));
             return;
         }
-        if !pages.is_empty() && src.arrange(ctx, &[], |p| p.delete_pages(&pages)) {
+        if pages.is_empty() {
+            return;
+        }
+        if src.arrange(ctx, &[], |p| p.delete_pages(&pages)) {
             self.status = format!("Moved {} from “{name}”.", pages_said(pages.len()));
+        } else {
+            // Said where the pages went, not in their tab, behind.
+            let why = src.error.take().unwrap_or_default();
+            self.tabs[self.active].info = Some(format!(
+                "Pasted a copy: the pages couldn't be taken out of “{name}”: {why}"
+            ));
         }
     }
 
