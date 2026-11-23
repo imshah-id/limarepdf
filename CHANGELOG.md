@@ -609,6 +609,12 @@
 - A damaged PNG whose palette of colours ends partway through a colour is refused, saying it is damaged, wherever
   a picture is read, as libpng (which many apps read PNGs with) refuses it. Before, the PNG library LimarePDF uses
   failed on it with an internal error, which closed LimarePDF when making a PDF from images.
+- A `limarepdf-cli` command whose output stops being read, as `limarepdf-cli remove-blank in.pdf -o out.pdf | head`
+  stops reading it, leaves out the rest of what it prints, runs to its end and exits with its own status. Before,
+  it stopped at the next line it printed with status 0: `remove-blank` and `optimize-scans`, which list what they
+  did before saving, saved nothing, and `save-images` said nothing of pictures it couldn't save.
+- `limarepdf-cli verify --signed-version` with `--require-trusted` is refused (status 2), writing nothing. Before,
+  `--require-trusted` was ignored there: the signed version was saved with status 0, trusted or not.
 
 ### Changed
 
