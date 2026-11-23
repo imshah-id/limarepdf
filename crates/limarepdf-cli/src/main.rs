@@ -1,11 +1,11 @@
 use anyhow::{anyhow, bail, Context, Result};
 
-/// println! that returns from the function when the output can't be written: see [`unwritten`].
+/// println! that returns from the function when the output can't be written, and writes nothing
+/// once its reader has gone: see [`report`].
 macro_rules! out {
-    ($($t:tt)*) => {{
-        use std::io::Write;
-        writeln!(std::io::stdout(), $($t)*).map_err(unwritten)?;
-    }};
+    ($($t:tt)*) => {
+        report(format_args!($($t)*))?
+    };
 }
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use limarepdf_core::{display_line, DigitalId, IdStore, NewId, SignPlace, SignRequest};
@@ -3011,18 +3011,10 @@ fn saved<T>(r: Result<T>) -> Result<T> {
     r
 }
 
-/// The reader of the output went away, as with `limarepdf-cli text file.pdf | head`: the
-/// command stops quietly, with the status it would have had otherwise (decision D5).
-#[derive(Debug)]
-struct Closed;
-
-impl std::fmt::Display for Closed {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        f.write_str("the output was closed")
-    }
-}
-
-impl std::error::Error for Closed {}
+/// Set once the reader of the output went away, as with `limarepdf-cli text file.pdf | head`:
+/// the rest of the report is skipped, and the command runs to its end, saving what it would
+/// have saved, with the status it would have had (decision D5, PB-203).
+static CLOSED: AtomicBool = AtomicBool::new(false);
 
 /// The output couldn't be written for another reason, such as a full disk.
 #[derive(Debug)]
@@ -3036,12 +3028,24 @@ impl std::fmt::Display for Unwritten {
 
 impl std::error::Error for Unwritten {}
 
-/// The error for output that couldn't be written (audit R15).
-fn unwritten(e: std::io::Error) -> anyhow::Error {
-    if e.kind() == std::io::ErrorKind::BrokenPipe {
-        Closed.into()
-    } else {
-        Unwritten(e).into()
+/// Writes `line` to the output, for [`out!`], unless its reader has gone.
+fn report(line: std::fmt::Arguments) -> Result<()> {
+    use std::io::Write;
+    if CLOSED.load(Ordering::Relaxed) {
+        return Ok(());
+    }
+    written(writeln!(std::io::stdout(), "{line}"))
+}
+
+/// `r`, a write to the output: a reader that went away is noted ([`CLOSED`]); any other
+/// failure is an error (audit R15).
+fn written(r: std::io::Result<()>) -> Result<()> {
+    match r {
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {
+            CLOSED.store(true, Ordering::Relaxed);
+            Ok(())
+        }
+        r => r.map_err(|e| Unwritten(e).into()),
     }
 }
 
@@ -3056,14 +3060,11 @@ fn main() -> Result<()> {
     }
     let done = guard(|| run(cli.cmd)).and_then(|()| {
         use std::io::Write;
-        std::io::stdout().flush().map_err(unwritten)
+        written(std::io::stdout().flush())
     });
     let Err(e) = done else {
         return Ok(());
     };
-    if e.is::<Closed>() {
-        return Ok(());
-    }
     // The file is in place, so never "nothing was written" (decision D7).
     if let Some(n) = e.downcast_ref::<limarepdf_core::NotConfirmed>() {
         return Err(anyhow!(
@@ -3731,21 +3732,13 @@ fn run(cmd: Cmd) -> Result<()> {
                 }
                 return Ok(());
             }
-            let shown = (|| -> Result<()> {
-                if json {
-                    out!("{}", serde_json::to_string_pretty(&verify_json(&rep))?);
-                } else {
-                    print_verify(&input, &rep)?;
-                }
-                Ok(())
-            })();
-            // A reader that went away doesn't change the verdict's status (decision D5).
-            match shown {
-                Err(e) if !e.is::<Closed>() => return Err(e),
-                _ if !rep.all_ok() || (require_trusted && !rep.all_trusted()) => {
-                    std::process::exit(1)
-                }
-                shown => shown?,
+            if json {
+                out!("{}", serde_json::to_string_pretty(&verify_json(&rep))?);
+            } else {
+                print_verify(&input, &rep)?;
+            }
+            if !rep.all_ok() || (require_trusted && !rep.all_trusted()) {
+                std::process::exit(1)
             }
         }
         Cmd::Trust { cmd } => run_trust(cmd)?,
