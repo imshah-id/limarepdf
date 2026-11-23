@@ -41,8 +41,9 @@ On Linux and macOS a written file is then confirmed on disk, so a power cut can'
 confirm it, the file is in place all the same, and the command stops with status 1 and "*file* was saved, but your
 system couldn't confirm it is safely on disk (...). If the computer lost power just now, run the command again."
 Windows has no way to confirm this: there a power cut in the moment after a file is put in place can still lose it.
-When whatever reads the output stops early, as `limarepdf-cli text file.pdf | head` does, the command stops quietly
-with the status it would have had otherwise.
+When whatever reads the output stops early, as `limarepdf-cli text file.pdf | head` does, the rest of what the
+command prints is left out quietly: it still runs to its end, saving any file it would have saved, and exits with
+the status it would have had otherwise.
 
 ## Look at a document
 
@@ -242,7 +243,7 @@ See [Removing hidden information](redaction.md#removing-hidden-information).
 | --- | --- |
 | `limarepdf-cli verify in.pdf` | Check every digital signature: whether the signed part is unchanged, who signed by their certificate, when, and warnings; what changed after each signature and whether the signer allowed it; also lists signature fields not signed yet |
 | `limarepdf-cli verify in.pdf --json` | The same as JSON, for scripts |
-| `limarepdf-cli verify in.pdf --signed-version 1 -o signed.pdf` | Save the version signature 1 (numbered as `limarepdf-cli verify` lists them) signed: the file as it was when signed, without later changes. Refused for a broken signature |
+| `limarepdf-cli verify in.pdf --signed-version 1 -o signed.pdf` | Save the version signature 1 (numbered as `limarepdf-cli verify` lists them) signed: the file as it was when signed, without later changes. Refused for a broken signature, and with `--require-trusted` (status 2, nothing written) |
 | `limarepdf-cli verify in.pdf --require-trusted` | Also exit with status 1 unless the file has signatures and every signer, and every timestamp authority a signature carries, is trusted |
 | `limarepdf-cli verify in.pdf --trust-file team.txt` | Judge trust by this trust list instead of your own |
 | `limarepdf-cli trust list` | The certificates you trust, with their fingerprints (`--json` for scripts) |

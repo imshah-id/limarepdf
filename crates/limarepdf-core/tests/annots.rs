@@ -1009,6 +1009,33 @@ fn a_text_box_is_written_and_restyled() {
         .is_err());
 }
 
+/// A text box another app coloured red in its `/DS` style alone, its `/DA` naming no colour,
+/// keeps its red when its size is changed as the inspector changes it, from the style listed;
+/// saved and read again, it is listed and drawn red (PB-147's write half; the read half is
+/// too_complex.rs's `a_text_box_s_style_is_read_once_and_listed_as_drawn`).
+#[test]
+fn a_text_box_coloured_by_its_style_alone_keeps_its_colour_restyled() {
+    let mut p = page();
+    let extra = dictionary! {
+        "DA" => text("/Helv 12 Tf"),
+        "DS" => text("font: 12pt Helvetica; color:#FF0000"),
+        "Contents" => text("MMMM MMMM"),
+    };
+    let id = add(&mut p, 0, "FreeText", [20.0, 60.0, 280.0, 140.0], extra);
+    let listed = p.annotations()[0].text_style.unwrap();
+    assert_eq!(listed.color, [1.0, 0.0, 0.0]);
+    let bigger = limarepdf_core::TextStyle {
+        size: 20.0,
+        ..listed
+    };
+    p.set_text_style(id, &bigger).unwrap();
+    let mut saved = Pdf::from_bytes(&p.to_bytes().unwrap(), None).unwrap();
+    assert_eq!(saved.annotations()[0].text_style, Some(bigger));
+    let b = shot(&mut saved);
+    let dark = count(&b, [20, 60, 280, 140], |c| c.iter().all(|&v| v < 90));
+    assert!(count(&b, [20, 60, 280, 140], reddish) > 100 && dark == 0);
+}
+
 /// A text box keeps its alignment (NEW-15's stage 3): left, centred or right, written as
 /// `/Q`, read back, changed with its style and drawn so. Justified is written left, as a PDF
 /// text box can't keep it; left is written as no `/Q`, which readers take as left.

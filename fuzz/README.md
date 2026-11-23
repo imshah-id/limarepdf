@@ -1,8 +1,10 @@
 # Fuzzing
 
 Fuzz targets for LimarePDF's readers (REL-12), run with [cargo-fuzz](https://github.com/rust-fuzz/cargo-fuzz)
-and libFuzzer. This folder is a workspace of its own: nothing here is built by the main workspace, CI or a release.
-libFuzzer is C++, used only here, for development.
+and libFuzzer. This folder is a workspace of its own: nothing here is built by the main workspace or a release. CI
+checks that the targets still build and that `Cargo.lock` here passes `cargo deny` (`.github/workflows/ci.yml`), and
+`.github/workflows/fuzz.yml` runs each target for five minutes every week. libFuzzer is C++, used only here, for
+development.
 
 | Target | What it fuzzes |
 | --- | --- |

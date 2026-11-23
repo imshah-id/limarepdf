@@ -82,7 +82,8 @@ fn press_key(app: &mut App, ctx: &egui::Context, key: Key, held: egui::Modifiers
 fn click_removing(app: &mut App, ctx: &egui::Context, label: &str) {
     click(app, ctx, label);
     for _ in 0..2 {
-        let _ = ctx.run_ui(egui::RawInput::default(), |ui| app.remove_now(ui.ctx()));
+        let mut out = ctx.run_ui(egui::RawInput::default(), |ui| app.remove_now(ui.ctx()));
+        out.textures_delta.clear();
     }
 }
 

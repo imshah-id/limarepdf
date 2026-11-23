@@ -444,7 +444,8 @@ available.
   checked against its output yet: the pictures of `insert-images --images` and of `--image` in `watermark`,
   `stamp` and `sign`, and `sign --password-file` (PB-139). When
   the command's own output can't be written (a full disk), it stops with an error and status 1, saying whether its
-  file was already saved; a reader that stops early (`… | head`) stops it quietly ([details](../cli.md)).
+  file was already saved; when a reader stops early (`… | head`), the rest of the output is left out and the
+  command runs to its end, saving its file, with its own status ([details](../cli.md)).
 - Text from a file that the app shows as a label or message (link addresses, bookmark names, comment authors and
   text, file names in tab and window titles and print job titles) has direction-changing (bidi), invisible and
   control characters removed and is shortened when very long, so a link can't pretend to go somewhere else. Form
