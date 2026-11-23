@@ -76,6 +76,29 @@ fn the_signed_version_is_saved_to_another_file() {
     unchanged(&input, &before);
 }
 
+/// `--require-trusted` judges the results, which `--signed-version` doesn't give, so the two
+/// together are refused with nothing written (PB-210). The signed version was saved, with
+/// status 0, though no signer is trusted.
+#[test]
+fn a_signed_version_cant_require_trust() {
+    let (dir, input) = setup("require-trusted");
+    let output = dir.join("signed.pdf");
+    let out = limarepdf_core::child_seam::output(
+        Command::new(env!("CARGO_BIN_EXE_limarepdf-cli"))
+            .current_dir(&dir)
+            .arg("verify")
+            .arg(&input)
+            .args(["--trust-file", "trust.txt", "--require-trusted"])
+            .args(["--signed-version", "1", "-o"])
+            .arg(&output),
+    )
+    .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{err}");
+    assert!(err.contains("--require-trusted"), "{err}");
+    assert!(!output.exists());
+}
+
 /// The input's own name, given as it is or as another path to it, is refused with the input
 /// unchanged.
 #[test]

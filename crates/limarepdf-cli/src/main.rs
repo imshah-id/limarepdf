@@ -420,7 +420,12 @@ enum Cmd {
         require_trusted: bool,
         /// Save the version signature N (numbered as listed) signed, instead of the
         /// results
-        #[arg(long, value_name = "N", requires = "output")]
+        #[arg(
+            long,
+            value_name = "N",
+            requires = "output",
+            conflicts_with = "require_trusted"
+        )]
         signed_version: Option<usize>,
         /// Where to save the signed version
         #[arg(short, long, requires = "signed_version")]
