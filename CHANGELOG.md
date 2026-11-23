@@ -615,6 +615,22 @@
   did before saving, saved nothing, and `save-images` said nothing of pictures it couldn't save.
 - `limarepdf-cli verify --signed-version` with `--require-trusted` is refused (status 2), writing nothing. Before,
   `--require-trusted` was ignored there: the signed version was saved with status 0, trusted or not.
+- Text still being typed on a page that is cut and pasted into another document goes with the page. Before, the
+  page was pasted without it, and the text was taken out with the page from its own document.
+- Ctrl+V waits while a task is under way, as Paste in the band does, and says so. Before, it pasted pages cut or
+  copied while the task ran.
+- Pages with form fields cut in one document and pasted into another are pasted only if the document they were
+  cut from is as it was when you answer the question about their fields; if not, nothing is pasted, and a message
+  says why. Before, when it was reloaded meanwhile, the pages were pasted and stayed in it too, with nothing said.
+- Pages cut and pasted into another document that can't be taken out of their own are copied, and a message says
+  so and why. Before, they stayed in both documents with nothing said.
+- Apply redactions and Remove hidden information, answered while the document is being saved, run once the save
+  ends. Before, a save ending between the answer and the removal cancelled it, saying the document had changed
+  while the question was open.
+- Draft replies are added to the document before pages are copied, as before cutting or saving, so the copies have
+  them, and adding them leaves what is selected as it was. Before, copies left them out, and with a draft left, a
+  command on the pages selected selected the draft's comment instead: Cut did nothing, Delete, Rotate and Extract
+  acted on the page in view, and Print offered every page.
 
 ### Changed
 

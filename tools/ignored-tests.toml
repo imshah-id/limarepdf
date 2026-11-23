@@ -700,6 +700,22 @@ group = "G6"
 needs = ["gs", "pdffonts", "pdftotext"]
 
 [[test]]
+name = "app::tests::organise::cross_check_typing_moved_with_its_page_with_poppler"
+crate = "limarepdf-gui"
+target = "--bin limarepdf"
+file = "crates/limarepdf-gui/src/app/tests/organise.rs"
+group = "G6"
+needs = ["pdftotext"]
+
+[[test]]
+name = "app::tests::redact_marks::cross_check_redactions_applied_as_a_save_ended_with_poppler"
+crate = "limarepdf-gui"
+target = "--bin limarepdf"
+file = "crates/limarepdf-gui/src/app/tests/redact_marks.rs"
+group = "G6"
+needs = ["pdftotext"]
+
+[[test]]
 name = "page_text::tests::cross_check_word_starts_with_pdftotext"
 crate = "limarepdf-gui"
 target = "--bin limarepdf"

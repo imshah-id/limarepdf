@@ -121,6 +121,9 @@ struct CutFrom {
     tab: u64,
     /// The pages, by object, as they were cut.
     pages: Vec<(u32, u16)>,
+    /// The tab's name, and its history ([`Tab::history`]) as they were copied out of it.
+    name: String,
+    history: (u64, usize, usize),
 }
 
 /// Pages copied to paste in any tab (PF-48): a document of them, as Extract makes, kept
@@ -767,6 +770,9 @@ const SPLIT_JOB: &str = "Split into files";
 
 /// Title of Replace all's review and messages (NEW-04b).
 const REPLACE_ALL: &str = "Replace all";
+
+/// Said when something is pasted while a task is under way.
+const PASTE_WAITS: &str = "Paste waits until the task under way finishes";
 
 /// Ends what a job wrote, printed or failed with when its tab was closed meanwhile (PB-87).
 fn closed_meanwhile(name: &str) -> String {
@@ -4680,9 +4686,13 @@ impl App {
     }
 
     /// Copies the pages selected in the tab in front (PF-48): a document of them is kept to
-    /// paste in any tab, and the system's clipboard gets their names, as Cut gives it.
+    /// paste in any tab, and the system's clipboard gets their names, as Cut gives it. What
+    /// is typed but not yet kept, such as a draft reply, is kept first, as Cut keeps it.
     fn copy_pages(&mut self, ctx: &egui::Context) {
         let t = &mut self.tabs[self.active];
+        if !t.keep_typing(ctx) {
+            return;
+        }
         let chosen: Vec<usize> =
             (t.ed.selection.pages()).map_or(Vec::new(), |s| s.iter().copied().collect());
         let doc = match t.pdf.extract(&chosen) {
@@ -4723,22 +4733,40 @@ impl App {
     /// ([`Tab::insert_at`]), in one step, selected (PF-48): pages cut in it move; pages cut
     /// in another tab are added, then taken out of their own, as text cut in one document
     /// and pasted in another moves; pages copied are added, each time. Pages with form
-    /// fields are asked about first, as Append PDFs asks.
+    /// fields are asked about first, as Append PDFs asks. Like the band's Paste, it waits
+    /// for the task under way.
     fn paste_pages(&mut self, ctx: &egui::Context) {
         let i = self.active;
         let t = &mut self.tabs[i];
+        if self.busy {
+            t.info = Some(PASTE_WAITS.into());
+            return;
+        }
         if t.has_cut() {
             if let Some(said) = t.paste_pages(ctx) {
                 t.info = Some(said.into());
             }
             return;
         }
-        let (doc, name, protected, cut_from) = match self.tabs.iter().find(|t| t.has_cut()) {
+        let (doc, name, protected, cut_from) = match self.tabs.iter().position(|t| t.has_cut()) {
             Some(s) => {
+                // What is typed in their tab, not yet kept, goes with them (PB-204): it is
+                // kept first, as before any command that uses the document.
+                let src = &mut self.tabs[s];
+                if !src.keep_typing(ctx) {
+                    let (name, why) = (src.name(), src.error.clone().unwrap_or_default());
+                    self.tabs[i].error = Some(format!(
+                        "Nothing was pasted: what is typed in “{name}” couldn't be kept: {why}"
+                    ));
+                    return;
+                }
+                let s = &self.tabs[s];
                 let pages: Vec<usize> = s.cut_pages().into_iter().collect();
                 let from = CutFrom {
                     tab: s.id,
                     pages: s.cut_ids().to_vec(),
+                    name: s.name(),
+                    history: s.history(),
                 };
                 match s.pdf.extract(&pages) {
                     Ok(doc) => (doc, s.name(), s.is_protected(), Some(from)),
@@ -4779,7 +4807,8 @@ impl App {
 
     /// Takes pages cut in one tab out of it once they are pasted in another (PF-48), in
     /// one step there. When they are all its pages it keeps them, as a document needs at
-    /// least one: the paste was a copy, and the tab in front says so.
+    /// least one: the paste was a copy, and the tab in front says so; and so when they
+    /// can't be taken out, with why.
     fn take_out_cut(&mut self, ctx: &egui::Context, from: Option<CutFrom>) {
         let Some(from) = from else {
             return;
@@ -4801,9 +4830,45 @@ impl App {
             ));
             return;
         }
-        if !pages.is_empty() && src.arrange(ctx, &[], |p| p.delete_pages(&pages)) {
-            self.status = format!("Moved {} from “{name}”.", pages_said(pages.len()));
+        if pages.is_empty() {
+            return;
         }
+        if src.arrange(ctx, &[], |p| p.delete_pages(&pages)) {
+            self.status = format!("Moved {} from “{name}”.", pages_said(pages.len()));
+        } else {
+            // Said where the pages went, not in their tab, behind.
+            let why = src.error.take().unwrap_or_default();
+            self.tabs[self.active].info = Some(format!(
+                "Pasted a copy: the pages couldn't be taken out of “{name}”: {why}"
+            ));
+        }
+    }
+
+    /// Whether the tab pages were cut from is still open and unchanged since they were
+    /// copied out of it to paste ([`CutFrom`]), as [`App::still`] asks of the tab they go
+    /// to. If not, nothing is pasted, and a message says why.
+    fn cut_still(&mut self, from: Option<&CutFrom>) -> bool {
+        let Some(from) = from else {
+            return true;
+        };
+        let found = self.tabs.iter().find(|t| t.id == from.tab);
+        if found.is_some_and(|t| t.history() == from.history) {
+            return true;
+        }
+        let what = if found.is_some() {
+            "changed"
+        } else {
+            "was closed or reloaded"
+        };
+        self.dialog = Dialog::Message(
+            "Nothing was done".into(),
+            format!(
+                "“{}”, where the pages were cut, {what} while the question was open, so \
+                 nothing was pasted. Cut them again if you still want to move them.",
+                from.name
+            ),
+        );
+        false
     }
 
     /// Removes the kinds of hidden information `what` from the active tab, once its
@@ -5944,7 +6009,7 @@ impl App {
                     .file(file),
                 ) {
                     Outcome::Apply => {
-                        if self.still(&q.asked) {
+                        if self.still(&q.asked) && self.cut_still(q.cut_from.as_ref()) {
                             let mut docs = std::mem::take(&mut q.docs);
                             let drawn = docs
                                 .iter_mut()
@@ -6378,7 +6443,7 @@ impl App {
             if t.organising() {
                 t.info = Some("To paste the picture, go back to the page view first".into());
             } else if busy {
-                t.info = Some("Paste waits until the task under way finishes".into());
+                t.info = Some(PASTE_WAITS.into());
             } else {
                 // The clipboard holds one thing: a picture copied after pages replaces them.
                 self.let_go_of_pages();
@@ -17051,6 +17116,21 @@ mod tests {
     /// The tab's document as it would be saved now, read back from its bytes.
     fn saved_pdf(t: &Tab) -> Pdf {
         Pdf::from_bytes(&t.pdf.clone().snapshot().unwrap(), None).unwrap()
+    }
+
+    /// The text of each page of the file at `path`, as Poppler's `pdftotext` reads it.
+    fn poppler_pages(path: &Path) -> Vec<String> {
+        let out = limarepdf_core::child_seam::output(
+            std::process::Command::new("pdftotext").args([path.as_os_str(), "-".as_ref()]),
+        )
+        .expect("pdftotext (Poppler) installed");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "pdftotext: {err}");
+        // Each page ends with a form feed.
+        let text = String::from_utf8_lossy(&out.stdout);
+        let mut pages: Vec<String> = text.split('\u{c}').map(str::to_string).collect();
+        pages.pop();
+        pages
     }
 
     /// The first page's rotation in the tab's document as it would be saved now.

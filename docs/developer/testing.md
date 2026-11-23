@@ -63,7 +63,7 @@ G3's `paragraph_gate`) are recorded as failing.
 | G3, the fetched samples | 8 | They read samples that aren't committed (`tools/fetch-render-samples.sh`, or `dss/` fetched by hand): `compact.rs`, `edit.rs`'s `several_objects_on_real_pages_change_as_one_at_a_time`, `reduce.rs`'s `reduce_pictures_on_the_corpus`, `save_reopen.rs`, `render_compare.rs` (with `pdftoppm`), `signatures.rs`'s `dss_samples` and `paragraph_check.rs`'s two (`paragraph_check`, and `paragraph_gate`, S2-15) | At release preparation, with the samples fetched | Not run until its result is recorded in its file's row; `paragraph_gate` recorded as failed (2026-11-11, "Finding paragraphs") and never counted as passing |
 | G4, timings | 7 | Run in a release build when measuring ([Performance](performance.md)): `layout.rs`'s `speed_of_a_long_word` and `speed_of_a_paragraph`, `objects.rs`'s `a_page_is_read_within_its_steps_and_refused_past_them`, `redact.rs`'s `redaction_timings_in_long_documents`, and the app's `speed_of_typing_in_a_paragraph`, `speed_of_aligning_300_pages` and `replace_all_speed_on_300_pages` | At release preparation, into performance.md | A measurement, not pass or fail |
 | G5, CUPS | 3 | They need a running CUPS: `print.rs`'s `cross_check_sheets_pass_cupsfilter_unscaled` and `papers.rs`'s two (`ipptool`, `lpstat`) | By hand on a machine with CUPS at release preparation (REL-04) | Not run until recorded |
-| G6, cross-checks with other tools | 46 | The other `cross_check_…` tests and the `poppler_…` ones: Poppler (`pdftotext`, `pdftoppm`, `pdfsig`), Ghostscript and OpenSSL read what LimarePDF wrote. Each line Ghostscript writes to its error output fails the test, except one: Ghostscript 10.02, which the cross-check job's Ubuntu 24.04 has, writes "finalizing subclassing device while child refcount > 1" after every `txtwrite` run, whatever the file (its bug 707132), and `child_seam::ghostscript_errors` leaves that line out on 10.02 only | On every CI run, in the cross-check job: `tools/run-cross-checks.sh` runs them by the list's exact names, fails when a program they need is missing, and checks that the tests that ran and passed are the list's, no more and no fewer | Passing once that job is green |
+| G6, cross-checks with other tools | 48 | The other `cross_check_…` tests and the `poppler_…` ones: Poppler (`pdftotext`, `pdftoppm`, `pdfsig`), Ghostscript and OpenSSL read what LimarePDF wrote. Each line Ghostscript writes to its error output fails the test, except one: Ghostscript 10.02, which the cross-check job's Ubuntu 24.04 has, writes "finalizing subclassing device while child refcount > 1" after every `txtwrite` run, whatever the file (its bug 707132), and `child_seam::ghostscript_errors` leaves that line out on 10.02 only | On every CI run, in the cross-check job: `tools/run-cross-checks.sh` runs them by the list's exact names, fails when a program they need is missing, and checks that the tests that ran and passed are the list's, no more and no fewer | Passing once that job is green |
 
 | Tests | What they cover |
 | --- | --- |
@@ -894,6 +894,28 @@ cases). The check was run over the render corpus with a throwaway program: 26 fo
 files, one flagged (`pdfjs/issue11768.pdf`). PB-44: `redact.rs`'s ignored `redaction_timings_in_long_documents`
 times opening, finding, redacting and saving made-up documents of 1,000, 5,000 and 10,000 pages; its figures are in
 [Performance](performance.md#redaction).
+
+Pages moved between tabs, with PB-211 (2026-11-23; each test written first and seen failing on bfae1cd; logs in
+the cycle folder's `runs/s2-cross-tab-move/`), in `organise.rs` unless named. PB-204:
+`typing_on_a_page_cut_goes_with_it_to_another_tab` (a line typed on a cut page, not yet kept, then Ctrl+V in
+another tab: the moved page has it, once, now and in the file saved; its own tab and file don't, and Undo there
+brings the page back with it; before, the page moved without it); opt-in,
+`cross_check_typing_moved_with_its_page_with_poppler`. Ctrl+V while a task runs:
+`ctrl_v_pastes_pages_once_the_task_under_way_ends` (held through `job_gate`: nothing pasted, the toast says why
+and the pages stay cut; pasted once it ends; before, pasted while it ran). The form question:
+`pages_asked_about_are_not_pasted_once_their_tab_is_read_again` (the source reloaded while it is open, then Add
+pages: nothing pasted or taken out, "Nothing was done"; before, pasted and kept in both). A removal refused:
+`pages_cut_that_cant_be_taken_out_are_copied_and_it_says_why` (a page staying draws a form that can't be read,
+sharing resources with the one cut, so core's `delete_pages` refuses it: copied, the toast saying so and why;
+before, nothing said). PB-211: `redact_marks.rs`'s
+`a_save_ending_before_the_redactions_answered_are_applied_leaves_them_to_be` (a save held by `commit_seam`, Apply
+redactions answered, the save let go: the marked text gone now and in the file saved after; before, "Nothing was
+done"); opt-in, `cross_check_redactions_applied_as_a_save_ended_with_poppler`. Draft replies kept before a command:
+`a_reply_left_as_a_draft_goes_with_its_page_copied_or_cut` (a reply left as a draft, its page selected, Ctrl+C or
+Ctrl+X, then Ctrl+V in another tab: kept first, the page still selected, the page pasted with it; before, Copy
+pasted it without, and Cut, keeping it, selected the comment and cut nothing) and
+`a_reply_left_as_a_draft_leaves_the_pages_selected_to_delete` (the other page selected, Pages > Delete: that page
+deleted; before, the page in view).
 
 Later additions (recent files, document notices, fit width, the theme button, crop)
 were checked by screenshot under a virtual X server; not every one has been clicked through by hand. Of the newest:

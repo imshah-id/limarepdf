@@ -252,10 +252,12 @@ impl App {
             (None, _) => {}
         }
         self.saved_copy(i, confirmed && unchanged);
-        // Questions asked about the tab while it saved still apply to it.
+        // Questions asked about the tab while it saved still apply to it, and so does a
+        // removal answered, about to run (PB-211).
         let (id, now) = (s.tab, self.tabs[i].state());
         let open = std::iter::once(&mut self.dialog).chain(&mut self.waiting);
-        for a in open.filter_map(Dialog::asked_mut) {
+        let removing = self.removing.as_mut().map(|r| &mut r.asked);
+        for a in open.filter_map(Dialog::asked_mut).chain(removing) {
             if a.tab == id && *a.state == before {
                 *a.state = now.clone();
             }
