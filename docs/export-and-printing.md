@@ -22,9 +22,11 @@ The dialog opens at once. The first time, it says it is looking for printers unt
 on Linux and macOS the printers set up on this computer come at once, and printers found on the network are added
 about a second later. After that it opens with the printers and paper sizes already found, ready to print, while
 it looks again in the background and adds any printer that has appeared since. The printer you last printed to
-is chosen, when it is there; otherwise the system's default. If the printing service doesn't answer within 10
-seconds or can't list the printers, the dialog says why; with no printers set up, it says so. Either way, **Try
-again** looks once more (after adding a printer in the system's settings, say).
+is chosen, when it is there; otherwise the system's default. If the printing service doesn't answer or can't list
+the printers, the dialog says why; with no printers set up, it says so. Each question to the service may take up
+to 10 seconds, and on Linux and macOS LimarePDF asks several in turn, so a service that has stopped answering can
+keep the dialog looking for longer than that. Either way, **Try again** looks once more (after adding a printer in
+the system's settings, say).
 
 ### Page setup
 

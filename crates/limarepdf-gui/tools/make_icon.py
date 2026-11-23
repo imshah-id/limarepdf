@@ -1,10 +1,11 @@
 # Makes the app icon (docs/images/icon.png and crates/limarepdf-gui/assets/icon.ico) from
-# Phosphor's file-pdf glyph, the icon on the start page card, in the light theme's accent.
+# Phosphor's file-pdf glyph, the icon on the start page card, in blue: the light theme's accent
+# when the icon was made. The theme's accent is teal now (theme.rs); the icon kept its blue.
 # Needs Pillow. Run from the repository root:
 #   python3 crates/limarepdf-gui/tools/make_icon.py
 from PIL import Image, ImageDraw, ImageFont
 
-ACCENT = (37, 99, 235, 255)  # theme.rs, light palette
+ACCENT = (37, 99, 235, 255)  # theme.rs's earlier light accent
 FONT = "crates/limarepdf-gui/assets/fonts/Phosphor.ttf"
 GLYPH = ""  # icon::FILE_PDF (src/icon.rs)
 MASTER = 2048

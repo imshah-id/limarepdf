@@ -181,8 +181,9 @@ settings, then press Try again in Print. Printing on paper has only been tried o
 
 ### Print says the printing service didn't answer
 
-LimarePDF waits 10 seconds for the system to list the printers. On Linux, check that CUPS is running (for example
-with `systemctl status cups`), then press Try again.
+LimarePDF gives each question to the printing service 10 seconds; on Linux and macOS it asks several in turn, so
+the message can take longer than that to show. On Linux, check that CUPS is running (for example with
+`systemctl status cups`), then press Try again.
 
 ### "The printer didn't take the document" or "the printing service didn't confirm the job"
 

@@ -23,7 +23,9 @@ signed with the <a href="limarepdf-signing-key.asc">LimarePDF release signing ke
 <code>0CF9 7E88 BAFE E9B6 38D2 14CB EB40 041A 7A8D C801</code>. Updates arrive with your system's own updates.</p>
 
 <h2>Debian and Ubuntu</h2>
-<p>Debian 13, Ubuntu 24.04 and later.</p>
+<p>Ubuntu 26.04 and later: the packages need glibc 2.43 or later, which Debian 13 doesn't have yet. On older
+systems, <a href="https://github.com/smaug42/limarepdf/blob/main/docs/install.md#build-from-source">build LimarePDF
+from source</a>.</p>
 <pre>sudo install -d /etc/apt/keyrings
 sudo curl -fsSLo /etc/apt/keyrings/limarepdf.asc https://smaug42.github.io/limarepdf/limarepdf-signing-key.asc
 sudo curl -fsSLo /etc/apt/sources.list.d/limarepdf.sources https://smaug42.github.io/limarepdf/apt/limarepdf.sources

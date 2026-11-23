@@ -169,8 +169,10 @@ them the same way ([Pages](cli.md#pages)).
 
 Files are numbered after the document, such as `book-001.pdf`; split at bookmarks, they are named after their
 bookmark too, such as `book-002 Introduction.pdf`, and the pages before the first bookmark get a file of their
-own. Each file is written as soon as its part is made, so a large document split into many files needs little
-more memory than the document itself. Splitting doesn't change the document.
+own. Every part is made and checked before any file is written, so a part that can't be made writes no files at
+all. The parts are then made again and written, several at once, each let go once its file is written, so they
+aren't all held in memory together. If a file can't be written, the message says how many were written before
+it. Splitting doesn't change the document.
 
 If files with the same names are already in the folder, LimarePDF asks once, saying how many, before writing
 anything: **Replace** replaces them, **Cancel** writes no files at all.
@@ -231,6 +233,11 @@ shows them. The choice is remembered between runs.
 Pages that are deleted, or left out when extracting or splitting, leave nothing in the saved file: bookmarks,
 named destinations, links, the opening view, form fields and tags stop referring to them, so their content isn't
 kept.
+
+A digitally signed document is the exception for deleting: saving it adds the changes after what was signed, so
+the pages deleted stay in the version that was signed, and anyone with the file can open that version
+([The version that was signed](signatures-in-depth.md#the-version-that-was-signed)). To remove them for good, use
+Redact or Remove hidden information, which write the whole file and break the signatures.
 
 - A link to such a page goes nowhere, and a form field whose boxes were all on those pages leaves the form.
 - Tags with content on those pages lose their alternative text (also when they have content on kept pages too),
