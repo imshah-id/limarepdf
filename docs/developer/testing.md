@@ -910,7 +910,12 @@ sharing resources with the one cut, so core's `delete_pages` refuses it: copied,
 before, nothing said). PB-211: `redact_marks.rs`'s
 `a_save_ending_before_the_redactions_answered_are_applied_leaves_them_to_be` (a save held by `commit_seam`, Apply
 redactions answered, the save let go: the marked text gone now and in the file saved after; before, "Nothing was
-done"); opt-in, `cross_check_redactions_applied_as_a_save_ended_with_poppler`.
+done"); opt-in, `cross_check_redactions_applied_as_a_save_ended_with_poppler`. Draft replies kept before a command:
+`a_reply_left_as_a_draft_goes_with_its_page_copied_or_cut` (a reply left as a draft, its page selected, Ctrl+C or
+Ctrl+X, then Ctrl+V in another tab: kept first, the page still selected, the page pasted with it; before, Copy
+pasted it without, and Cut, keeping it, selected the comment and cut nothing) and
+`a_reply_left_as_a_draft_leaves_the_pages_selected_to_delete` (the other page selected, Pages > Delete: that page
+deleted; before, the page in view).
 
 Later additions (recent files, document notices, fit width, the theme button, crop)
 were checked by screenshot under a virtual X server; not every one has been clicked through by hand. Of the newest:

@@ -627,6 +627,10 @@
 - Apply redactions and Remove hidden information, answered while the document is being saved, run once the save
   ends. Before, a save ending between the answer and the removal cancelled it, saying the document had changed
   while the question was open.
+- Draft replies are added to the document before pages are copied, as before cutting or saving, so the copies have
+  them, and adding them leaves what is selected as it was. Before, copies left them out, and with a draft left, a
+  command on the pages selected selected the draft's comment instead: Cut did nothing, Delete, Rotate and Extract
+  acted on the page in view, and Print offered every page.
 
 ### Changed
 
