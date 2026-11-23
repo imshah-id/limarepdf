@@ -378,11 +378,15 @@ pub(crate) fn black_out(
         for r in rects {
             mp.clear(r);
         }
-        masks.push((key, encode(ms, mp)?));
+        let mut mask = encode(ms, mp)?;
+        mask.dict.remove(b"Metadata");
+        masks.push((key, mask));
     }
     let mut image = encode(s, px)?;
-    // Its alternate versions hold the pixels blacked out.
+    // Its alternate versions hold the pixels blacked out, and its XMP metadata can describe them (a caption, a
+    // small preview).
     image.dict.remove(b"Alternates");
+    image.dict.remove(b"Metadata");
     Ok(Some(Cut { image, masks }))
 }
 

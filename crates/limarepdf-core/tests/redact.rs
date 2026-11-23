@@ -3794,6 +3794,45 @@ fn a_blacked_out_picture_s_soft_mask_a_picture_page_2_draws_shares_is_kept_and_r
     assert_eq!(rep.picture_notices(), [notice(2)]);
 }
 
+/// XMP metadata holding `text`, as a picture's `/Metadata`.
+fn xmp(p: &mut Pdf, text: &str) -> ObjectId {
+    let xml = format!("<x:xmpmeta xmlns:x=\"adobe:ns:meta/\">{text}</x:xmpmeta>");
+    p.doc.add_object(Stream::new(
+        dictionary! { "Type" => "Metadata", "Subtype" => "XML" },
+        xml.into_bytes(),
+    ))
+}
+
+/// PB-140: the blacked-out picture and its cut soft mask are written without their XMP
+/// metadata, which can describe the picture as it was (a caption, a small preview). Page 2's
+/// picture keeps its own.
+#[test]
+fn a_blacked_out_picture_s_metadata_goes() {
+    let (mut p, (_, mask), marks) = picture_with_parts("q 150 0 0 100 0 0 cm /Green Do Q");
+    let original = (p.doc.objects.iter())
+        .find(|(_, o)| o.as_stream().is_ok_and(|s| s.dict.has(b"Alternates")))
+        .map(|(&id, _)| id)
+        .unwrap();
+    let green = two_pixels(&mut p, "DeviceRGB", &[0, 255, 0, 0, 255, 0]);
+    for (id, text) in [
+        (original, "PictureSecretZebra"),
+        (mask, "MaskSecretZebra"),
+        (green, "KeptZebra"),
+    ] {
+        let metadata = xmp(&mut p, text);
+        let s = p.doc.get_object_mut(id).unwrap().as_stream_mut().unwrap();
+        s.dict.set("Metadata", metadata);
+    }
+    add_res(
+        &mut p,
+        1,
+        dictionary! { "XObject" => dictionary! { "Green" => green } },
+    );
+    let gone = ["PictureSecretZebra", "MaskSecretZebra"];
+    let (rep, _) = redacted(&mut p, &marks, &gone, &["KeptZebra"]);
+    assert_eq!(rep.pages[0].images_cut, 1, "{:?}", rep.pages[0]);
+}
+
 /// The time each step of redacting one word in a long document takes, the median of three
 /// runs, for PB-44's baseline (WP-04 makes it faster): every page has a line of text sharing
 /// one font, and the middle page has "Secret" in it too. Run on a release build:

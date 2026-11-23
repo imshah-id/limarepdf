@@ -218,9 +218,9 @@ and `settle` (`editor/replace_all.rs`), which hold its copy.
 - A route still reaching something removed is refused, not cut: a tagged document whose tags point at a removed
   link or comment can't be redacted there (PF-73, after the freeze).
 - What [Redaction](../redaction.md#limits) lists: the gap shows how long the removed text was, embedded fonts
-  keep the shapes of the letters they hold, vertical writing and tiling patterns aren't redacted, a blacked-out
-  picture keeps its own XMP metadata, and the removed text found elsewhere (other pages, bookmarks, comments,
-  fields, the document's properties) is reported, not removed.
+  keep the shapes of the letters they hold, vertical writing and tiling patterns aren't redacted, and the removed
+  text found elsewhere (other pages, bookmarks, comments, fields, the document's properties) is reported, not
+  removed.
 - The walk after the change can't fail on a document the walk before passed: argued, not proven. Should it, the
   change is undone as any failure is.
 - The same for pages: a tagged document whose tags point into what only the pages that went drew (a form their
