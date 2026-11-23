@@ -278,6 +278,12 @@
 - Split into files' Choose folder… in the inspector now waits, greyed, while another task runs, as Export pages as
   images' does. A split started alongside a task such as Recognise text, ending first, took the busy sign away
   while that task still ran, so editing could start again and the task's result was then discarded.
+- Redacting part of a picture also removes the picture's XMP metadata, and its soft mask's, which can hold a
+  caption or a small preview of the picture as it was. Before, the blacked-out picture kept it, and only
+  **Remove hidden information** took it out.
+- Two notices shown above a document, with buttons of different widths (such as Reload on one and Save on the
+  other), no longer make the window lay out every frame twice. Each notice measured its buttons against the
+  other's width, so each frame was thrown away and drawn again for as long as both were shown.
 - A fax picture stating more than 131,072 pixels across, and more than 16 million in all, is now left out of the
   page as it is shown, printed as a picture or read with OCR, with the page's notice, rather than making
   LimarePDF ask for memory for every pixel; a blank fax row takes a bit however wide it is, so its data can't

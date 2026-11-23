@@ -76,9 +76,10 @@ For each area:
   then saved again (JPEG pictures as JPEG at about their own quality, black-and-white scans as CCITT, others without
   loss). Pixels only partly under the area are blacked out too. A picture's transparency (soft mask) is cut the same
   way. The blacked-out picture keeps none of its alternate versions (copies some files carry for printing or for
-  other screens), since they hold the pixels as they were. A picture shared with other pages or drawn elsewhere on
-  the page is copied first, so only the covered copy changes. Pictures LimarePDF can't read (JPEG 2000, JBIG2,
-  CMYK JPEG, some unusual formats) are removed whole, and the report counts them.
+  other screens), since they hold the pixels as they were, and neither it nor its soft mask keeps its XMP metadata,
+  which can hold a caption or a small preview of the picture as it was. A picture shared with other pages or drawn
+  elsewhere on the page is copied first, so only the covered copy changes. Pictures LimarePDF can't read
+  (JPEG 2000, JBIG2, CMYK JPEG, some unusual formats) are removed whole, and the report counts them.
 - **Drawings**: the parts of a drawing mostly under the area are removed. Lines and fills that only cross the
   area's edge (a table border, a coloured background) are kept but cut out of the area. Colour gradients are cut
   out the same way.
@@ -252,9 +253,6 @@ of the file aren't kept in it.
 - A picture drawn at an angle (not a quarter turn) is blacked out over a rectangle in the picture that holds the
   whole area, so a little more than the area can go black.
 - Saving a JPEG picture again loses a little quality across the whole picture.
-- A blacked-out picture keeps the picture's own XMP metadata, which can hold a title, a caption or a small preview
-  of the picture as it was; redaction doesn't check it. **Remove hidden information** removes it (Document
-  information and XMP metadata).
 - The removed text can still be in bookmarks, comments, file attachments or metadata; the check warns about the
   places it can search.
 - Removing hidden layers: any drawing whose compressed (Flate) data is cut off or damaged part way stops the
