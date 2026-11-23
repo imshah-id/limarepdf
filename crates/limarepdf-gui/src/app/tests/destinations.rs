@@ -5,7 +5,8 @@
 //! the name is free again (the open tab's own check aside). A split never writes over a
 //! file open in another tab. The Digital IDs window's exports keep apart from the tabs'
 //! files, and an ID's export from the files tabs save (PB-167). No writer writes in the
-//! folder of digital IDs (PB-170).
+//! folder of digital IDs (PB-170). None replaces a file the chooser never asked about: one
+//! at the name chosen with the extension LimarePDF adds (PB-205).
 
 use super::*;
 
@@ -457,5 +458,161 @@ fn no_writer_writes_in_the_id_folder() {
     app.act(&ctx, Act::SaveAs);
     saves_done(&mut app, &ctx);
     assert_eq!(pages_in(&beside), 1);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// What another app wrote at each name the tests below choose with an extension added.
+const THEIRS: &[u8] = b"another app's file";
+
+/// Another app's files in `dir` at `report` with each extension LimarePDF adds to a name
+/// chosen without one; that name, `report`.
+fn beside_files(dir: &Path) -> PathBuf {
+    let chosen = dir.join("report");
+    for ext in ["pdf", "txt", "png", "cer", "p12"] {
+        std::fs::write(chosen.with_extension(ext), THEIRS).unwrap();
+    }
+    chosen
+}
+
+/// `why` says `report.{ext}` in `dir` is already there, and that file is as it was.
+fn refused(dir: &Path, why: &str, ext: &str) {
+    let said = format!("\"report.{ext}\" is already there");
+    assert!(why.starts_with(&said), "{ext}: {why}");
+    let now = std::fs::read(dir.join(format!("report.{ext}"))).unwrap();
+    assert_eq!(now, THEIRS, "report.{ext} was replaced");
+}
+
+/// The same, said in the app's message, and nothing started.
+fn refused_in_message(app: &mut App, dir: &Path, ext: &str) {
+    let (_, why) = message(app);
+    refused(dir, why, ext);
+    assert!(!app.busy && app.saves.is_empty(), "{ext}: it started");
+    app.dialog = Dialog::None;
+}
+
+/// A tab with a picture and text, each to save; the picture's id.
+fn picture_and_text() -> (egui::Context, App, usize) {
+    let png = limarepdf_core::render::encode(&super::save_image::halves(), ImageFormat::Png, 72.0)
+        .unwrap();
+    super::save_image::picture_tab(&png)
+}
+
+/// A name chosen without its extension, beside a file with it: LimarePDF adds the extension
+/// after the chooser, which asked about the name chosen alone, so Save as is refused and
+/// the file there is left as it was (PB-205). Chosen with its extension, which the chooser
+/// asks about, it is replaced.
+#[test]
+fn save_as_never_replaces_the_file_its_extension_names() {
+    let (ctx, mut app, _) = picture_and_text();
+    let dir = test_dir("extension-save-as");
+    let chosen = beside_files(&dir);
+    SAVE_AS.with(|s| s.set(Some(chosen.clone())));
+    app.act(&ctx, Act::SaveAs);
+    refused_in_message(&mut app, &dir, "pdf");
+    assert!(app.tabs[0].path.is_none(), "the tab took the file");
+
+    let file = chosen.with_extension("pdf");
+    SAVE_AS.with(|s| s.set(Some(file.clone())));
+    app.act(&ctx, Act::SaveAs);
+    saves_done(&mut app, &ctx);
+    assert_eq!(pages_in(&file), 1);
+    assert_eq!(app.tabs[0].path.as_deref(), Some(file.as_path()));
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// The selection saved, as text or as a PDF, likewise (PB-205).
+#[test]
+fn the_selection_saved_never_replaces_the_file_its_extension_names() {
+    let (_, mut app, _) = picture_and_text();
+    let dir = test_dir("extension-selection");
+    let chosen = beside_files(&dir);
+    let t = &mut app.tabs[0];
+    t.ed.select_all_words(&t.pdf, 0);
+    assert!(app.tabs[0].ed.selected_text().is_some());
+    for (layout, ext) in [(dlg::Layout::TextFile, "txt"), (dlg::Layout::Plain, "pdf")] {
+        SAVE_AS.with(|s| s.set(Some(chosen.clone())));
+        app.save_selection(layout);
+        refused_in_message(&mut app, &dir, ext);
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// The text exported likewise (PB-205).
+#[test]
+fn the_text_exported_never_replaces_the_file_its_extension_names() {
+    let (_, mut app, _) = picture_and_text();
+    let dir = test_dir("extension-text");
+    let chosen = beside_files(&dir);
+    SAVE_AS.with(|s| s.set(Some(chosen.clone())));
+    app.export_text();
+    refused_in_message(&mut app, &dir, "txt");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A signed copy likewise: the signing window says why and doesn't sign (PB-205).
+#[test]
+fn a_signed_copy_never_replaces_the_file_its_extension_names() {
+    let (ctx, mut app, _) = picture_and_text();
+    let dir = test_dir("extension-signed");
+    let chosen = beside_files(&dir);
+    let t = &app.tabs[0];
+    let place = SignPlace::NewBox {
+        page: 0,
+        rect: [72.0, 72.0, 272.0, 132.0],
+    };
+    let mut w = SignWindow::new(t.id, t.revision, place, "a box".into(), false, false);
+    SAVE_AS.with(|s| s.set(Some(chosen.clone())));
+    app.start_signing(&ctx, &mut w);
+    refused(&dir, &w.error.clone().unwrap_or_default(), "pdf");
+    assert!(!w.busy(), "signing started");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A picture saved likewise (PB-205).
+#[test]
+fn a_picture_saved_never_replaces_the_file_its_extension_names() {
+    let (ctx, mut app, picture) = picture_and_text();
+    let dir = test_dir("extension-picture");
+    let chosen = beside_files(&dir);
+    select(&mut app, &ctx, &[picture]);
+    SAVE_AS.with(|s| s.set(Some(chosen.clone())));
+    app.act(&ctx, Act::SaveImage);
+    refused_in_message(&mut app, &dir, "png");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// The Digital IDs window's exports likewise, through its Export… button: a certificate or
+/// an ID is refused, the form says why and nothing is written (PB-205).
+#[test]
+fn an_id_export_never_replaces_the_file_its_extension_names() {
+    let ctx = egui::Context::default();
+    ctx.enable_accesskit();
+    theme::install(&ctx);
+    let mut app = App::with(Settings::from_file(None), Recent::from_file(None));
+    unsaved_tab(&mut app, &ctx, None);
+    let dir = test_dir("extension-id-export");
+    let chosen = beside_files(&dir);
+    let password = limarepdf_core::password_seam::made_up();
+    let store = limarepdf_core::IdStore::new(dir.join("ids"));
+    let new = limarepdf_core::NewId {
+        name: "Jane Example".into(),
+        ..Default::default()
+    };
+    let id = store.create(&new, &password).unwrap().id;
+    for (key, ext) in [(false, "cer"), (true, "p12")] {
+        let w = IdsWindow::test_export_form(store.clone(), id.clone(), key, &password);
+        app.ids_window = Some(w);
+        let tree = window(&mut app, &ctx, 1400.0, vec![]);
+        let (at, _) = node(&tree, "Export…").expect("no Export…");
+        SAVE_AS.with(|s| s.set(Some(chosen.clone())));
+        window(&mut app, &ctx, 1400.0, click_at(at.center()));
+        let busy = app.ids_window.as_ref().is_some_and(IdsWindow::busy);
+        assert!(!busy, "{ext}: the export started");
+        let tree = window(&mut app, &ctx, 1400.0, vec![]);
+        let shown = (tree.nodes.iter())
+            .filter_map(|(_, n)| n.value())
+            .find(|v| v.contains("is already there"));
+        refused(&dir, shown.unwrap_or_default(), ext);
+    }
     std::fs::remove_dir_all(&dir).unwrap();
 }

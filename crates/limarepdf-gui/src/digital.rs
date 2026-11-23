@@ -924,7 +924,7 @@ impl IdsWindow {
         if go {
             match f.kind {
                 ExportKind::Certificate => {
-                    if let Some(path) = save_path(&f.id.name, "cer", "Certificate") {
+                    if let Some(path) = save_path(&mut f, "cer", "Certificate") {
                         self.export_certificate(f, &path, taken);
                         return;
                     }
@@ -951,7 +951,7 @@ impl IdsWindow {
                     };
                     if let Some((field, why)) = problem {
                         f.error = Some((field, capital(&why)));
-                    } else if let Some(path) = save_path(&f.id.name, "p12", "Digital ID") {
+                    } else if let Some(path) = save_path(&mut f, "p12", "Digital ID") {
                         self.export_key(ui.ctx(), f, path, taken);
                         return;
                     }
@@ -1058,19 +1058,48 @@ impl IdsWindow {
         w.exporting = Some(path);
         (w, go)
     }
+
+    /// For the app's tests: a window for `store` at the form exporting `id`, its certificate
+    /// alone or (`key`) the ID itself under its own `password`, as Export… in the list
+    /// opens it.
+    #[cfg(test)]
+    pub(crate) fn test_export_form(
+        store: IdStore,
+        id: DigitalId,
+        key: bool,
+        password: &str,
+    ) -> Self {
+        let mut w = Self::with_store(Ok(store));
+        w.page = Page::Export(Box::new(ExportForm {
+            id,
+            kind: if key {
+                ExportKind::Key
+            } else {
+                ExportKind::Certificate
+            },
+            password: Secret(password.into()),
+            fresh: false,
+            new_password: Secret::default(),
+            again: Secret::default(),
+            error: None,
+            focus: None,
+        }));
+        w
+    }
 }
 
-/// Asks where to save an exported file, suggesting `stem.ext`.
-fn save_path(stem: &str, ext: &str, kind: &str) -> Option<PathBuf> {
-    let mut path = crate::app::App::save_as(
+/// Asks where to save the file form `f` exports, suggesting the ID's name with `.ext`;
+/// `None` when cancelled, or refused with the form's error saying why: a name whose added
+/// extension makes one already there (PB-205).
+fn save_path(f: &mut ExportForm, ext: &str, kind: &str) -> Option<PathBuf> {
+    let chosen = crate::app::App::save_as(
         rfd::FileDialog::new()
             .add_filter(kind, &[ext])
-            .set_file_name(format!("{stem}.{ext}")),
+            .set_file_name(format!("{}.{ext}", f.id.name)),
     )?;
-    if path.extension().is_none() {
-        path.set_extension(ext);
-    }
-    Some(path)
+    crate::app::App::with_extension(chosen, ext)
+        .map_err(|why| f.error = Some((Field::Form, why)))
+        .ok()
 }
 
 fn capital(s: &str) -> String {
