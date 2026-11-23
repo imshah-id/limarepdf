@@ -164,8 +164,9 @@ one annotation on several pages: each of them shows it, and it has one card, und
 the Reply box at the bottom of the inspector, which lists the replies the comment already has. **Add reply** or
 Ctrl+Enter adds it. A reply you leave unfinished, by selecting another comment or another document, stays with its
 comment as a draft, as in Word and Google Docs: its card says **Draft reply**, and it is back in the box when you
-select that comment again. Saving, printing and the other commands that change or use the document add every draft
-first, and closing asks about them, as for any text still being typed; Undo and Redo leave drafts as they are.
+select that comment again. Saving, printing, copying or cutting pages and the other commands that change or use the
+document add every draft first, leaving what you selected as it was, and closing asks about them, as for any text
+still being typed; Undo and Redo leave drafts as they are.
 Replies are saved as standard reply comments, which aren't shown on the page or printed, and carry your name.
 
 ## Your name on comments

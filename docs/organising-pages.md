@@ -99,6 +99,8 @@ why: for example, when a drawing on a page that stays can't be read.
 To have pages twice, copy them: select them and press Ctrl+C (or **Edit > Copy**, or **Copy** in the right-click
 menu), then paste in this document or another as above. The pages you copied stay as they are. Each paste adds
 another copy, selected, in one step that Undo takes back.
+[Draft replies](comments-and-markup.md#see-every-comment-and-reply) are added to the document first, as saving adds
+them, so the copies have those on their pages.
 
 Copying or cutting something else in LimarePDF, text or pages, replaces the pages copied or cut, as in a word
 processor; pages that were cut stay where they are. Copying in another app doesn't replace them. The clipboard

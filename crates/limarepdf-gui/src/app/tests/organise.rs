@@ -1450,6 +1450,87 @@ fn cross_check_typing_moved_with_its_page_with_poppler() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A tab of two pages, 500 and 501 points wide, with a comment on the first, its reply
+/// "Walrus draft" typed and left as a draft, and then page `selected` selected.
+fn draft_left(ctx: &egui::Context, selected: usize) -> App {
+    let mut app = App::with(Settings::from_file(None), Recent::from_file(None));
+    let mut pdf = Pdf::new();
+    for i in 0..2 {
+        pdf.insert_blank(i, 500.0 + i as f32, 600.0).unwrap();
+    }
+    let yellow = [1.0, 1.0, 0.0];
+    let id = (pdf.add_note(0, (100.0, 100.0), yellow, "Walrus one", "Tester")).unwrap();
+    assert!(app.add_tab(ctx, pdf, None, None, false));
+    app.tabs[0].ed.selection = Selection::Annot { page: 0, id };
+    settle(&mut app, ctx);
+    click_named(&mut app, ctx, "Reply");
+    let typed = vec![egui::Event::Text("Walrus draft".into())];
+    window(&mut app, ctx, 1400.0, typed);
+    app.tabs[0].ed.selection = Selection::pages_from([selected].into());
+    settle(&mut app, ctx);
+    assert!(app.tabs[0].ed.pending(), "no draft");
+    app
+}
+
+/// The replies in `pdf`.
+fn replies(pdf: &Pdf) -> Vec<String> {
+    let all = pdf.annotations();
+    let notes = all.into_iter().filter(|a| a.reply_to.is_some());
+    notes.map(|a| a.contents).collect()
+}
+
+/// A reply written to a comment and left as a draft, then the comment's page selected and
+/// copied or cut: the reply is kept in its document first, the page still selected, and the
+/// page pasted in another tab has it, once. Before, Copy didn't keep it, and keeping it for
+/// Cut selected the comment instead, so nothing was cut.
+#[test]
+fn a_reply_left_as_a_draft_goes_with_its_page_copied_or_cut() {
+    let ctx = test_ctx();
+    let ty = Typist::new(&ctx);
+    for (key, cut_it) in [(egui::Event::Copy, false), (egui::Event::Cut, true)] {
+        let mut app = draft_left(&ctx, 0);
+        let page = app.tabs[0].ed.selection.clone();
+        copied_by(&mut app, &ctx, vec![key.clone()]);
+        let t = &app.tabs[0];
+        assert_eq!(replies(&t.pdf), ["Walrus draft"], "{key:?}: not kept");
+        assert_eq!(t.ed.selection, page, "{key:?}: the page no longer selected");
+        let held = match cut_it {
+            true => cut(&app).len(),
+            false => (app.copied_pages.as_ref()).map_or(0, |c| c.doc.page_count()),
+        };
+        assert_eq!(held, 1, "{key:?}: nothing to paste");
+        text_tab(&mut app, &ctx, &["Otter one"]);
+        ty.pause(&mut app);
+        paste_keys(&mut app, &ty);
+        let otter = &app.tabs[1];
+        assert_eq!(otter.page_count(), 2, "{key:?}: not pasted");
+        let got = replies(&otter.pdf);
+        assert_eq!(got, ["Walrus draft"], "{key:?}: pasted without it");
+        let seal = &app.tabs[0];
+        let left: Vec<String> = match cut_it {
+            true => vec![],
+            false => vec!["Walrus draft".into()],
+        };
+        let want = (2 - usize::from(cut_it), left);
+        assert_eq!((seal.page_count(), replies(&seal.pdf)), want, "{key:?}");
+    }
+}
+
+/// A reply left as a draft on the first page's comment, the second page selected, then
+/// Pages > Delete: the reply is kept first and the second page deleted. Before, keeping the
+/// reply selected its comment, and the page in view, the first, was deleted instead.
+#[test]
+fn a_reply_left_as_a_draft_leaves_the_pages_selected_to_delete() {
+    let ctx = test_ctx();
+    let mut app = draft_left(&ctx, 1);
+    app.act(&ctx, Act::Delete);
+    settle(&mut app, &ctx);
+    let t = &app.tabs[0];
+    assert_eq!(t.page_count(), 1, "nothing deleted");
+    assert_eq!(t.sizes[0].0, 500.0, "the page in view deleted");
+    assert_eq!(replies(&t.pdf), ["Walrus draft"], "not kept");
+}
+
 /// Ctrl+V waits for the task under way to paste pages, as the band's Paste (greyed then) and
 /// a picture pasted do: nothing is pasted or taken out, and it says why. Once the task has
 /// ended, Ctrl+V moves them.

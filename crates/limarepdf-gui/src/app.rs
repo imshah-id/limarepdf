@@ -4686,9 +4686,13 @@ impl App {
     }
 
     /// Copies the pages selected in the tab in front (PF-48): a document of them is kept to
-    /// paste in any tab, and the system's clipboard gets their names, as Cut gives it.
+    /// paste in any tab, and the system's clipboard gets their names, as Cut gives it. What
+    /// is typed but not yet kept, such as a draft reply, is kept first, as Cut keeps it.
     fn copy_pages(&mut self, ctx: &egui::Context) {
         let t = &mut self.tabs[self.active];
+        if !t.keep_typing(ctx) {
+            return;
+        }
         let chosen: Vec<usize> =
             (t.ed.selection.pages()).map_or(Vec::new(), |s| s.iter().copied().collect());
         let doc = match t.pdf.extract(&chosen) {
