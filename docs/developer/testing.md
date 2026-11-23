@@ -259,10 +259,11 @@ To see what a change does to real files, compare the CLI before and after it:
 `bash crates/limarepdf-core/tools/compare-cli.sh BASE-CLI [PDF...]`, where BASE-CLI is `limarepdf-cli` built
 (`--profile ci-test`) before the change and copied out of `target`. It builds this tree's CLI and runs `verify` and
 `info` with both on every PDF in `tests/data`, the fetched corpus and `dss/` samples too when they're there. Then it
-writes `target/tmp/compare-cli/summary.txt` (`COMPARE_CLI_OUT`): the differences in `verify`'s output, the signed
-files' exit codes, the notes `info` prints on stderr (such as "other PDF apps may show it differently") before and
-after with their differences, and the time each `info` pass took. PDFs given after BASE-CLI, crafted attack files say,
-are run through both in full. A run over the 1,207 files takes about two minutes. The signature-change fixes of
+writes `summary.txt` in a new directory under `target/tmp/` (or at `COMPARE_CLI_OUT`, which must not exist).
+It uses the executable reported by Cargo, including when `CARGO_TARGET_DIR` is set. The report includes
+differences in `verify` output and exit codes, `info` notes and exit codes from both passes, and their timings.
+Extra PDFs are compared alongside the corpus. The script exits 0 when the outputs match, 1 for differences and
+non-zero if the comparison cannot be completed. A run over the 1,207 files takes about two minutes. The signature-change fixes of
 2026-11-20 were checked so: the notes it showed new were each read and judged, and six false positives fixed.
 
 The timings and memory figures in [Performance](performance.md) come from
