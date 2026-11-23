@@ -631,6 +631,10 @@
   them, and adding them leaves what is selected as it was. Before, copies left them out, and with a draft left, a
   command on the pages selected selected the draft's comment instead: Cut did nothing, Delete, Rotate and Extract
   acted on the page in view, and Print offered every page.
+- A name chosen without its extension in Save As, signing, saving the selection or a picture, exporting text, or
+  exporting a digital ID or its certificate never writes over a file that already has that name with the extension
+  LimarePDF adds: nothing is saved, and a message says why. Choosing the full name replaces it. Before, that file
+  was replaced, though the file chooser never asked about it.
 
 ### Changed
 

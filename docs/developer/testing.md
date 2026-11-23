@@ -917,6 +917,17 @@ pasted it without, and Cut, keeping it, selected the comment and cut nothing) an
 `a_reply_left_as_a_draft_leaves_the_pages_selected_to_delete` (the other page selected, Pages > Delete: that page
 deleted; before, the page in view).
 
+A name chosen without its extension, PB-205 (2026-11-23; each test written first and seen failing on d51b53c; logs
+in the cycle folder's `runs/s2-save-suffix/`), in `destinations.rs`, each choosing `report` beside another app's
+`report.pdf`, `.txt`, `.png`, `.cer` and `.p12`: `save_as_never_replaces_the_file_its_extension_names` (refused,
+the file as it was and the tab still without a file; `report.pdf` chosen then saves there),
+`the_selection_saved_never_replaces_the_file_its_extension_names` (as text and as a PDF),
+`the_text_exported_never_replaces_the_file_its_extension_names`,
+`a_signed_copy_never_replaces_the_file_its_extension_names` (the signing window says why, nothing signed),
+`a_picture_saved_never_replaces_the_file_its_extension_names` and
+`an_id_export_never_replaces_the_file_its_extension_names` (the Digital IDs window's Export…, for a certificate and
+for an ID: the form says why). Each is refused, saying why, nothing started; before, each replaced the file.
+
 Later additions (recent files, document notices, fit width, the theme button, crop)
 were checked by screenshot under a virtual X server; not every one has been clicked through by hand. Of the newest:
 the page layouts (facing and single page) have unit tests for pairing and fitting but were not clicked through;

@@ -1781,14 +1781,19 @@ impl App {
         if let Some(dir) = t.path.as_ref().and_then(|p| p.parent()) {
             d = d.set_directory(dir);
         }
-        let Some(mut out) = Self::save_as(d) else {
+        let Some(chosen) = Self::save_as(d) else {
             return;
         };
-        if out.extension().is_none() {
-            out.set_extension("pdf");
-        }
-        // Never over another tab's file or one being written (S1-03), nor over this tab's
-        // own when something else changed it since (BUG-06).
+        // Never over a file the chooser didn't ask about (PB-205), another tab's file or one
+        // being written (S1-03), nor over this tab's own when something else changed it
+        // since (BUG-06).
+        let out = match Self::with_extension(chosen, "pdf") {
+            Ok(out) => out,
+            Err(why) => {
+                w.error = Some(why);
+                return;
+            }
+        };
         if let Some((_, why)) = self.conflict(&out, w.tab, true) {
             w.error = Some(why);
             return;
@@ -2647,15 +2652,23 @@ impl App {
         if let Some(dir) = Self::start_folder(Some(t), self.settings.folder.as_deref()) {
             d = d.set_directory(dir);
         }
-        let Some(mut path) = Self::save_as(d) else {
+        let Some(chosen) = Self::save_as(d) else {
             return;
         };
-        // The kind's own extension, added to a name without it.
-        let given = path.extension().map(|e| e.to_string_lossy().to_lowercase());
+        // The kind's own extension, added to a name without it, never over a file the
+        // chooser didn't ask about (PB-205).
+        let given = chosen
+            .extension()
+            .map(|e| e.to_string_lossy().to_lowercase());
+        let mut path = chosen.clone();
         if !given.is_some_and(|e| kinds.contains(&e.as_str())) {
             let mut named = path.into_os_string();
             named.push(format!(".{ext}"));
             path = named.into();
+        }
+        if let Some(why) = Self::added_name_taken(&chosen, &path) {
+            self.dialog = Dialog::Message("Already there".into(), why);
+            return;
         }
         self.spawn_job(ctx, "Save image as", vec![path.clone()], move |p| {
             let (_, bytes) = p.picture_file(page, id)?;
@@ -2763,16 +2776,20 @@ impl App {
             );
             return;
         }
-        let Some(mut path) = Self::save_as(
+        let Some(chosen) = Self::save_as(
             rfd::FileDialog::new()
                 .add_filter("Text", &["txt"])
                 .set_file_name(format!("{}.txt", t.stem("document"))),
         ) else {
             return;
         };
-        if path.extension().is_none() {
-            path.set_extension("txt");
-        }
+        let path = match Self::with_extension(chosen, "txt") {
+            Ok(path) => path,
+            Err(why) => {
+                self.dialog = Dialog::Message("Already there".into(), why);
+                return;
+            }
+        };
         if let Some((title, why)) = self.conflict(&path, self.tabs[self.active].id, false) {
             self.dialog = Dialog::Message(title.into(), why);
             return;
@@ -2799,16 +2816,20 @@ impl App {
             dlg::Layout::TextFile => ("Text", "txt"),
             _ => ("PDF", "pdf"),
         };
-        let Some(mut path) = Self::save_as(
+        let Some(chosen) = Self::save_as(
             rfd::FileDialog::new()
                 .add_filter(filter, &[ext])
                 .set_file_name(format!("{} (selection).{ext}", t.stem("document"))),
         ) else {
             return;
         };
-        if path.extension().is_none() {
-            path.set_extension(ext);
-        }
+        let path = match Self::with_extension(chosen, ext) {
+            Ok(path) => path,
+            Err(why) => {
+                self.dialog = Dialog::Message("Already there".into(), why);
+                return;
+            }
+        };
         if let Some((title, why)) = self.conflict(&path, self.tabs[self.active].id, false) {
             self.dialog = Dialog::Message(title.into(), why);
             return;
@@ -2946,11 +2967,16 @@ impl App {
     }
 
     /// Where to save the tab: its file, or one the user picks (for Save as, or a document
-    /// with no file yet).
-    fn save_path(tab: &Tab, as_new: bool, folder: Option<&Path>) -> Option<PathBuf> {
+    /// with no file yet); `Err`, saying why, for a name picked that the added extension
+    /// makes one already there ([`Self::with_extension`]).
+    fn save_path(
+        tab: &Tab,
+        as_new: bool,
+        folder: Option<&Path>,
+    ) -> Option<Result<PathBuf, String>> {
         if !as_new {
             if let Some(p) = &tab.path {
-                return Some(p.clone());
+                return Some(Ok(p.clone()));
             }
         }
         let mut d = Self::pdf_dialog();
@@ -2962,11 +2988,7 @@ impl App {
         if let Some(dir) = Self::start_folder(Some(tab), folder) {
             d = d.set_directory(dir);
         }
-        let mut p = Self::save_as(d)?;
-        if p.extension().is_none() {
-            p.set_extension("pdf");
-        }
-        Some(p)
+        Self::save_as(d).map(|p| Self::with_extension(p, "pdf"))
     }
 
     /// The folder a file chooser starts in, as word processors start Save As: beside the
@@ -2998,6 +3020,39 @@ impl App {
         tests::SAVE_AS.with(std::cell::Cell::take)
     }
 
+    /// The file to write for `chosen`, picked in a save chooser: with `.{ext}` added to a
+    /// name without an extension. `Err`, saying why, when that adds a name already there
+    /// ([`Self::added_name_taken`]).
+    pub(crate) fn with_extension(chosen: PathBuf, ext: &str) -> Result<PathBuf, String> {
+        if chosen.extension().is_some() {
+            return Ok(chosen);
+        }
+        let path = chosen.with_extension(ext);
+        match Self::added_name_taken(&chosen, &path) {
+            Some(why) => Err(why),
+            None => Ok(path),
+        }
+    }
+
+    /// Why nothing is written to `path`, the file `chosen` in a save chooser with an
+    /// extension added after it: something is there, a link too, and the chooser asked
+    /// about replacing `chosen` alone (PB-205). Choosing that name itself replaces it.
+    pub(crate) fn added_name_taken(chosen: &Path, path: &Path) -> Option<String> {
+        if chosen == path || std::fs::symlink_metadata(path).is_err() {
+            return None;
+        }
+        let name = path
+            .file_name()
+            .unwrap_or(path.as_os_str())
+            .to_string_lossy();
+        let ext = path.extension().unwrap_or_default().to_string_lossy();
+        Some(format!(
+            "\"{name}\" is already there, and the file chooser didn't ask about replacing it: \
+             LimarePDF added \".{ext}\" to the name chosen. Choose \"{name}\" itself to replace \
+             it, or choose another name. Nothing was saved."
+        ))
+    }
+
     /// The file the user picks to open in the chooser `d`, if any.
     #[cfg(not(test))]
     fn pick_file(d: rfd::FileDialog) -> Option<PathBuf> {
@@ -3011,12 +3066,19 @@ impl App {
     }
 
     /// Where to save the active tab (see [`Self::save_path`]), with the version of the file
-    /// there the save may replace (see [`Self::stale`]); `None`, saying why, for a file open
-    /// in another tab or being written (S1-03), or one another app or tab changed since this
-    /// tab last read or saved it, until the user says to replace it (BUG-06).
+    /// there the save may replace (see [`Self::stale`]); `None`, saying why, for a name
+    /// whose added extension makes one already there (PB-205), a file open in another tab or
+    /// being written (S1-03), or one another app or tab changed since this tab last read or
+    /// saved it, until the user says to replace it (BUG-06).
     fn save_target(&mut self, as_new: bool) -> Option<(PathBuf, Option<disk::Version>)> {
         let t = self.tabs.get(self.active)?;
-        let path = Self::save_path(t, as_new, self.settings.folder.as_deref())?;
+        let path = match Self::save_path(t, as_new, self.settings.folder.as_deref())? {
+            Ok(path) => path,
+            Err(why) => {
+                self.dialog = Dialog::Message("Already there".into(), why);
+                return None;
+            }
+        };
         if let Some((title, why)) = self.conflict(&path, t.id, true) {
             self.dialog = Dialog::Message(title.into(), why);
             return None;

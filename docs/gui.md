@@ -298,6 +298,9 @@ do they write a file LimarePDF is still saving or writing from another tab, by a
 too): wait until it is done, or choose another name. None of them writes in the folder where LimarePDF keeps its
 digital IDs, where a file could take the place of an ID: choose another folder. Exporting a digital ID or its
 certificate is refused the same files and that folder; while an ID is being exported, nothing else writes its file.
+A name chosen without its extension gets one after the file chooser closes. If a file already has that full name,
+which the chooser didn't ask about replacing, nothing is saved: choose that name itself to replace it, or choose
+another name.
 
 When you come back to LimarePDF after another app changed a file open here, its tab shows a notice with
 **Reload**. ☰ > **Reload from disk** reads the file again as it now is; with unsaved changes it asks
