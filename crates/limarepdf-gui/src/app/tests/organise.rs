@@ -1356,6 +1356,100 @@ fn pages_with_form_fields_are_asked_about_when_pasted() {
     assert!(t.pdf.form_fields().is_empty(), "the fields came too");
 }
 
+/// PB-204's move: the first of the pages "Seal one" and "Seal two" cut, new text "Walrus"
+/// typed on it and left open, then a tab of "Otter one" and "Otter two" opened in front and
+/// Ctrl+V pressed there. Each tab is then saved, the first as `seal.pdf` in `dir`, the
+/// second as `otter.pdf`, the second left in front.
+fn typed_on_and_moved(ctx: &egui::Context, ty: &Typist, dir: &Path) -> App {
+    let mut app = App::with(Settings::from_file(None), Recent::from_file(None));
+    text_tab(&mut app, ctx, &["Seal one", "Seal two"]);
+    app.tabs[0].ed.selection = Selection::pages_from([0].into());
+    copied_by(&mut app, ctx, vec![egui::Event::Cut]);
+    assert_eq!(cut(&app), [0]);
+    let before = app.tabs[0].history();
+    app.act(ctx, Act::Tool(Tool::Text));
+    let (min, k) = ty.page(&mut app);
+    ty.click(&mut app, min + egui::vec2(300.0, 400.0) * k);
+    ty.text(&mut app, "Walrus");
+    let t = &app.tabs[0];
+    assert!(t.ed.typing_id().is_some(), "not being typed");
+    assert_eq!(t.history(), before, "kept already");
+    assert_eq!(cut(&app), [0], "no longer cut");
+    text_tab(&mut app, ctx, &["Otter one", "Otter two"]);
+    ty.pause(&mut app);
+    paste_keys(&mut app, ty);
+    for (i, name) in [(0, "seal.pdf"), (1, "otter.pdf")] {
+        app.active = i;
+        SAVE_AS.with(|s| s.set(Some(dir.join(name))));
+        app.act(ctx, Act::SaveAs);
+        saves_done(&mut app, ctx);
+    }
+    app
+}
+
+/// PB-204: new text typed on a page cut, not yet kept, goes with the page pasted in another
+/// tab: it is kept in its own document first, as before any command that uses it. The page
+/// goes after the page being read there, the other pages as they were; its own tab no longer
+/// has it, and Undo there brings it back with the text. The files saved read the same.
+#[test]
+fn typing_on_a_page_cut_goes_with_it_to_another_tab() {
+    let ctx = test_ctx();
+    let ty = Typist::new(&ctx);
+    let dir = test_dir("cut-typed-on");
+    let mut app = typed_on_and_moved(&ctx, &ty, &dir);
+    fn texts(p: &Pdf) -> Vec<String> {
+        (0..p.page_count()).map(|i| p.page_text(i)).collect()
+    }
+    let read = |name: &str| texts(&Pdf::open(dir.join(name), None).expect(name));
+    let (now, saved) = (texts(&app.tabs[1].pdf), read("otter.pdf"));
+    for (when, otter) in [("now", now), ("saved", saved)] {
+        assert_eq!(otter.len(), 3, "{when}: {otter:?}");
+        let moved = otter[1].contains("Seal one") && otter[1].contains("Walrus");
+        assert!(moved, "{when}: moved without the typing: {otter:?}");
+        let others = otter[0].contains("Otter one") && otter[2].contains("Otter two");
+        assert!(others, "{when}: {otter:?}");
+        let once = otter.iter().filter(|p| p.contains("Walrus")).count() == 1;
+        assert!(once, "{when}: {otter:?}");
+    }
+    let (now, saved) = (texts(&app.tabs[0].pdf), read("seal.pdf"));
+    for (when, seal) in [("now", now), ("saved", saved)] {
+        assert_eq!(seal.len(), 1, "{when}: {seal:?}");
+        assert!(seal[0].contains("Seal two"), "{when}: {seal:?}");
+        assert!(!seal[0].contains("Walrus"), "{when}: {seal:?}");
+    }
+    app.active = 0;
+    assert_eq!(cut(&app), [0usize; 0], "still cut");
+    app.act(&ctx, Act::Undo);
+    let seal = texts(&app.tabs[0].pdf);
+    assert_eq!(seal.len(), 2, "Undo: {seal:?}");
+    let back = seal[0].contains("Seal one") && seal[0].contains("Walrus");
+    assert!(back, "Undo: {seal:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// PB-204, read by Poppler: the files [`typed_on_and_moved`] saves. Opt-in: `cargo test -p
+/// limarepdf-gui --bin limarepdf -- --ignored cross_check`.
+#[test]
+#[ignore]
+fn cross_check_typing_moved_with_its_page_with_poppler() {
+    let ctx = test_ctx();
+    let ty = Typist::new(&ctx);
+    let dir = test_dir("cut-typed-on-poppler");
+    typed_on_and_moved(&ctx, &ty, &dir);
+    let otter = poppler_pages(&dir.join("otter.pdf"));
+    assert_eq!(otter.len(), 3, "{otter:?}");
+    let moved = otter[1].contains("Seal one") && otter[1].contains("Walrus");
+    assert!(moved, "the page moved without the typing: {otter:?}");
+    let others = otter[0].contains("Otter one") && otter[2].contains("Otter two");
+    let alone = !otter[0].contains("Walrus") && !otter[2].contains("Walrus");
+    assert!(others && alone, "{otter:?}");
+    let seal = poppler_pages(&dir.join("seal.pdf"));
+    assert_eq!(seal.len(), 1, "{seal:?}");
+    let kept = seal[0].contains("Seal two") && !seal[0].contains("Walrus");
+    assert!(kept, "{seal:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A click between cards puts the insertion bar there, as a slide sorter's, letting go of
 /// the pages selected: the place new pages go. Insert blank page puts its page there, the
 /// size of the page before, selected, and the bar goes. A click before the first card puts

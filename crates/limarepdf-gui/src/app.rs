@@ -4733,8 +4733,19 @@ impl App {
             }
             return;
         }
-        let (doc, name, protected, cut_from) = match self.tabs.iter().find(|t| t.has_cut()) {
+        let (doc, name, protected, cut_from) = match self.tabs.iter().position(|t| t.has_cut()) {
             Some(s) => {
+                // What is typed in their tab, not yet kept, goes with them (PB-204): it is
+                // kept first, as before any command that uses the document.
+                let src = &mut self.tabs[s];
+                if !src.keep_typing(ctx) {
+                    let (name, why) = (src.name(), src.error.clone().unwrap_or_default());
+                    self.tabs[i].error = Some(format!(
+                        "Nothing was pasted: what is typed in “{name}” couldn't be kept: {why}"
+                    ));
+                    return;
+                }
+                let s = &self.tabs[s];
                 let pages: Vec<usize> = s.cut_pages().into_iter().collect();
                 let from = CutFrom {
                     tab: s.id,
@@ -17051,6 +17062,21 @@ mod tests {
     /// The tab's document as it would be saved now, read back from its bytes.
     fn saved_pdf(t: &Tab) -> Pdf {
         Pdf::from_bytes(&t.pdf.clone().snapshot().unwrap(), None).unwrap()
+    }
+
+    /// The text of each page of the file at `path`, as Poppler's `pdftotext` reads it.
+    fn poppler_pages(path: &Path) -> Vec<String> {
+        let out = limarepdf_core::child_seam::output(
+            std::process::Command::new("pdftotext").args([path.as_os_str(), "-".as_ref()]),
+        )
+        .expect("pdftotext (Poppler) installed");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "pdftotext: {err}");
+        // Each page ends with a form feed.
+        let text = String::from_utf8_lossy(&out.stdout);
+        let mut pages: Vec<String> = text.split('\u{c}').map(str::to_string).collect();
+        pages.pop();
+        pages
     }
 
     /// The first page's rotation in the tab's document as it would be saved now.
