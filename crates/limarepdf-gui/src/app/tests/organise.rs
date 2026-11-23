@@ -1479,6 +1479,57 @@ fn ctrl_v_pastes_pages_once_the_task_under_way_ends() {
     assert_eq!(app.tabs[0].page_count(), 2, "not taken out");
 }
 
+/// Pages with form fields cut in one tab and pasted in another are asked about first. When
+/// the tab they were cut from is read again from its file while the question is open, the
+/// pages asked about are no longer its own: the answer pastes nothing, and says why.
+#[test]
+fn pages_asked_about_are_not_pasted_once_their_tab_is_read_again() {
+    let ctx = test_ctx();
+    let ty = Typist::new(&ctx);
+    let mut app = App::with(Settings::from_file(None), Recent::from_file(None));
+    let dir = test_dir("cut-read-again");
+    let file = dir.join("form.pdf");
+    let mut form = form_doc(&[("Name", 1)]);
+    form.insert_blank(1, 612.0, 792.0).unwrap();
+    std::fs::write(&file, form.clone().snapshot().unwrap()).unwrap();
+    assert!(app.add_tab(&ctx, form, None, None, false));
+    app.tabs[0].path = Some(file.clone());
+    app.tabs[0].ed.selection = Selection::pages_from([0].into());
+    copied_by(&mut app, &ctx, vec![egui::Event::Cut]);
+    // What Reload records as it starts reading the file (`App::reload`).
+    let into = Some((app.tabs[0].id, app.tabs[0].revision));
+    text_tab(&mut app, &ctx, &["Otter one"]);
+    paste_keys(&mut app, &ty);
+    assert!(
+        matches!(app.dialog, Dialog::ConfirmAppendForms(_)),
+        "not asked"
+    );
+    let pdf = Pdf::from_bytes(&std::fs::read(&file).unwrap(), None).unwrap();
+    let (path, version) = (file.clone(), disk::version(&file).unwrap());
+    let read = Loaded::Ok {
+        path,
+        pdf,
+        page: None,
+        signed: None,
+        version,
+        into,
+    };
+    app.tx.send(read).unwrap();
+    app.poll_loads(&ctx);
+    fn named<'a>(app: &'a App, name: &str) -> &'a Tab {
+        app.tabs.iter().find(|t| t.name() == name).expect(name)
+    }
+    let form = named(&app, "form.pdf");
+    assert_ne!(Some((form.id, form.revision)), into, "not read again");
+    click(&mut app, &ctx, "Add pages");
+    assert_eq!(named(&app, "Untitled").page_count(), 1, "pasted");
+    assert_eq!(named(&app, "form.pdf").page_count(), 2, "taken out");
+    let (title, text) = message(&app);
+    assert_eq!(title, "Nothing was done", "{text}");
+    assert!(text.contains("“form.pdf”"), "{text}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A click between cards puts the insertion bar there, as a slide sorter's, letting go of
 /// the pages selected: the place new pages go. Insert blank page puts its page there, the
 /// size of the page before, selected, and the bar goes. A click before the first card puts

@@ -121,6 +121,9 @@ struct CutFrom {
     tab: u64,
     /// The pages, by object, as they were cut.
     pages: Vec<(u32, u16)>,
+    /// The tab's name, and its history ([`Tab::history`]) as they were copied out of it.
+    name: String,
+    history: (u64, usize, usize),
 }
 
 /// Pages copied to paste in any tab (PF-48): a document of them, as Extract makes, kept
@@ -4758,6 +4761,8 @@ impl App {
                 let from = CutFrom {
                     tab: s.id,
                     pages: s.cut_ids().to_vec(),
+                    name: s.name(),
+                    history: s.history(),
                 };
                 match s.pdf.extract(&pages) {
                     Ok(doc) => (doc, s.name(), s.is_protected(), Some(from)),
@@ -4823,6 +4828,33 @@ impl App {
         if !pages.is_empty() && src.arrange(ctx, &[], |p| p.delete_pages(&pages)) {
             self.status = format!("Moved {} from “{name}”.", pages_said(pages.len()));
         }
+    }
+
+    /// Whether the tab pages were cut from is still open and unchanged since they were
+    /// copied out of it to paste ([`CutFrom`]), as [`App::still`] asks of the tab they go
+    /// to. If not, nothing is pasted, and a message says why.
+    fn cut_still(&mut self, from: Option<&CutFrom>) -> bool {
+        let Some(from) = from else {
+            return true;
+        };
+        let found = self.tabs.iter().find(|t| t.id == from.tab);
+        if found.is_some_and(|t| t.history() == from.history) {
+            return true;
+        }
+        let what = if found.is_some() {
+            "changed"
+        } else {
+            "was closed or reloaded"
+        };
+        self.dialog = Dialog::Message(
+            "Nothing was done".into(),
+            format!(
+                "“{}”, where the pages were cut, {what} while the question was open, so \
+                 nothing was pasted. Cut them again if you still want to move them.",
+                from.name
+            ),
+        );
+        false
     }
 
     /// Removes the kinds of hidden information `what` from the active tab, once its
@@ -5963,7 +5995,7 @@ impl App {
                     .file(file),
                 ) {
                     Outcome::Apply => {
-                        if self.still(&q.asked) {
+                        if self.still(&q.asked) && self.cut_still(q.cut_from.as_ref()) {
                             let mut docs = std::mem::take(&mut q.docs);
                             let drawn = docs
                                 .iter_mut()
