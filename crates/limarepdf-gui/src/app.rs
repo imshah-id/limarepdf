@@ -9870,6 +9870,36 @@ mod tests {
         assert!(egui::Popup::is_any_open(&ctx), "F6 closed the menu");
     }
 
+    /// PB-159: two notices whose buttons differ in width, once settled, are drawn in one pass.
+    /// Each keeps its own buttons' width; sharing one, each found the other's, and every frame
+    /// was laid out twice.
+    #[test]
+    fn two_notices_settle() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        theme::install(&ctx);
+        let mut app = app_with(&ctx, 1);
+        app.tabs[0].show_banner(crate::banners::changed_on_disk());
+        app.tabs[0].show_banner(crate::banners::no_copies("the folder is full"));
+        let tree = settled_at(&mut app, &ctx, 1400.0);
+        let dismiss = (tree.nodes.iter())
+            .filter(|(_, n)| n.label() == Some("Dismiss"))
+            .count();
+        assert_eq!(dismiss, 2, "both notices shown");
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1400.0, TEST_HEIGHT),
+            )),
+            ..Default::default()
+        };
+        let mut frame = eframe::Frame::_new_kittest();
+        let out = ctx.run_ui(raw, |ui| eframe::App::ui(&mut app, ui, &mut frame));
+        let o = out.platform_output;
+        let why = o.request_discard_reasons;
+        assert!(why.is_empty(), "{} passes: {why:?}", o.num_completed_passes);
+    }
+
     /// ENH-10: each region is named for screen readers, with its role, and the document's
     /// tab says it is the one shown.
     #[test]

@@ -3112,7 +3112,8 @@ impl Tab {
                         ui.add(egui::Label::new(&b.text).wrap());
                     };
                     let buttons = |ui: &mut egui::Ui| {
-                        let id = ui.scope_id().with("banner buttons");
+                        // Each notice keeps its own: the two rows' Uis share a scope id.
+                        let id = ui.scope_id().with(("banner buttons", i));
                         let last = ui.data(|d| d.get_temp(id));
                         let width = crate::dialogs::reading_order(ui, last, |ui| {
                             if let Some((label, act)) = b.action() {
