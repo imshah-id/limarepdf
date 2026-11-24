@@ -946,3 +946,44 @@ fn a_cmyk_scan_keeps_its_colours() {
     let (r, delta) = colour_change(&mut p, ScanMode::Color);
     assert!(delta < 4.0, "{r:?}, mean difference {delta:.1}");
 }
+
+// ------------------------------------------------ largest resolution in range (PB-206)
+
+/// A largest resolution outside 10 to 10,000 dpi is refused before anything changes; at the
+/// ends of the range, a scan above it is brought down to it, and its page keeps its size.
+#[test]
+fn a_largest_resolution_out_of_range_is_refused() {
+    let mut p = scanned(DynamicImage::ImageLuma8(photo(600, 400)), 300.0);
+    let before = p.snapshot().unwrap();
+    let never = [
+        0.0,
+        -5.0,
+        f32::NAN,
+        f32::INFINITY,
+        f32::NEG_INFINITY,
+        1e-30,
+        9.9,
+        10_000.5,
+    ];
+    for d in never {
+        let o = ScanOptions {
+            mode: ScanMode::Gray,
+            max_dpi: d,
+            ..opts()
+        };
+        let e = p.optimize_scans(&[0], &o).unwrap_err();
+        assert!(e.to_string().contains("from 10 to 10000 dpi"), "{d}: {e}");
+    }
+    assert_eq!(p.snapshot().unwrap(), before);
+    for (d, width) in [(10.0, 20), (10_000.0, 600)] {
+        let mut p = scanned(DynamicImage::ImageLuma8(photo(600, 400)), 300.0);
+        let o = ScanOptions {
+            mode: ScanMode::Gray,
+            max_dpi: d,
+            ..opts()
+        };
+        optimize(&mut p, &o);
+        assert_eq!(width_on(&p, 0), width, "{d}");
+        assert_eq!(p.page_size(0).unwrap(), (144.0, 96.0), "{d}");
+    }
+}

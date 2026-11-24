@@ -44,7 +44,7 @@ pub enum ScanMode {
 pub struct ScanOptions {
     pub mode: ScanMode,
     /// Greyscale and colour images above this resolution (dots per inch) are downsampled
-    /// to it. Black-and-white images keep their resolution.
+    /// to it. Black-and-white images keep their resolution. One of [`crate::USABLE_DPI`].
     pub max_dpi: f32,
     /// JPEG quality for greyscale and colour images, 1 to 100.
     pub jpeg_quality: u8,
@@ -119,11 +119,15 @@ impl Pdf {
     /// pages is processed once, as carefully as the most demanding of them needs: at the
     /// lowest resolution any of them shows it at, in either direction, and not straightened
     /// if any of them has text over it.
+    ///
+    /// Nothing changes when `opts.max_dpi` isn't one of [`crate::USABLE_DPI`].
     pub fn optimize_scans(
         &mut self,
         pages: &[usize],
         opts: &ScanOptions,
     ) -> Result<Vec<(usize, ScanResult)>> {
+        let largest = "the largest resolution for scans";
+        crate::imgs::check_dpi(largest, opts.max_dpi, crate::USABLE_DPI)?;
         let ids = self.page_ids();
         let mut found: Vec<(usize, std::result::Result<Target, String>)> = Vec::new();
         for &p in pages {
