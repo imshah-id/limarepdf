@@ -416,6 +416,10 @@ available.
   error page. Redactions and removed hidden information are recorded with the change itself, so a later save of a
   signed document always writes the file out in full. `limarepdf-cli` prints such a failure as a plain error and
   exits with status 1.
+- A resolution given is checked before anything changes: 10 to 10,000 dpi to size pictures as pages or to bring
+  scans down to, 36 to 1152 to save pages as images. One outside, or not a number, is refused with the range, on the
+  command line as in the app's core; a JPEG quality on the command line is 1 to 100 (PB-206). A file's own
+  resolution outside 10 to 10,000 is passed over for the one assumed.
 - These sizes a file states are capped before memory is set aside for them, so a small crafted file can't make
   LimarePDF ask for gigabytes for them: a page image has at most 268 million pixels (A3 at 1152 dpi) and 65,280 a side, the
   renderer's limit across, held for both sides (an export with a page past either is refused before any image is
