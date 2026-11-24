@@ -764,6 +764,74 @@ fn removes_a_fax_picture_too_large_to_decode() {
     assert_eq!(images_in_file(&mut p), 0);
 }
 
+/// A page with a 100×100 fax picture filling 100..200 × 50..150 (displayed): black grid
+/// lines on white, stored with `/BlackIs1 true` (its codes for black and white swapped) or
+/// the usual way.
+fn fax_picture(black_is_1: bool) -> Pdf {
+    use fax::{encoder::Encoder, Color, VecWriter};
+    let mut p = make(&["q 100 0 0 100 100 50 cm /Im1 Do Q"]);
+    let mut enc = Encoder::new(VecWriter::new());
+    for y in 0..100 {
+        let row = (0..100).map(|x| {
+            let black = x % 10 < 2 || y % 25 < 2;
+            if black != black_is_1 {
+                Color::Black
+            } else {
+                Color::White
+            }
+        });
+        enc.encode_line(row, 100).unwrap();
+    }
+    let mut parms = dictionary! { "K" => -1, "Columns" => 100, "Rows" => 100 };
+    if black_is_1 {
+        parms.set("BlackIs1", true);
+    }
+    let img = p.doc.add_object(Stream::new(
+        dictionary! {
+            "Type" => "XObject", "Subtype" => "Image", "Width" => 100, "Height" => 100,
+            "ColorSpace" => "DeviceGray", "BitsPerComponent" => 1,
+            "Filter" => "CCITTFaxDecode", "DecodeParms" => parms,
+        },
+        enc.finish().unwrap().finish(),
+    ));
+    let page = p.page_ids()[0];
+    let d = p.doc.get_dictionary_mut(page).unwrap();
+    let mut res = d.get(b"Resources").unwrap().as_dict().unwrap().clone();
+    res.set("XObject", dictionary! { "Im1" => img });
+    d.set("Resources", res);
+    p
+}
+
+/// Redact a box from [`fax_picture`] and check what `look` shows of the page, saved and
+/// opened again: the box black, nothing else changed.
+fn fax_redacted(black_is_1: bool, look: fn(&mut Pdf) -> Image) {
+    let case = format!("black is 1: {black_is_1}");
+    let mut p = fax_picture(black_is_1);
+    let before = look(&mut p);
+    // The grid's lines: a fifth of the columns and two rows in 25.
+    let grid = ink(&before, [100, 50, 200, 150]);
+    assert!(
+        (2_000..3_500).contains(&grid),
+        "{case}: {grid} pixels inked"
+    );
+    let mark = [120.0, 60.0, 150.0, 90.0];
+    let rep = p.redact(&[(0, mark)]).unwrap();
+    assert_eq!(rep.pages[0].images_cut, 1, "{case}");
+    let mut back = Pdf::from_bytes(&p.to_bytes().unwrap(), None).unwrap();
+    let after = look(&mut back);
+    assert_eq!(ink(&after, [121, 61, 149, 89]), 28 * 28, "{case}");
+    assert_eq!(changed_outside(&before, &after, &[(0, mark)]), 0, "{case}");
+}
+
+/// Redacting part of a fax picture blacks that part out and leaves the rest as it was,
+/// whichever way its black is stored (PB-218).
+#[test]
+fn blacks_out_part_of_a_fax_picture_whichever_way_its_black_is_stored() {
+    for black_is_1 in [true, false] {
+        fax_redacted(black_is_1, |p| drawn(p, 0));
+    }
+}
+
 #[test]
 fn drops_a_picture_from_shared_resources_when_no_page_draws_it() {
     let mut p = make(&[
@@ -2222,6 +2290,16 @@ fn cross_check_a_letter_whose_width_is_taken_back_with_poppler() {
         let after = tools::pdftotext(&p.to_bytes().unwrap());
         assert!(!after.contains('t'), "{take}: {after}");
         assert!(after.contains("here"), "{take}: {after}");
+    }
+}
+
+/// [`blacks_out_part_of_a_fax_picture_whichever_way_its_black_is_stored`] read back by
+/// poppler: `cargo test -p limarepdf-core --test redact -- --ignored cross_check`.
+#[test]
+#[ignore]
+fn cross_check_a_fax_picture_redacted_either_way_with_poppler() {
+    for black_is_1 in [true, false] {
+        fax_redacted(black_is_1, |p| tools::pdftoppm(&p.to_bytes().unwrap()));
     }
 }
 
