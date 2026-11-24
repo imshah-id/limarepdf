@@ -642,6 +642,10 @@
   replaced each scan with a picture of one pixel, and `render` drew at 1152 dpi when asked for more and at 3.6 when
   asked for less. The `--quality` of `render` and `optimize-scans` is refused outside 1 to 100, where before 0 was
   taken as 1 and anything above 100 as 100.
+- On the command line, `form fill --values` takes back the values `form list --json` prints, edited, when the form
+  has a read-only field: that field's value, unchanged, is left as it is, and the report says how many were.
+  Before, filling stopped at the read-only field and wrote nothing. Any other value for a read-only field is still
+  refused.
 
 ### Changed
 
