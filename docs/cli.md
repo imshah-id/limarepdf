@@ -64,13 +64,14 @@ the status it would have had otherwise.
 | Command | What it does |
 | --- | --- |
 | `limarepdf-cli form fill in.pdf -o out.pdf --set name=Ann --set agree=on` | Fill in fields. Checkboxes take `on` or `off`; a multi-select list takes its choices separated by `\|` |
-| `limarepdf-cli form fill in.pdf -o out.pdf --values values.json` | Fill in fields from a JSON object in the form `limarepdf-cli form list --json` prints, so you can list, edit and fill. A choice can be given by its export value or by the text shown for it. `--set` can be added and is applied after the file |
+| `limarepdf-cli form fill in.pdf -o out.pdf --values values.json` | Fill in fields from a JSON object in the form `limarepdf-cli form list --json` prints, so you can list, edit and fill. A read-only field given the value it holds, as listed, is left as it is, and the report says how many were. A choice can be given by its export value or by the text shown for it. `--set` can be added and is applied after the file |
 | `limarepdf-cli form reset in.pdf -o out.pdf` | Put every field back to its default value. Refuses a form whose fields are nested more than 32 levels deep, which LimarePDF can't follow to the end |
 | `limarepdf-cli form flatten in.pdf -o out.pdf` | Draw the fields into the pages as they look now and remove them, so they can no longer be filled in. `--pages 1-3` flattens only those pages; fields elsewhere stay fillable. Refuses, naming the fields, when a shown value has no drawing and LimarePDF can't draw it (Hebrew, Arabic and other right-to-left or shaped scripts, emoji made of several characters and characters no installed font has), rather than lose it, and refuses a form whose fields are nested more than 32 levels deep, which LimarePDF can't follow to the end |
 | `limarepdf-cli form fill in.pdf -o out.pdf --values values.json --flatten` | Fill in, then flatten |
 
-Filling checks every value first: an unknown field name, a read-only field, text too long for the field, a line
-break in a single-line field, or an option the field doesn't have stops it before anything is written. LimarePDF draws
+Filling checks every value first: an unknown field name, a read-only field given a value other than its own, text
+too long for the field, a line break in a single-line field, or an option the field doesn't have stops it before
+anything is written. LimarePDF draws
 each filled field itself, so the values show in every reader. Field text can be Latin, Greek, Cyrillic, Chinese,
 Japanese, Korean or single emoji; Hebrew, Arabic and other right-to-left or shaped scripts, emoji made of several
 characters and characters no installed font has are refused rather than written wrongly. When the field's own
