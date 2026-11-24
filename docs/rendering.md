@@ -187,11 +187,12 @@ on which fonts are installed, as in other viewers.
   the file.
 - When hayro reports a picture it can't decode, the app shows a notice that parts of the document couldn't be drawn.
 - The same notice covers what is left out before hayro draws, because drawing it would take gigabytes or hours: a
-  picture stating far more pixels than its data holds, and a tiling pattern (a cell repeated to fill a shape) whose
+  picture stating far more pixels than its data holds, a black-and-white (fax) picture stating more than 131,072
+  pixels across and more than 16 million in all, and a tiling pattern (a cell repeated to fill a shape) whose
   cell hayro would draw over 10,000 times, or whose tile would take over 256 MB or be over 65,530 pixels long at
   some zoom, including where a drawing it is in skews or stretches it. They are left out of the page as it is
   shown, printed as a picture and read by OCR; the document keeps them, and other readers may draw them. None of
-  the public test files that open has either.
+  the public test files that open has any of them.
 - A second notice covers fonts that aren't embedded or installed: which are shown with a stand-in, or which
   language has no font at all, and what to install (see [Fonts that aren't embedded](#fonts-that-arent-embedded)).
   Plain fonts that aren't embedded are drawn with the closest of the standard fonts (Helvetica for Arial) and

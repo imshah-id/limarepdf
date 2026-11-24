@@ -6,6 +6,9 @@ all-features = true
 # Known advisories (RustSec). Each one set aside has its reason; releasing.md's step 1 looks for
 # fixes before each release.
 [advisories]
+# Unmaintained crates are reported wherever they are in the tree, not only among the workspace's
+# own dependencies (cargo-deny 0.22's default), so the ones set aside below stay checked.
+unmaintained = "all"
 ignore = [
     # Unmaintained, with no known vulnerability, and reached only through eframe: ttf-parser
     # through winit's window decorations on Wayland, the zbus ones through AccessKit on Linux.

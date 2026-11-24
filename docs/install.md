@@ -68,7 +68,9 @@ sudo ln -s /Applications/LimarePDF.app/Contents/MacOS/limarepdf-cli /usr/local/b
 ## Linux packages
 
 The easiest way is LimarePDF's package repository, which brings updates with the rest of your system. It is signed
-with the project's key (see [Checking a download](#checking-a-download)).
+with the project's key (see [Checking a download](#checking-a-download)). Its packages need glibc 2.43 or later
+too: on an older system, Debian 13 and Ubuntu 24.04 among them, it keeps the version installed now, and newer
+versions have to be [built from source](#build-from-source).
 
 Debian and Ubuntu:
 

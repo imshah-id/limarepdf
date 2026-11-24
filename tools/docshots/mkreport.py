@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """The made-up "Quarterly Field Report" the user guide's screenshots show (docs/images).
 
-    python3 -I tools/docshots/mkreport.py OUT [--plain | --review]
+    python3 -I tools/docshots/mkreport.py OUT [--plain | --review | --form]
 
 Three pages, each a heading, a paragraph or two and a bar chart. By default page 1 carries Pat Example's
 highlight, note, pen tick and text box with an arrow. --plain leaves them out. --review adds Alex Kim's
 and Sam Lee's review: two notes, a highlight and an underline on page 1, a reply to a note and one to the
-highlight, and a note on page 2 (12 comments in all).
+highlight, and a note on page 2 (12 comments in all). --form writes the same survey's one-page "Site visit
+request" instead, empty: text fields, a drop-down, three checkboxes and a multi-line Notes field.
 
 The comments are written as LimarePDF writes them, without appearance streams (the app draws them).
 Their dates are fixed and carry no time zone, so the app shows them as written. The text is set in
@@ -138,6 +139,53 @@ def page_content(n, title, sub, body, bars):
     return c
 
 
+INK = (0.1, 0.1, 0.12)
+COMBO, MULTILINE = 1 << 17, 1 << 12
+STATIONS = ["Station %d (%s the weir)" % (n, "above" if n <= 6 else "below") for n in range(1, 13)]
+
+
+def form_page():
+    """The site visit request's page and its fields, as comments() gives a page's comments; {YES} and
+    {OFF} are a checkbox's two looks, filled in by build()."""
+    c = text("F1", 9, 540 - width("F1", 9, "Northern Water Survey"), 740, "Northern Water Survey", (0.2, 0.2, 0.2))
+    c += "%.3f %.3f %.3f rg 72 716 468 3 re f\n" % BLUE
+    c += text("F2", 24, 72, 678, "Site visit request", INK)
+    c += text("F1", 12, 72, 658, "Please send this form at least a week before your visit.", (0.42, 0.45, 0.5))
+    c += "0.6 0.62 0.66 RG 0.75 w\n"
+    fields = []
+
+    def field(name, tip, rect, rest, da="/Helv 11 Tf 0 g"):
+        fields.append((name, None, "<< /Type /Annot /Subtype /Widget /P {P} /F %d /T (%s) /TU (%s) /Rect [%s] "
+                       "/DA (%s) %s >>" % (PRINT, name, esc(tip), nums(*rect), da, rest)))
+
+    def labelled(label, x, y, x1, x2):
+        return text("F1", 11, x, y + 6, label, INK) + "%s m %s l S\n" % (nums(x1, y), nums(x2, y))
+
+    y = 612
+    for name, label in [("name", "Your name"), ("organisation", "Organisation"), ("email", "Email")]:
+        c += labelled(label, 72, y, 180, 540)
+        field(name, label, (180, y, 540, y + 20), "/FT /Tx")
+        y -= 34
+    c += labelled("Station", 72, y, 180, 400)
+    field("station", "Station to visit", (180, y, 400, y + 20),
+          "/FT /Ch /Ff %d /Opt [%s]" % (COMBO, " ".join("(%s)" % s for s in STATIONS)))
+    y -= 34
+    c += labelled("Visit date", 72, y, 180, 300) + labelled("Visitors", 330, y, 400, 460)
+    field("date", "Visit date (YYYY-MM-DD)", (180, y, 300, y + 20), "/FT /Tx")
+    field("visitors", "How many people", (400, y, 460, y + 20), "/FT /Tx")
+    y -= 44
+    for name, label in [("safety", "I have read the site safety notes"), ("parking", "We need a parking space"),
+                        ("samples", "We will take water samples")]:
+        c += "%s re S\n" % nums(180, y, 14, 14) + text("F1", 11, 202, y + 3, label, INK)
+        field(name, label, (180, y, 194, y + 14),
+              "/FT /Btn /V /Off /AS /Off /MK << /CA (4) >> /AP << /N << /Yes {YES} /Off {OFF} >> >>", "/ZaDb 0 Tf 0 g")
+        y -= 24
+    y -= 70
+    c += text("F1", 11, 72, y + 48, "Notes", INK) + "%s re S\n" % nums(180, y, 360, 62)
+    field("notes", "Anything we should know", (180, y, 540, y + 62), "/FT /Tx /Ff %d" % MULTILINE)
+    return c, {0: fields}
+
+
 # Who and when: each comment's author and fixed date (no time zone: shown as written).
 PAT = ("Pat Example", "D:20261020093000")
 ALEX = ("Alex Kim", "D:20261028192900")
@@ -229,25 +277,48 @@ def build(mode):
         objs[len(objs) + 1] = body
         return len(objs)
 
+    def stream(c, rest=""):
+        c = c.encode()
+        return b"<< /Length %d%s >>stream\n" % (len(c), rest.encode()) + c + b"\nendstream"
+
     catalog, pages = add(), add()
     fonts = " ".join("/%s %d 0 R" % (k, add(font_dict(k))) for k in FONTS)
-    notes = comments(mode)
-    kids = []
-    for i, page in enumerate(PAGES):
-        c = page_content(i + 1, *page).encode()
-        cid = add(b"<< /Length %d >>stream\n" % len(c) + c + b"\nendstream")
+    looks = {}
+    if mode == "form":
+        content, notes = form_page()
+        contents = [content]
+        helv = add("<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>")
+        zadb = add("<< /Type /Font /Subtype /Type1 /BaseFont /ZapfDingbats >>")
+        box = " /Type /XObject /Subtype /Form /BBox [0 0 14 14] /Resources << /Font << /ZaDb %d 0 R >> >>" % zadb
+        looks["{YES}"] = add(stream("0 g BT /ZaDb 11.2 Tf 2.26 3.08 Td (4) Tj ET", box))
+        looks["{OFF}"] = add(stream("", box))
+    else:
+        contents = [page_content(i + 1, *page) for i, page in enumerate(PAGES)]
+        notes = comments(mode)
+    kids, widgets = [], []
+    for i, c in enumerate(contents):
+        cid = add(stream(c))
         pid = add()
         ids = {key: add() for key, _, _ in notes.get(i, [])}
         for key, parent, d in notes.get(i, []):
             d = d.replace("{P}", "%d 0 R" % pid).replace("{NM}", "docshots-%s" % key)
+            for k, v in looks.items():
+                d = d.replace(k, "%d 0 R" % v)
             objs[ids[key]] = d.replace("{IRT}", "%d 0 R" % ids[parent]) if parent else d
         listed = " /Annots [%s]" % " ".join("%d 0 R" % v for v in ids.values()) if ids else ""
         objs[pid] = "<< /Type /Page /Parent %d 0 R /MediaBox [0 0 612 792] /Contents %d 0 R /Resources << /Font << %s >> >>%s >>" % (
             pages, cid, fonts, listed)
         kids.append(pid)
-    objs[catalog] = "<< /Type /Catalog /Pages %d 0 R >>" % pages
+        widgets += ids.values()
+    if mode == "form":
+        objs[catalog] = ("<< /Type /Catalog /Pages %d 0 R /AcroForm << /Fields [%s] /DA (/Helv 11 Tf 0 g) "
+                         "/DR << /Font << /Helv %d 0 R /ZaDb %d 0 R >> >> >> >>") % (
+            pages, " ".join("%d 0 R" % w for w in widgets), helv, zadb)
+        info = add("<< /Title (Site visit request) /Author (Northern Water Survey) /CreationDate (D:20261020090000) >>")
+    else:
+        objs[catalog] = "<< /Type /Catalog /Pages %d 0 R >>" % pages
+        info = add("<< /Title (Quarterly Field Report) /Author (Pat Example) /CreationDate (D:20261020090000) >>")
     objs[pages] = "<< /Type /Pages /Kids [%s] /Count %d >>" % (" ".join("%d 0 R" % k for k in kids), len(kids))
-    info = add("<< /Title (Quarterly Field Report) /Author (Pat Example) /CreationDate (D:20261020090000) >>")
     out = b"%PDF-1.7\n"
     offsets = []
     for i in range(1, len(objs) + 1):
@@ -266,7 +337,7 @@ def build(mode):
 def main(args):
     flags = [a for a in args if a.startswith("--")]
     paths = [a for a in args if not a.startswith("--")]
-    if len(paths) != 1 or len(flags) > 1 or not set(flags) <= {"--plain", "--review"}:
+    if len(paths) != 1 or len(flags) > 1 or not set(flags) <= {"--plain", "--review", "--form"}:
         sys.exit(__doc__.strip().splitlines()[2].strip())
     mode = flags[0][2:] if flags else "comments"
     pathlib.Path(paths[0]).write_bytes(build(mode))

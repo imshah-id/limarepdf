@@ -537,9 +537,9 @@ detail is in [How it is built](developer/architecture.md#content-editing).
   words.
 - A paragraph grows and shrinks downwards in its frame; nothing else on the page moves, and text doesn't flow on
   to the next column or page. Links and comments stay where they are, so a paragraph rewrapped or made narrower
-  can move its words out from under them. While you type in a line or a paragraph, a comment another app saved
-  without a look of its own (which LimarePDF draws for it) is hidden with the old text until the change is kept;
-  other comments and form fields show. A typed word takes the style of the character before it, so typed
+  can move its words out from under them. While you type in a line or a paragraph, the page's comments and form
+  fields still show, including a comment another app saved without a look of its own, which LimarePDF draws for
+  it. A typed word takes the style of the character before it, so typed
   right after a symbol (a bullet, say) it is in the symbol's font. A letter TeX draws as its accent over its letter (an older way of writing
   "ü") reads as the accent, then the letter ("Pr¨ufung"), in the paragraph you type in too; it is written back as
   it was drawn, so other readers still read it as one letter.

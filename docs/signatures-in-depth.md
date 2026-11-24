@@ -579,7 +579,10 @@ the reason says which rule: *never allowed after signing*, *the certification al
 locked it*.
 
 Each version a later signature signed is compared with the one before it, so a change made and undone between two
-signatures still counts against both: the second signer signed something the first didn't.
+signatures still counts against both: the second signer signed something the first didn't. This holds for every
+later signed version, also one past the 100 versions LimarePDF opens and one signed by a signature it can't check;
+a later version other apps may read differently is refused for every signature before it, and so is a later
+signature signing a part of the file that isn't one of its versions.
 
 ### How LimarePDF judges a change
 
@@ -615,6 +618,12 @@ refuses as malformed:
   9,223,372,036,854,775,807, which Poppler takes as damage; or a cross-reference stream's type wider than 4 bytes. A
   signed file whose own sections are like this opens as a file other apps may read differently, so its signatures
   show *can't check*;
+- cross-reference information other apps may read otherwise: a cross-reference stream naming another
+  (`/XRefStm`); a mixed (hybrid) section whose table frees an object its stream places, or an object freed that
+  LimarePDF's PDF library still reads as in use; an object given two different entries in one section; a stream
+  whose rows are under 3 bytes wide; a pointer to a section that lands near it rather than on it; or a version
+  taking its catalog or encryption from another section, or whose encryption dictionary other apps may read
+  otherwise;
 - a cross-reference table subsection of more than one entry that starts at object 1 with a free entry: Poppler (for
   one at offset 0 with generation 65535) and pdf.js (for any) take it for one that should start at 0, as files from
   IBM's patent server have it, and read each entry as the object before. A signed file whose own table is like this
