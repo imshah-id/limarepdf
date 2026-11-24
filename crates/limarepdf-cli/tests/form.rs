@@ -1,5 +1,6 @@
 //! `limarepdf-cli form fill`: a field past the 10,000 LimarePDF lists is filled by name, as
-//! any other (PB-174). It was refused as not there.
+//! any other (PB-174). It was refused as not there. The values `form list --json` prints are
+//! taken back with a read-only field among them (PB-207).
 
 use limarepdf_core::{FieldValue, Pdf};
 use std::path::{Path, PathBuf};
@@ -61,6 +62,29 @@ fn make_titled(dir: &Path, kids: usize) -> PathBuf {
         ),
     ];
     objects.extend((0..kids).map(|i| format!("<< /FT /Tx /T (k{i}) /V (v) /Parent 4 0 R >>")));
+    write_pdf(dir, &objects)
+}
+
+/// A one-page PDF at `dir/in.pdf` with the line "Unrelated" and a form of two text fields:
+/// `Reference`, read-only, holding "A-100", and `Name`, holding "Ann".
+fn make_read_only(dir: &Path) -> PathBuf {
+    let objects = vec![
+        "<< /Type /Catalog /Pages 2 0 R /AcroForm << /Fields [4 0 R 5 0 R] \
+         /DA (/Helv 10 Tf 0 g) /DR << /Font << /Helv 7 0 R >> >> >> >>"
+            .to_string(),
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".into(),
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Contents 6 0 R \
+         /Resources << /Font << /F1 7 0 R >> >> /Annots [4 0 R 5 0 R] >>"
+            .into(),
+        "<< /Type /Annot /Subtype /Widget /FT /Tx /T (Reference) /Ff 1 /V (A-100) /F 4 \
+         /Rect [25 100 170 120] /P 3 0 R >>"
+            .into(),
+        "<< /Type /Annot /Subtype /Widget /FT /Tx /T (Name) /V (Ann) /F 4 \
+         /Rect [25 70 170 90] /P 3 0 R >>"
+            .into(),
+        stream("", "BT /F1 12 Tf 25 30 Td (Unrelated) Tj ET"),
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>".into(),
+    ];
     write_pdf(dir, &objects)
 }
 
@@ -168,5 +192,65 @@ fn fill_says_a_field_past_what_is_read_may_be_there() {
         assert!(!res.status.success(), "{kids}");
         assert!(err.contains(says), "{kids}: {err}");
         assert!(!dir.join("out.pdf").exists(), "{kids}");
+    }
+}
+
+/// The values `form list --json` prints, one changed, fill the form in again though a
+/// read-only field is among them: its value is left as it is, and the report says so
+/// (PB-207). Filling stopped at it, writing nothing. Given as it is with `--set`, it is left
+/// too; any other value for it is still refused, writing nothing.
+#[test]
+fn fill_takes_back_the_values_listed() {
+    let dir = folder("round-trip");
+    make_read_only(&dir);
+    let listed = run(&dir, &["form", "list", "in.pdf", "--json"]);
+    assert_eq!(listed.status.code(), Some(0));
+    let mut values: serde_json::Value = serde_json::from_slice(&listed.stdout).unwrap();
+    assert_eq!(values["Reference"], "A-100");
+    values["Name"] = "Bert".into();
+    std::fs::write(dir.join("values.json"), values.to_string()).unwrap();
+    let fill = |args: &[&str], output: &str| {
+        let res = run(
+            &dir,
+            &[&["form", "fill", "in.pdf"], args, &["-o", output]].concat(),
+        );
+        let out = String::from_utf8_lossy(&res.stdout).into_owned();
+        let err = String::from_utf8_lossy(&res.stderr).into_owned();
+        (res.status.code(), out, err)
+    };
+
+    let (code, out, err) = fill(&["--values", "values.json"], "out.pdf");
+    assert_eq!(code, Some(0), "{err}");
+    assert!(
+        out.starts_with("filled 1 field(s); left 1 read-only field(s) as they were; wrote "),
+        "{out}"
+    );
+    let pdf = Pdf::open(dir.join("out.pdf"), None).unwrap();
+    let value = |name: &str| {
+        let fields = pdf.form_fields();
+        fields.into_iter().find(|f| f.name == name).unwrap().value
+    };
+    assert_eq!(value("Name"), FieldValue::Text("Bert".into()));
+    assert_eq!(value("Reference"), FieldValue::Text("A-100".into()));
+    assert!(pdf.page_text(0).contains("Unrelated"));
+
+    let (code, out, err) = fill(&["--set", "Reference=A-100"], "same.pdf");
+    assert_eq!(code, Some(0), "{err}");
+    assert!(
+        out.starts_with("filled 0 field(s); left 1 read-only field(s) as they were; wrote "),
+        "{out}"
+    );
+
+    values["Reference"] = "A-200".into();
+    std::fs::write(dir.join("changed.json"), values.to_string()).unwrap();
+    for args in [&["--values", "changed.json"], &["--set", "Reference=A-200"]] {
+        let (code, out, err) = fill(args, "changed.pdf");
+        assert_eq!(code, Some(1), "{args:?}");
+        assert_eq!(out, "", "{args:?}");
+        assert!(
+            err.contains("the field \"Reference\" is read-only"),
+            "{args:?}: {err}"
+        );
+        assert!(!dir.join("changed.pdf").exists(), "{args:?}");
     }
 }

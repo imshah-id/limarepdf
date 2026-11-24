@@ -1394,7 +1394,8 @@ fn form_fill(io: &Io, set: &[String], values: &Option<PathBuf>, flatten: bool) -
             None => pdf.form_field(name),
         }
     };
-    let mut todo: Vec<(String, FieldValue)> = Vec::new();
+    // Each value, and whether its field is read-only.
+    let mut todo: Vec<(String, FieldValue, bool)> = Vec::new();
     if let Some(path) = values {
         not_an_input(&[path], &io.output)?;
         let text = std::fs::read_to_string(path)
@@ -1408,32 +1409,41 @@ fn form_fill(io: &Io, set: &[String], values: &Option<PathBuf>, flatten: bool) -
             );
         };
         for (name, v) in &map {
-            todo.push((name.clone(), value_from_json(&field(name)?, v)?));
+            let f = field(name)?;
+            todo.push((name.clone(), value_from_json(&f, v)?, f.read_only));
         }
     }
     for s in set {
         let Some((name, v)) = s.split_once('=') else {
             bail!("--set takes NAME=VALUE, not \"{s}\"");
         };
-        todo.push((name.to_string(), value_from_text(&field(name)?, v)?));
+        let f = field(name)?;
+        todo.push((name.to_string(), value_from_text(&f, v)?, f.read_only));
     }
     if todo.is_empty() {
         bail!("nothing to fill in: give --set NAME=VALUE or --values FILE");
     }
-    for (name, v) in &todo {
+    for (name, v, _) in &todo {
         pdf.set_field(name, v.clone())?;
     }
     if flatten {
         pdf.flatten_form(None)?;
     }
     save_edited(io, &mut pdf, &original, false)?;
+    // A read-only field's value is taken only when it is the one it holds, and left.
+    let left = todo.iter().filter(|t| t.2).count();
     out!(
-        "filled {} field(s){}; wrote {}",
-        todo.len(),
+        "filled {} field(s){}{}; wrote {}",
+        todo.len() - left,
         if flatten {
             " and flattened the form"
         } else {
             ""
+        },
+        if left > 0 {
+            format!("; left {left} read-only field(s) as they were")
+        } else {
+            String::new()
         },
         io.output.display()
     );

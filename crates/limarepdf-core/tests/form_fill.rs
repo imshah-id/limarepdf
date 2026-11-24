@@ -394,6 +394,42 @@ fn refuses_values_that_dont_fit() {
     assert_eq!(value(&p, "one"), FieldValue::Text(String::new()));
 }
 
+/// A read-only field given the value it holds is left as it is, so values read from a form
+/// can be given back (PB-207): even text LimarePDF couldn't write. Any other value is refused,
+/// a choice by its shown text too, and so is a read-only push button. It refused them all.
+#[test]
+fn read_only_fields_take_back_their_own_values() {
+    let mut p = page();
+    form(
+        &mut p,
+        vec![
+            dictionary! { "FT" => "Tx", "T" => text("ref"), "Ff" => 1, "V" => text("A-100"), "Rect" => rect(0.0, 0.0, 80.0, 20.0) },
+            dictionary! { "FT" => "Tx", "T" => text("he"), "Ff" => 1, "V" => utf16("של"), "Rect" => rect(0.0, 30.0, 80.0, 20.0) },
+            dictionary! { "FT" => "Ch", "T" => text("pick"), "Ff" => 1, "V" => text("a"),
+            "Opt" => vec![Object::Array(vec![text("a"), text("Apple")])], "Rect" => rect(0.0, 60.0, 80.0, 20.0) },
+            dictionary! { "FT" => "Btn", "Ff" => 1 | 1 << 16, "T" => text("go"), "Rect" => rect(0.0, 90.0, 80.0, 20.0) },
+        ],
+    );
+    let t = |s: &str| FieldValue::Text(s.into());
+    let before = p.doc.objects.clone();
+    p.set_field("ref", t("A-100")).unwrap();
+    p.set_field("he", t("של")).unwrap();
+    p.set_field("pick", FieldValue::Choice(vec!["a".into()]))
+        .unwrap();
+    assert!(p.doc.objects == before);
+
+    let err = |r: limarepdf_core::Result<()>| r.unwrap_err().to_string();
+    assert_eq!(
+        err(p.set_field("ref", t("A-200"))),
+        "the field \"ref\" is read-only"
+    );
+    assert!(
+        err(p.set_field("pick", FieldValue::Choice(vec!["Apple".into()]))).contains("read-only")
+    );
+    assert!(err(p.set_field("go", FieldValue::None)).contains("read-only"));
+    assert!(p.doc.objects == before);
+}
+
 #[test]
 fn passwords_are_drawn_hidden_and_not_kept() {
     let mut p = page();

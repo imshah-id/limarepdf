@@ -98,10 +98,16 @@ impl Pdf {
     /// an option (a choice's shown text is accepted too). Read-only fields, push buttons
     /// and signature fields can't be set, and text LimarePDF can't write (right-to-left or
     /// shaped scripts, emoji of several characters, characters no installed font has) is
-    /// refused rather than saved wrongly.
+    /// refused rather than saved wrongly. A read-only field given the value it holds, exactly
+    /// as [`Pdf::form_fields`] reads it, is left as it is, so values read from a form can be
+    /// given back.
     pub fn set_field(&mut self, name: &str, value: FieldValue) -> Result<()> {
         let (field, node) = self.named_node(name)?;
         if field.read_only {
+            // Compared before the value is checked: one read may be text LimarePDF can't write.
+            if value != FieldValue::None && value == field.value {
+                return Ok(());
+            }
             bail!("the field \"{name}\" is read-only");
         }
         let value = check_value(&field, value)?;

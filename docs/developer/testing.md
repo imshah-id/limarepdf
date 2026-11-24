@@ -945,6 +945,16 @@ the picture's placing finite); opt-in, `cross_check_page_sizes_with_poppler` (`p
 `render_region.rs`'s `an_export_resolution_out_of_range_is_refused` (`encode_pages` and `export_images`, the
 folder not made).
 
+A form's listed values filled back in, PB-207 (2026-11-23; each test written first and seen failing on e2b2850;
+logs in the cycle folder's `runs/s2-form-round-trip/`): `limarepdf-cli`'s `form.rs`
+`fill_takes_back_the_values_listed` (`form list --json` of a form with a read-only field, one value changed, then
+`form fill --values`: the change written, the read-only value as it was, the page's own text kept, the report saying
+one field was left; `--set` with its own value left too; another value, by either, refused naming the field, no file
+written; before, the listed values were refused) and core's `form_fill.rs`
+`read_only_fields_take_back_their_own_values` (a read-only field's own value, text LimarePDF can't write among
+them, taken with the document unchanged; another value, a choice by its shown text and a read-only push button
+refused).
+
 Later additions (recent files, document notices, fit width, the theme button, crop)
 were checked by screenshot under a virtual X server; not every one has been clicked through by hand. Of the newest:
 the page layouts (facing and single page) have unit tests for pairing and fitting but were not clicked through;
