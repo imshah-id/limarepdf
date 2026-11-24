@@ -646,6 +646,8 @@
   has a read-only field: that field's value, unchanged, is left as it is, and the report says how many were.
   Before, filling stopped at the read-only field and wrote nothing. Any other value for a read-only field is still
   refused.
+- Optimise scanned pages keeps a black-and-white scan stored as a fax picture (CCITT Group 4) that marks its black
+  as 1, as some scanners write it, black on white. Before, such pages came out as a negative, white on black.
 
 ### Changed
 
