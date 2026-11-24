@@ -11473,9 +11473,13 @@ mod tests {
         let named = |tree: &TreeUpdate, label: &str| {
             tree.nodes.iter().any(|(_, n)| n.label() == Some(label))
         };
+        // The inspector's Bold, the one with a state: the floating bar's is a command.
         let bold = |tree: &TreeUpdate| {
-            let n = tree.nodes.iter().find(|(_, n)| n.label() == Some("Bold"));
-            n.and_then(|(_, n)| n.toggled()) == Some(Toggled::True)
+            let n = tree
+                .nodes
+                .iter()
+                .find(|(_, n)| n.label() == Some("Bold") && n.toggled().is_some());
+            n.expect("the inspector's Bold").1.toggled() == Some(Toggled::True)
         };
         let mut tree = frame(&mut app, vec![]);
         for _ in 0..4 {
