@@ -166,11 +166,12 @@ enum Cmd {
         pages: String,
         #[arg(long, value_enum, default_value = "auto")]
         mode: ScanModeArg,
-        /// Greyscale and colour images above this resolution are downsampled to it
-        #[arg(long, default_value_t = 200.0)]
+        /// Greyscale and colour images above this resolution are downsampled to it, 10 to
+        /// 10000
+        #[arg(long, default_value_t = 200.0, value_parser = parse_picture_dpi)]
         max_dpi: f32,
         /// JPEG quality for greyscale and colour images, 1 to 100
-        #[arg(long, default_value_t = 75)]
+        #[arg(long, default_value_t = 75, value_parser = clap::value_parser!(u8).range(1..=100))]
         quality: u8,
         /// Do not straighten tilted pages
         #[arg(long)]
@@ -620,13 +621,13 @@ enum Cmd {
         input: PathBuf,
         #[arg(long, default_value = "all")]
         pages: String,
-        /// Resolution, at most 1152
-        #[arg(long, default_value_t = 150.0)]
+        /// Resolution, 36 to 1152
+        #[arg(long, default_value_t = 150.0, value_parser = parse_render_dpi)]
         dpi: f32,
         #[arg(long, value_enum, default_value_t = FormatArg::Png)]
         format: FormatArg,
         /// JPEG quality, 1 to 100
-        #[arg(long, default_value_t = 90)]
+        #[arg(long, default_value_t = 90, value_parser = clap::value_parser!(u8).range(1..=100))]
         quality: u8,
         #[arg(long)]
         out_dir: PathBuf,
@@ -977,12 +978,34 @@ fn kb(bytes: usize) -> String {
 /// Page size for imported images.
 #[derive(Args, Clone)]
 struct ImageSize {
-    /// Resolution in dots per inch, overriding the one stored in the files
-    #[arg(long)]
+    /// Resolution in dots per inch, overriding the one stored in the files, 10 to 10000
+    #[arg(long, value_parser = parse_picture_dpi)]
     dpi: Option<f32>,
-    /// Resolution assumed for files that state none
-    #[arg(long, default_value_t = 150.0)]
+    /// Resolution assumed for files that state none, 10 to 10000
+    #[arg(long, default_value_t = 150.0, value_parser = parse_picture_dpi)]
     fallback_dpi: f32,
+}
+
+/// A resolution in dots per inch, one of `range`.
+fn parse_dpi(s: &str, range: std::ops::RangeInclusive<f32>) -> std::result::Result<f32, String> {
+    match s.trim().parse::<f32>() {
+        Ok(d) if range.contains(&d) => Ok(d),
+        _ => Err(format!(
+            "expected a resolution from {} to {} dpi",
+            range.start(),
+            range.end()
+        )),
+    }
+}
+
+/// A resolution pictures are sized from, or scans brought down to.
+fn parse_picture_dpi(s: &str) -> std::result::Result<f32, String> {
+    parse_dpi(s, limarepdf_core::USABLE_DPI)
+}
+
+/// A resolution pages are rendered at.
+fn parse_render_dpi(s: &str) -> std::result::Result<f32, String> {
+    parse_dpi(s, render::MIN_DPI..=render::MAX_DPI)
 }
 
 impl ImageSize {
