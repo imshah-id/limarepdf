@@ -448,3 +448,34 @@ fn an_export_with_one_page_too_large_writes_no_pages() {
     assert!(e.to_string().contains("page 3"), "{e}");
     assert_eq!(files_in(&dir), 0);
 }
+
+/// A resolution outside 36 to 1152 dpi is refused, the export's folder not even made, where
+/// it was brought into that range before; its ends are drawn at their sizes (PB-206).
+#[test]
+fn an_export_resolution_out_of_range_is_refused() {
+    let mut p = red_far_off(&[(60.0, 40.0)], 0);
+    let hp = render::load(p.snapshot().unwrap(), None).unwrap();
+    let never = [0.0, -1.0, f32::NAN, f32::INFINITY, 35.9, 1152.5, 2000.0];
+    for dpi in never {
+        let e = render::encode_pages(&hp, &[0], dpi, render::ImageFormat::Png).unwrap_err();
+        assert!(e.to_string().contains("from 36 to 1152 dpi"), "{dpi}: {e}");
+        let (_scratch, dir) = export_dir("out-of-range");
+        let e = p
+            .export_images(
+                &[0],
+                dpi,
+                render::ImageFormat::Png,
+                &dir,
+                "page",
+                &mut Default::default(),
+            )
+            .unwrap_err();
+        assert!(e.to_string().contains("from 36 to 1152 dpi"), "{dpi}: {e}");
+        assert!(!dir.exists(), "{dpi}");
+    }
+    for (dpi, size) in [(36.0, (30, 20)), (1152.0, (960, 640))] {
+        let files = render::encode_pages(&hp, &[0], dpi, render::ImageFormat::Png).unwrap();
+        let i = image::load_from_memory(&files[0]).unwrap();
+        assert_eq!((i.width(), i.height()), size, "{dpi}");
+    }
+}
