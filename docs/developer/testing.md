@@ -968,6 +968,20 @@ summary line, read back the same from a child process's lines, and counted; with
 compared, which counts toward the skip limit; before, page 2 passed over and the file the same). The control:
 node-signpdf's `signed.pdf`, the same, both saves adding a revision and saying so.
 
+A fax scan storing its black as 1, PB-218 (2026-11-24; each test written first, the scan tests seen failing on
+47ce6a4; logs in the cycle folder's `runs/s2-scan-polarity/`), in core's `scan.rs`:
+`a_fax_scan_shows_as_it_did_whichever_way_its_black_is_stored` (three Group 4 text scans, the first and last with
+`/BlackIs1 true`, each drawn as made; pages 1 and 2 optimised to black and white, saved and reopened, each still
+drawn as made, and page 3, left, keeping its picture; before, page 1 saved differed in every pixel) and, opt-in,
+`poppler_shows_a_fax_scan_as_it_was_whichever_way_its_black_is_stored` (`pdftoppm` draws each page as before; before,
+page 1's mean brightness was 24 of 255); `redact.rs`'s
+`blacks_out_part_of_a_fax_picture_whichever_way_its_black_is_stored` (a grid in a Group 4 picture stored either way,
+part blacked out: the mark black, everything outside it as it was; a guard, passing before too, as redaction already
+wrote the picture back the way it came) and, opt-in, `cross_check_a_fax_picture_redacted_either_way_with_poppler` (the
+same, drawn by `pdftoppm`). Over the render corpus's 23 files with fax pictures, main's command line against the
+fix's: PDFBox's `2779.pdf` pages 2 and 3 were negative before (83% of pixels changed at 20 dpi), now within 0.02%
+(straightened by 0.2°); every other page drew the same with both.
+
 Later additions (recent files, document notices, fit width, the theme button, crop)
 were checked by screenshot under a virtual X server; not every one has been clicked through by hand. Of the newest:
 the page layouts (facing and single page) have unit tests for pairing and fitting but were not clicked through;

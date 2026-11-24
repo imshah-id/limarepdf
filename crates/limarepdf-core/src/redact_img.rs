@@ -212,6 +212,7 @@ pub(crate) fn decode(doc: &Document, s: &Stream, spaces: &Dictionary, mask: bool
             else {
                 return Err("cannot decode the CCITT picture".into());
             };
+            // Kept to write the picture back as it came.
             let black_is_1 = d
                 .get(b"DecodeParms")
                 .and_then(|o| o.as_dict())
@@ -222,7 +223,7 @@ pub(crate) fn decode(doc: &Document, s: &Stream, spaces: &Dictionary, mask: bool
             let mut data = vec![0u8; stride * h];
             for (i, &v) in g.as_raw().iter().enumerate() {
                 let (x, y) = (i % w, i / w);
-                if (v == 0) == black_is_1 {
+                if v != 0 {
                     data[y * stride + x / 8] |= 0x80 >> (x % 8);
                 }
             }

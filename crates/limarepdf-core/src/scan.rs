@@ -101,7 +101,7 @@ struct Target {
     spaces: Dictionary,
 }
 
-/// Decoded pixels. `Bits` holds 0 (black) or 255 (white).
+/// Decoded pixels. `Bits` holds 0 (black) or 255 (white), as they show in grey.
 pub(crate) enum Img {
     Bits(GrayImage),
     Gray(GrayImage),
@@ -544,12 +544,17 @@ fn decode_raw(raw: &[u8], w: u32, h: u32, n: usize, bpc: i64) -> std::result::Re
     }
 }
 
+/// The samples a Group 4 fax picture's filter gives, as [`Img::Bits`]: 0 for a 0 bit, 255
+/// for a 1. The code's black is a 0 bit, or with `/BlackIs1 true` a 1 (white in grey).
 pub(crate) fn decode_ccitt(s: &Stream, w: u32, h: u32) -> std::result::Result<Img, String> {
     let parms = s.dict.get(b"DecodeParms").and_then(Object::as_dict).ok();
     let p = |k: &[u8]| parms.and_then(|d| d.get(k).ok()?.as_i64().ok());
-    let aligned = parms
-        .and_then(|d| d.get(b"EncodedByteAlign").ok()?.as_bool().ok())
-        .unwrap_or(false);
+    let flag = |k: &[u8]| {
+        parms
+            .and_then(|d| d.get(k).ok()?.as_bool().ok())
+            .unwrap_or(false)
+    };
+    let (aligned, black_is_1) = (flag(b"EncodedByteAlign"), flag(b"BlackIs1"));
     if p(b"K").unwrap_or(0) >= 0 || aligned {
         return Err("only CCITT Group 4 images are supported".into());
     }
@@ -560,16 +565,17 @@ pub(crate) fn decode_ccitt(s: &Stream, w: u32, h: u32) -> std::result::Result<Im
     if pixel_size(w as i64, h as i64).is_none() {
         return Err("the CCITT image is too large".into());
     }
+    let (black, white) = if black_is_1 { (255, 0) } else { (0, 255) };
     let mut px = Vec::with_capacity((w * h) as usize);
     let data = s.content.iter().copied();
     fax::decoder::decode_g4(data, w, Some(h), |line| {
         px.extend(fax::decoder::pels(line, w).map(|c| match c {
-            fax::Color::Black => 0u8,
-            fax::Color::White => 255,
+            fax::Color::Black => black,
+            fax::Color::White => white,
         }));
     })
     .ok_or("cannot decode the CCITT image")?;
-    px.resize((w * h) as usize, 255);
+    px.resize((w * h) as usize, white);
     GrayImage::from_raw(w, h, px)
         .map(Img::Bits)
         .ok_or_else(|| "cannot decode the CCITT image".into())

@@ -524,6 +524,14 @@ group = "G6"
 needs = ["pdftoppm", "pdftotext"]
 
 [[test]]
+name = "cross_check_a_fax_picture_redacted_either_way_with_poppler"
+crate = "limarepdf-core"
+target = "--test redact"
+file = "crates/limarepdf-core/tests/redact.rs"
+group = "G6"
+needs = ["pdftoppm"]
+
+[[test]]
 name = "cross_check_a_letter_whose_width_is_taken_back_with_poppler"
 crate = "limarepdf-core"
 target = "--test redact"
@@ -610,6 +618,14 @@ target = "--test scan"
 file = "crates/limarepdf-core/tests/scan.rs"
 group = "G6"
 needs = ["pdfimages"]
+
+[[test]]
+name = "poppler_shows_a_fax_scan_as_it_was_whichever_way_its_black_is_stored"
+crate = "limarepdf-core"
+target = "--test scan"
+file = "crates/limarepdf-core/tests/scan.rs"
+group = "G6"
+needs = ["pdftoppm"]
 
 [[test]]
 name = "poppler_shows_a_profiled_scan_as_it_was"
