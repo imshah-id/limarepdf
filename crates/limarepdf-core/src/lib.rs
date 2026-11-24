@@ -135,7 +135,7 @@ pub use ids::{
 };
 #[cfg(any(test, feature = "test-seams"))]
 pub use imgs::import_seam;
-pub use imgs::{image_dimensions, picture_preview, ImageImport, PicturesTooLarge};
+pub use imgs::{image_dimensions, picture_preview, ImageImport, PicturesTooLarge, USABLE_DPI};
 pub use labels::{LabelRange, LabelStyle};
 pub use layout::{fallback_faces, fallbacks, set_in, warm_fallbacks, SetIn};
 pub use links::{email_link, web_link, Link, LinkId, LinkTarget, Unfollowed};

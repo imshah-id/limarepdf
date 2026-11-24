@@ -1,18 +1,15 @@
 //! Importing PNG, JPEG and TIFF files as pages.
 
-#[allow(dead_code)]
-#[path = "common/tool.rs"]
-mod tool;
+mod common;
 
-#[allow(dead_code)]
-#[path = "common/seeds.rs"]
-mod seeds;
-
+use common::saved::{self, Saved};
+use common::{seeds, tool};
 use image::codecs::jpeg::{JpegEncoder, PixelDensity};
 use image::metadata::Orientation;
 use image::{DynamicImage, GrayImage, Rgb, RgbImage, Rgba, RgbaImage};
 use limarepdf_core::{render, ImageImport, Pdf};
-use lopdf::Dictionary;
+use lopdf::content::Content;
+use lopdf::{Dictionary, Object};
 use std::io::Cursor;
 
 const RED: [u8; 3] = [255, 0, 0];
@@ -270,6 +267,116 @@ fn jpeg_page_size_follows_jfif_density() {
     let jpg = encode_jpeg(&DynamicImage::ImageRgb8(RgbImage::new(400, 200)), Some(200));
     let p = import(&[jpg], &Default::default());
     assert_size(&p, 0, (144.0, 72.0));
+}
+
+/// A 300 × 150 PNG stating no resolution, and the same stating 300 dpi.
+fn unstated_and_stated() -> (Vec<u8>, Vec<u8>) {
+    let png = encode_png(&DynamicImage::ImageRgb8(RgbImage::new(300, 150)));
+    let stated = with_chunk(png.clone(), b"pHYs", &phys_dpi(300.0));
+    (png, stated)
+}
+
+/// Pages made at resolutions in range: from the file's own, from the one assumed for a file
+/// stating none, and at the ends of the range; each with the size it should have.
+fn in_range() -> Vec<(Vec<u8>, ImageImport, (f32, f32))> {
+    let (png, stated) = unstated_and_stated();
+    let low = ImageImport {
+        dpi: None,
+        fallback_dpi: 10.0,
+    };
+    vec![
+        (stated.clone(), Default::default(), (72.0, 36.0)),
+        (png.clone(), Default::default(), (144.0, 72.0)),
+        (png, low, (2160.0, 1080.0)),
+        (stated, at_dpi(10_000.0), (2.16, 1.08)),
+    ]
+}
+
+/// A resolution given for the pictures outside 10 to 10,000 dpi, for all of them or for
+/// those stating none, is refused before anything changes, as a file's own outside them is
+/// passed over (PB-206).
+#[test]
+fn resolutions_out_of_range_are_refused() {
+    let (png, stated) = unstated_and_stated();
+    let mut p = import(std::slice::from_ref(&stated), &Default::default());
+    let before = p.snapshot().unwrap();
+    let never = [
+        0.0,
+        -5.0,
+        f32::NAN,
+        f32::INFINITY,
+        f32::NEG_INFINITY,
+        1e-30,
+        9.9,
+        10_000.5,
+    ];
+    for d in never {
+        let fallback = ImageImport {
+            dpi: None,
+            fallback_dpi: d,
+        };
+        for opts in [at_dpi(d), fallback] {
+            for file in [&png, &stated] {
+                let files = std::slice::from_ref(file);
+                let e = p.insert_image_pages(1, files, &opts).unwrap_err();
+                assert!(e.to_string().contains("from 10 to 10000 dpi"), "{d}: {e}");
+                assert!(Pdf::from_images(files, &opts).is_err(), "{d}");
+            }
+        }
+    }
+    assert_eq!(p.snapshot().unwrap(), before);
+}
+
+/// Pages made at resolutions in range are saved at their sizes, every number in their boxes
+/// and in the placing of their pictures finite, and open again (PB-206).
+#[test]
+fn pages_at_resolutions_in_range_are_saved_at_their_size() {
+    for (file, opts, want) in in_range() {
+        let mut p = import(&[file], &opts);
+        let saved = Saved::of(&mut p);
+        let back = Pdf::from_bytes(&saved.bytes, None).unwrap();
+        assert_size(&back, 0, want);
+        let page = back.doc.get_dictionary(back.page_ids()[0]).unwrap();
+        let mut numbers: Vec<f32> = page
+            .get(b"MediaBox")
+            .and_then(Object::as_array)
+            .unwrap()
+            .iter()
+            .map(|n| n.as_float().unwrap())
+            .collect();
+        let content = back.doc.get_page_content(back.page_ids()[0]);
+        let ops = Content::decode(&content).unwrap().operations;
+        let cm = ops
+            .iter()
+            .find(|o| o.operator == "cm")
+            .expect("the picture is placed");
+        numbers.extend(cm.operands.iter().map(|n| n.as_float().unwrap()));
+        let finite = numbers.iter().all(|n| n.is_finite());
+        assert!(finite, "{want:?}: {numbers:?}");
+    }
+}
+
+/// Poppler reads those pages at the same sizes (PB-206). Opt-in: needs `pdfinfo`.
+#[test]
+#[ignore]
+fn cross_check_page_sizes_with_poppler() {
+    for (file, opts, want) in in_range() {
+        let bytes = import(&[file], &opts).to_bytes().unwrap();
+        let info = saved::tools::run("pdfinfo", &["{}"], &bytes);
+        let line = info
+            .lines()
+            .find_map(|l| l.strip_prefix("Page size:"))
+            .expect("pdfinfo gives the page size");
+        let got: Vec<f32> = line
+            .split_whitespace()
+            .filter_map(|w| w.parse().ok())
+            .collect();
+        let near = |a: f32, b: f32| (a - b).abs() < 0.05;
+        assert!(
+            got.len() == 2 && near(got[0], want.0) && near(got[1], want.1),
+            "{want:?}: {line}"
+        );
+    }
 }
 
 // ------------------------------------------------------------ orientation

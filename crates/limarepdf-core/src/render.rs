@@ -791,8 +791,16 @@ impl ImageFormat {
     }
 }
 
+/// Lowest export resolution: a pixel every two points.
+pub const MIN_DPI: f32 = 36.0;
+
 /// Highest export resolution: the renderer's largest scale.
 pub const MAX_DPI: f32 = 16.0 * 72.0;
+
+/// Refuse an export resolution outside [`MIN_DPI`] to [`MAX_DPI`].
+fn check_export_dpi(dpi: f32) -> Result<()> {
+    crate::imgs::check_dpi("the resolution", dpi, MIN_DPI..=MAX_DPI)
+}
 
 /// Encode a bitmap as an RGB image file that records `dpi`, so the image is imported
 /// back at the page's size.
@@ -837,10 +845,11 @@ pub fn image_names(pages: &[usize], stem: &str, format: ImageFormat) -> Vec<Stri
         .collect()
 }
 
-/// Render `pages` at `dpi` (at most [`MAX_DPI`]) and write them to `dir` with the names
-/// from [`image_names`], each whole or not at all, replacing files of the same name. Pages
-/// are rendered in parallel, in batches that keep the bitmaps in memory to about 1 GB. A
-/// page too large to draw whole at `dpi` refuses the export before any file is written.
+/// Render `pages` at `dpi` ([`MIN_DPI`] to [`MAX_DPI`]) and write them to `dir` with the
+/// names from [`image_names`], each whole or not at all, replacing files of the same name.
+/// Pages are rendered in parallel, in batches that keep the bitmaps in memory to about 1 GB.
+/// A `dpi` out of range, or a page too large to draw whole at it, refuses the export before
+/// `dir` is made or any file is written.
 /// Returns the files written, and adds to `missing` what couldn't be drawn as the file asks
 /// (as [`Renderer::take_missing`]). When every file was written but one wasn't confirmed
 /// on disk, the error is that file's [`crate::NotConfirmed`], and `missing` is filled all
@@ -854,6 +863,7 @@ pub fn write_images(
     stem: &str,
     missing: &mut BTreeSet<Missing>,
 ) -> Result<Vec<PathBuf>> {
+    check_export_dpi(dpi)?;
     std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     let paths: Vec<PathBuf> = image_names(pages, stem, format)
         .into_iter()
@@ -876,14 +886,15 @@ pub fn write_images(
     unconfirmed.map_or(Ok(paths), Err)
 }
 
-/// Render `pages` at `dpi` (at most [`MAX_DPI`]) and encode each as an image file, in
-/// page order, as [`write_images`] would write them.
+/// Render `pages` at `dpi` ([`MIN_DPI`] to [`MAX_DPI`]) and encode each as an image file,
+/// in page order, as [`write_images`] would write them.
 pub fn encode_pages(
     pdf: &HPdf,
     pages: &[usize],
     dpi: f32,
     format: ImageFormat,
 ) -> Result<Vec<Vec<u8>>> {
+    check_export_dpi(dpi)?;
     encode_batched(pdf, pages, dpi, format, &mut BTreeSet::new(), |_, bytes| {
         Ok(bytes)
     })
@@ -901,7 +912,6 @@ fn encode_batched<T: Send>(
     missing: &mut BTreeSet<Missing>,
     f: impl Fn(usize, Vec<u8>) -> Result<T> + Sync,
 ) -> Result<Vec<T>> {
-    let dpi = dpi.clamp(0.05 * 72.0, MAX_DPI);
     // hayro truncates the pixel size, and 612 pt at 100 dpi is 849.99994 px in f32: nudge
     // the scale so whole sizes come out whole.
     let scale = dpi / 72.0 * (1.0 + 1e-5);

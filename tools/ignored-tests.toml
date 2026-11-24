@@ -428,6 +428,14 @@ group = "G6"
 needs = ["pdftoppm"]
 
 [[test]]
+name = "cross_check_page_sizes_with_poppler"
+crate = "limarepdf-core"
+target = "--test import"
+file = "crates/limarepdf-core/tests/import.rs"
+group = "G6"
+needs = ["pdfinfo"]
+
+[[test]]
 name = "cross_check_links_with_poppler"
 crate = "limarepdf-core"
 target = "--test links"

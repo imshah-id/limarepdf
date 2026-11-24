@@ -635,6 +635,13 @@
   exporting a digital ID or its certificate never writes over a file that already has that name with the extension
   LimarePDF adds: nothing is saved, and a message says why. Choosing the full name replaces it. Before, that file
   was replaced, though the file chooser never asked about it.
+- On the command line, a resolution of 0, below 0 or not a number is refused before anything is written, as is
+  one out of range: `images` and `insert-images` take `--dpi` and `--fallback-dpi` from 10 to 10,000,
+  `optimize-scans` takes `--max-dpi` from 10 to 10,000, and `render` takes `--dpi` from 36 to 1152, as the app's
+  Export does. Before, `images --dpi 0` made a PDF that couldn't be opened again, `optimize-scans --max-dpi 0`
+  replaced each scan with a picture of one pixel, and `render` drew at 1152 dpi when asked for more and at 3.6 when
+  asked for less. The `--quality` of `render` and `optimize-scans` is refused outside 1 to 100, where before 0 was
+  taken as 1 and anything above 100 as 100.
 
 ### Changed
 

@@ -27,7 +27,7 @@ use crate::spin::Spin;
 use crate::tab::{Side, Stamp, StampForm, Tab};
 use crate::theme;
 use eframe::egui::{self, Ui};
-use limarepdf_core::render::{ImageFormat, MAX_DPI};
+use limarepdf_core::render::{ImageFormat, MAX_DPI, MIN_DPI};
 use limarepdf_core::{
     parse_page_range, Bates, Cipher, Encryption, HeaderFooter, Info, LabelRange, LabelStyle,
     OpenLayout, OpenPanel, Restrictions, ScanMode, ScanOptions, ViewPrefs, Watermark,
@@ -1638,7 +1638,7 @@ fn export_ui(ui: &mut Ui, s: &mut Export, busy: bool) -> bool {
         });
         ui.end_row();
         row(ui, "Resolution", |ui| {
-            let dpi = Spin::new(&mut s.dpi, 36.0..=MAX_DPI).suffix(" dpi");
+            let dpi = Spin::new(&mut s.dpi, MIN_DPI..=MAX_DPI).suffix(" dpi");
             ui.add(dpi.name("Resolution"))
         });
         ui.label("JPEG quality");

@@ -928,6 +928,23 @@ the file as it was and the tab still without a file; `report.pdf` chosen then sa
 `an_id_export_never_replaces_the_file_its_extension_names` (the Digital IDs window's Export…, for a certificate and
 for an ID: the form says why). Each is refused, saying why, nothing started; before, each replaced the file.
 
+Resolutions out of range, PB-206 (2026-11-23; each test written first and seen failing on 7f604a7; logs in the
+cycle folder's `runs/s2-zero-dpi/`), in `limarepdf-cli`'s `resolutions.rs`:
+`picture_resolutions_out_of_range_are_refused` (`images` and `insert-images` with `--dpi` or `--fallback-dpi` 0,
+−5, NaN, ±infinity, 1e-30, 9.9 or 10000.5), `a_largest_scan_resolution_out_of_range_is_refused` (`optimize-scans
+--max-dpi`, the same; 50 and 10 taken, the page keeping its size), `render_resolutions_out_of_range_are_refused`
+(`render --dpi`, the first six, 35, 1153 and 2000; 36 and 1152 drawn at their sizes) and
+`jpeg_qualities_out_of_range_are_refused` (0, 101 and 255 for both `--quality` options): each refused, saying the
+range, the folder as it was; before, each ran. The control, `pictures_at_resolutions_in_range_open_at_their_size`:
+a file's own 300 dpi, the 150 assumed, the ends of the range, and `insert-images --dpi 150` into a text document,
+which keeps its text, each reopened at its size. In core, `import.rs`'s `resolutions_out_of_range_are_refused`
+(`insert_image_pages` and `from_images`, the document as it was) and
+`pages_at_resolutions_in_range_are_saved_at_their_size` (saved and reopened, every number of the page's box and of
+the picture's placing finite); opt-in, `cross_check_page_sizes_with_poppler` (`pdfinfo` reads the same sizes);
+`scan.rs`'s `a_largest_resolution_out_of_range_is_refused` (before, 0 made each scan one pixel) and
+`render_region.rs`'s `an_export_resolution_out_of_range_is_refused` (`encode_pages` and `export_images`, the
+folder not made).
+
 Later additions (recent files, document notices, fit width, the theme button, crop)
 were checked by screenshot under a virtual X server; not every one has been clicked through by hand. Of the newest:
 the page layouts (facing and single page) have unit tests for pairing and fitting but were not clicked through;

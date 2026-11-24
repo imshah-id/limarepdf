@@ -6,16 +6,35 @@ use anyhow::{anyhow, bail};
 use image::metadata::Orientation;
 use lopdf::{dictionary, Dictionary, Object, ObjectId, Stream};
 use std::io::Cursor;
+use std::ops::RangeInclusive;
 use tiff::decoder::{ifd::Value, Decoder, DecodingResult};
 use tiff::tags::Tag;
 use tiff::ColorType;
 
+/// The resolutions (dots per inch) pictures are sized and scans brought down to: a file's
+/// own outside them is passed over for [`ImageImport::fallback_dpi`], and one given outside
+/// them is refused.
+pub const USABLE_DPI: RangeInclusive<f32> = 10.0..=10_000.0;
+
+/// Refuse `dpi`, given as `what`, unless it is in `range` (never when it isn't a number).
+pub(crate) fn check_dpi(what: &str, dpi: f32, range: RangeInclusive<f32>) -> Result<()> {
+    if !range.contains(&dpi) {
+        bail!(
+            "{what} must be from {} to {} dpi, not {dpi}",
+            range.start(),
+            range.end()
+        );
+    }
+    Ok(())
+}
+
 /// How [`Pdf::insert_image_pages`] sizes pages.
 #[derive(Clone, Copy, Debug)]
 pub struct ImageImport {
-    /// Use this resolution (dots per inch) instead of the one stored in the file.
+    /// Use this resolution (dots per inch) instead of the one stored in the file; one of
+    /// [`USABLE_DPI`].
     pub dpi: Option<f32>,
-    /// Resolution assumed when the file states none.
+    /// Resolution assumed when the file states none; one of [`USABLE_DPI`].
     pub fallback_dpi: f32,
 }
 
@@ -877,13 +896,19 @@ impl Pdf {
     /// Insert one page per image at position `at` (0 = before the first page). Each page
     /// of a multi-page TIFF becomes a page. Pages are sized from the image resolution and
     /// shown in the orientation the file asks for. Returns the number of pages added.
-    /// Nothing is changed if any file cannot be decoded.
+    /// Nothing is changed if any file cannot be decoded, or a resolution in `opts` isn't
+    /// one of [`USABLE_DPI`].
     pub fn insert_image_pages(
         &mut self,
         at: usize,
         files: &[Vec<u8>],
         opts: &ImageImport,
     ) -> Result<usize> {
+        if let Some(d) = opts.dpi {
+            check_dpi("the resolution given for the pictures", d, USABLE_DPI)?;
+        }
+        let fallback = "the resolution assumed for pictures stating none";
+        check_dpi(fallback, opts.fallback_dpi, USABLE_DPI)?;
         if at > self.page_count() {
             bail!("position {at} is beyond the end of the document");
         }
@@ -901,14 +926,24 @@ impl Pdf {
             })?);
         }
         let n = rasters.len();
-        for (k, r) in rasters.into_iter().enumerate() {
-            let usable = |d: f32| (10.0..=10_000.0).contains(&d);
-            let (dx, dy) = match (opts.dpi, r.dpi) {
-                (Some(d), _) => (d, d),
-                (None, Some((x, y))) if usable(x) && usable(y) => (x, y),
-                _ => (opts.fallback_dpi, opts.fallback_dpi),
-            };
-            let (iw, ih) = (r.w as f32 * 72.0 / dx, r.h as f32 * 72.0 / dy);
+        // Every page's size before any page is added.
+        let usable = |d: f32| USABLE_DPI.contains(&d);
+        let sizes: Vec<(f32, f32)> = rasters
+            .iter()
+            .map(|r| {
+                let (dx, dy) = match (opts.dpi, r.dpi) {
+                    (Some(d), _) => (d, d),
+                    (None, Some((x, y))) if usable(x) && usable(y) => (x, y),
+                    _ => (opts.fallback_dpi, opts.fallback_dpi),
+                };
+                (r.w as f32 * 72.0 / dx, r.h as f32 * 72.0 / dy)
+            })
+            .collect();
+        let sized = |s: f32| s.is_finite() && s > 0.0;
+        if let Some(k) = sizes.iter().position(|&(w, h)| !(sized(w) && sized(h))) {
+            bail!("picture {} has no size to give its page", k + 1);
+        }
+        for (k, (r, (iw, ih))) in rasters.into_iter().zip(sizes).enumerate() {
             let o = r.orientation;
             let (pw, ph) = if swaps_axes(o) { (ih, iw) } else { (iw, ih) };
             let m = orient_matrix(o, pw, ph);
