@@ -244,12 +244,17 @@ sizes, page labels, annotations, form fields and their values, bookmarks and pag
 as in the file itself. Bytes aren't compared, since a save may renumber objects and compress streams. Each file is
 checked in a process of its own, two at a time (`SAVE_REOPEN_JOBS`), each allowed 2 GiB on Linux
 (`SAVE_REOPEN_MEMORY`, in MiB) and three minutes, so a file needing more stops only its own check, is stopped, and is
-listed as skipped. The report, `target/tmp/save-reopen/index.html`, lists every difference, with pictures of pages
-that draw differently; `summary.txt` has one line per file, and the run prints how many files were the same,
-different, skipped and not downloaded. The test fails on a difference not in `tools/save-reopen-known.txt` (the known
-limits: each line names a file, the text of its difference and the reason, so another difference in a listed file
-still fails), and when nothing was checked or, from 20 files, more than a tenth were skipped; a known limit not seen
-in a file that was checked is printed, to take off the list. `SAVE_REOPEN_ONLY=issue12` limits the run. A full run takes about
+listed as skipped. A page drawn neither before nor after saving can't be compared: it is listed and counted, not
+taken as a difference, and its file's line in `summary.txt` says `undrawn` (the same, but for those pages) and why
+each wasn't drawn. The report, `target/tmp/save-reopen/index.html`, lists every difference, with pictures of pages
+that draw differently, every page not drawn and, for a signed file, each save that wrote the whole file instead of
+adding a revision, and why; `summary.txt` has one line per file, and the run prints how many files were the same,
+the same but for pages not drawn, different, skipped and not downloaded, how many pages were compared and how many
+not drawn, and how many signed files were written whole. The test fails on a difference not in
+`tools/save-reopen-known.txt` (the known limits: each line names a file, the text of its difference and the reason,
+so another difference in a listed file still fails), and when no page was compared or, from 20 files, more than a
+tenth were skipped or had no page compared; a known limit not seen in a file that was checked is printed, to take off
+the list. `SAVE_REOPEN_ONLY=issue12` limits the run. A full run takes about
 five minutes; on 2026-10-20, after the page-list repair, 1,082 of 1,089 files were the same, 1 differed (the known
 limit) and 6 were skipped (4 need a password, 1 doesn't open, and PDFBox 2363, where hayro asks for 7.6 GB at
 once to fill one shape at 96 dpi); rerun on 2026-10-26 with lopdf 0.46, the same. To check that it catches failures, a scratch copy whose save dropped annotations, kept page 1
@@ -954,6 +959,14 @@ written; before, the listed values were refused) and core's `form_fill.rs`
 `read_only_fields_take_back_their_own_values` (a read-only field's own value, text LimarePDF can't write among
 them, taken with the document unchanged; another value, a choice by its shown text and a read-only push button
 refused).
+
+Pages the save-and-reopen check can't draw, PB-208 (2026-11-23; the test written first and seen failing with the new
+counts in place but pages drawn neither time still passed over, as on 02d258c; logs in the cycle folder's
+`runs/s2-save-reopen-coverage/`), in core's `save_reopen.rs`: `pages_not_drawn_are_counted` (a two-page file whose
+page 2 is too large to draw: page 2 listed as not drawn in both checks, with the reason, the file `undrawn` in its
+summary line, read back the same from a child process's lines, and counted; with only page 2 listed, no page
+compared, which counts toward the skip limit; before, page 2 passed over and the file the same). The control:
+node-signpdf's `signed.pdf`, the same, both saves adding a revision and saying so.
 
 Later additions (recent files, document notices, fit width, the theme button, crop)
 were checked by screenshot under a virtual X server; not every one has been clicked through by hand. Of the newest:
