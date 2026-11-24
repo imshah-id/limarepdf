@@ -138,7 +138,9 @@ warning: 2 annotation(s) LimarePDF can't draw were left as they were (pages 3, 7
 
 Pages that `delete` removes, or that `extract` and `split` leave out, leave nothing in the output: bookmarks,
 named destinations, links, form fields and tags stop referring to them, and tags with content on them (and the
-tags above those) lose their alternative text. A form nested more than 32 deep makes them stop with an error.
+tags above those) lose their alternative text. A form nested more than 32 deep makes them stop with an error,
+and so does a file that still holds something of the pages that go another way (a tagged document's tags
+pointing at it, say, or a page that stays with a drawing that can't be read); `split` then writes no file.
 `extract` and `split` keep the bookmarks to
 the pages they keep; `delete` keeps every bookmark, without a destination when its page went. `split` writes each
 file as soon as its part is made (several at once, one per core); if one can't be written, the error says how many

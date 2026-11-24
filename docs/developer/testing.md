@@ -655,6 +655,12 @@ made-up report (standard-library Python, fixed names and dates) and `docshots.sh
 Xvfb with settings, recovery folders and made-up digital IDs of its own, and crops each picture to its old size.
 Its header says how to find a control's new click point when one moves.
 
+For 0.14.0 (2026-11-24) `organise` and `forms` were retaken with recipes of their own in `docshots.sh`
+(PB-150): `mkreport.py --form` writes the site visit request, which the command-line app fills in but for Notes,
+and the 12-page document is the report four times, the second with its comments. The text cursor blinks from the last change, so the
+full stop is typed last. The other five, taken again with the release build, differ only in the page text's
+anti-aliasing and the day's date, so they stay; the code behind the other nine hasn't changed since 2026-11-11.
+
 D2's flow (build plan 6.4): fields filled in one flow (BUG-03, BUG-04, BUG-10), and a photographed or flat form
 finished in Fill and sign (batch 42, ENH-09), each step with its test:
 

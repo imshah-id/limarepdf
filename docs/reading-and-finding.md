@@ -72,7 +72,8 @@ exported images and everything else keep the page's own colours.
 On a long document the matches come in page by page, with "Searching…" and the count so far; when it is done, the
 count reads "1 match", "12 matches" or "No matches". Changing what you typed starts again, and the old matches go at
 once. Emptying the search box clears the results. If you change the document while searching, the results are
-brought up to date, and the match you were on stays the current one.
+brought up to date, and the match you were on stays the current one. A page too complex to read isn't searched;
+Search results name it and say why.
 
 Search treats any run of spaces as one space. A phrase can run across a line break, or from the bottom of one page
 to the top of the next: the break counts as a space, and the part on each line is highlighted. A word hyphenated

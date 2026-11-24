@@ -253,6 +253,9 @@ Redact or Remove hidden information, which write the whole file and break the si
   its page went.
 - A form nested more than 32 deep can't be followed to its end, so deleting, extracting or splitting stops with a
   message saying why, changing nothing.
+- When the file still holds something of the pages that go another way, as when a tagged document's tags point at
+  it, or a page that stays has a drawing that can't be read, deleting, extracting or splitting stops with a
+  message saying why, changing nothing; Split then writes no file.
 
 ## From the command line
 
