@@ -200,7 +200,7 @@ pub struct Button {
 pub struct Planned {
     pub label: &'static str,
     pub icon: &'static str,
-    /// The build plan's item that builds it (for the plan's records; not shown).
+    /// The GitHub issue that builds it (for the records; not shown).
     #[cfg_attr(not(test), allow(dead_code))]
     pub item: &'static str,
     /// What it will do, said on hover and to screen readers.
@@ -267,23 +267,23 @@ const TEXT_ALIGNS: [Act; 4] = [
     Act::AlignText(TextAlign::Justified),
 ];
 
-// The planned features, each with the build plan's item that builds it.
+// The planned features, each with the GitHub issue that builds it.
 const EXPORT_COMMENTS: Planned = Planned {
     label: "Export comments",
     icon: icon::FILE_ARROW_UP,
-    item: "PF-05",
+    item: "#277",
     what: "Save the comments as a summary or for another app.",
 };
 const CREATE_FIELDS: Planned = Planned {
     label: "Create fields",
     icon: icon::LIST_PLUS,
-    item: "PF-04",
+    item: "#231",
     what: "Add form fields for others to fill in.",
 };
 const YOUR_AI: Planned = Planned {
     label: "Your AI",
     icon: icon::SPARKLE,
-    item: "ENH-42",
+    item: "#280",
     what: "Connect an AI of your own to ask about the document. Off unless you connect it.",
 };
 
@@ -1307,23 +1307,31 @@ mod tests {
         }
     }
 
-    /// ENH-41: each planned feature is named for what it will do and the plan's item that
+    /// ENH-41: each planned feature is named for what it will do and the GitHub issue that
     /// builds it; no two say the same.
     #[test]
-    fn planned_features_name_their_plan_items() {
+    fn planned_features_name_their_issues() {
         let all = all_planned();
         assert!(all.len() >= 3);
-        // Built: Underline (NEW-07, batch 46's 4b), Align (NEW-08, its stage 5), Print
-        // preview (ENH-14, batch 30's stage 3), Link (ENH-17's stage 2), Spelling (NEW-06),
-        // Reduce file size (ENH-19's stage 2) and Blank document (NEW-09's stage 1).
+        // Built, so planned no longer: Underline (NEW-07), Align (NEW-08), Print preview
+        // (ENH-14), Link (ENH-17), Spelling (NEW-06), Reduce file size (ENH-19) and Blank
+        // document (NEW-09).
         let built = [
-            "NEW-07", "NEW-08", "ENH-14", "ENH-17", "NEW-06", "ENH-19", "NEW-09",
+            "Underline",
+            "Align",
+            "Print preview",
+            "Link",
+            "Spelling",
+            "Reduce file size",
+            "Blank document",
         ];
-        assert!(!all.iter().any(|p| built.contains(&p.item)));
+        assert!(!all.iter().any(|p| built.contains(&p.label)));
         for p in &all {
             let id = p.item;
-            let known = ["NEW-", "ENH-", "PF-"].iter().any(|k| id.starts_with(k));
-            assert!(known && id.len() > 4, "{}: {id}", p.label);
+            let issue = id
+                .strip_prefix('#')
+                .is_some_and(|n| !n.is_empty() && n.bytes().all(|c| c.is_ascii_digit()));
+            assert!(issue, "{}: {id}", p.label);
             assert!(p.what.ends_with('.') && !p.what.is_empty(), "{}", p.label);
         }
         let mut labels: Vec<&str> = all.iter().map(|p| p.label).collect();

@@ -172,7 +172,7 @@ this list once it works. The feature table below has the details.
   page's and other objects' edges and middles only: no grid, rulers or guides of your own, and a nudge with the
   arrow keys never snaps.
 - Comments have no status (resolved, accepted, rejected), so the Comments view can't filter by one, and can't be
-  exported or imported as comment files (FDF, XFDF; PF-05). The view's filter and search last while the tab is
+  exported or imported as comment files (FDF, XFDF; #277). The view's filter and search last while the tab is
   open; they aren't remembered for the next time the document is opened. Replies are typed in the inspector's one
   reply box, not on the card.
 - Bookmarks move one at a time: several can't be selected and moved together (PF-58), and they have no colours or
