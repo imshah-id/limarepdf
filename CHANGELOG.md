@@ -1,5 +1,15 @@
 # Changelog
 
+## [Unreleased]
+
+### Changed
+
+- The Linux builds, the `.deb` and the `.rpm` need glibc 2.39 or later again, as in 0.13.0 (0.14.0 needed 2.43),
+  so they install on Ubuntu 24.04, Debian 13, Red Hat Enterprise Linux 10 and the systems built from it (AlmaLinux,
+  Rocky Linux), openSUSE Leap 16 and Fedora. The package repository works there too: on Red Hat Enterprise Linux,
+  AlmaLinux and Rocky Linux, add it with `sudo dnf config-manager --add-repo
+  https://smaug42.github.io/limarepdf/rpm/limarepdf.repo` ([Install](docs/install.md#linux-packages)).
+
 ## [0.14.0] - 2026-11-24
 
 ### Added
