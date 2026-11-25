@@ -10,6 +10,10 @@
 - An AppImage for Linux, x86_64 and Arm64, for systems the `.deb` and `.rpm` don't cover: one file holding the
   desktop app and the command-line tool (give it `limarepdf-cli` as its first argument). Like the packages, it needs
   glibc 2.39 or later; it doesn't need libfuse2 ([Install](docs/install.md#appimage)).
+- Packages for Arch Linux on the AUR, x86_64 and aarch64: `limarepdf`, built from source on your computer, and
+  `limarepdf-bin`, the release's programs ([Install](docs/install.md#arch-linux)).
+- Each release has its source as a signed archive, `limarepdf-<version>-source.tar.gz`, which the AUR's
+  `limarepdf` builds from.
 
 ### Changed
 

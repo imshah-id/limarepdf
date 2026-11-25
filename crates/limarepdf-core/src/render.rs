@@ -639,7 +639,8 @@ impl<'a> Renderer<'a> {
 
     /// Render the part `region` of a page drawn at `scale` (at most
     /// [`MAX_REGION_SCALE`]), for showing a page in tiles at high zoom. The region is cut
-    /// to the page; one wholly outside it is an error.
+    /// to the page and to at most [`MAX_SIDE`] (65,280) pixels a side, so the bitmap can be
+    /// smaller than asked; one wholly outside the page is an error.
     pub fn render_region(&self, index: usize, scale: f32, region: Region) -> Result<Bitmap> {
         let page = self.page(index)?;
         let scale = scale.clamp(0.05, MAX_REGION_SCALE);

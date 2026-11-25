@@ -1,0 +1,47 @@
+# Maintainer: Clayton Cornell <clayton at smaug42 dot com>
+#
+# LimarePDF from the release's signed Linux archives, the programs as released: the AUR's limarepdf-bin. The
+# version and the archives' checksums here are placeholders; packaging/arch/update.sh fills them in for each
+# release and writes the copy the AUR gets, with its .SRCINFO. ci.yml's arch job builds, checks and installs
+# it (packaging/arch/check-arch.sh). It installs what the archive holds, as limarepdf does.
+
+pkgname=limarepdf-bin
+pkgver=0.14.1
+pkgrel=1
+pkgdesc='PDF viewer and editor (the release builds)'
+arch=(x86_64 aarch64)
+url='https://github.com/smaug42/limarepdf'
+license=('MIT OR Apache-2.0')
+# The libraries limarepdf loads at run time (windowing, OpenGL, file dialogs over D-Bus), and the icons'
+# folders.
+depends=(dbus glibc hicolor-icon-theme libgcc libglvnd libx11 libxcursor libxi libxkbcommon libxkbcommon-x11
+         wayland)
+optdepends=('cups: printing'
+            'xdg-desktop-portal: file dialogs'
+            'xdg-utils: opening links')
+provides=("limarepdf=$pkgver")
+conflicts=(limarepdf)
+# Stripped already, as released.
+options=(!strip !debug)
+_release="https://github.com/smaug42/limarepdf/releases/download/v$pkgver/limarepdf-$pkgver-linux"
+source_x86_64=("$_release-x86_64.tar.gz"{,.asc})
+source_aarch64=("$_release-arm64.tar.gz"{,.asc})
+sha256sums_x86_64=('SKIP'
+                   'SKIP')
+sha256sums_aarch64=('SKIP'
+                    'SKIP')
+# The release signing key, docs/limarepdf-signing-key.asc.
+validpgpkeys=('0CF97E88BAFEE9B638D214CBEB40041A7A8DC801')
+
+package() {
+  cd "limarepdf-$pkgver-linux-${CARCH/aarch64/arm64}"
+  install -Dm755 -t "$pkgdir/usr/bin" limarepdf limarepdf-cli
+  install -Dm644 -t "$pkgdir/usr/share/applications" io.github.smaug42.limarepdf.desktop
+  install -Dm644 -t "$pkgdir/usr/share/icons/hicolor/256x256/apps" io.github.smaug42.limarepdf.png
+  install -Dm644 -t "$pkgdir/usr/share/licenses/$pkgname" LICENSE-* *-LICENSE-*.txt THIRD-PARTY-LICENSES.html
+  # The guide, whose links reach the README and the licences beside it, as in the archive.
+  install -Dm644 -t "$pkgdir/usr/share/doc/limarepdf" README.md CHANGELOG.md SECURITY.md OCR-MODEL.md
+  cp -r --no-preserve=mode docs "$pkgdir/usr/share/doc/limarepdf/"
+  ln -s "../../licenses/$pkgname/LICENSE-MIT" "$pkgdir/usr/share/doc/limarepdf/LICENSE-MIT"
+  ln -s "../../licenses/$pkgname/LICENSE-APACHE" "$pkgdir/usr/share/doc/limarepdf/LICENSE-APACHE"
+}
