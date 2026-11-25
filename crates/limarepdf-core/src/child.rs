@@ -434,7 +434,7 @@ pub mod child_seam {
     }
 
     /// What Ghostscript 10.02 writes after a `txtwrite` run whatever the file says: its bug
-    /// 707132, about its own device. Ubuntu 24.04, where the cross-check job runs, has 10.02.1.
+    /// 707132, about its own device. Ubuntu 24.04 has 10.02.1; the cross-check job's 26.04 has 10.06.
     const GS_10_02_DEVICE: &str = "Error: finalizing subclassing device while child refcount > 1";
 
     /// What Ghostscript wrote to `stderr` that counts against the file it read, trimmed: all of
