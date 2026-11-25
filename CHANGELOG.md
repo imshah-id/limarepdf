@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.14.1] - 2026-11-25
 
 ### Added
 
@@ -29,6 +29,7 @@
   Fedora, Red Hat Enterprise Linux and the systems built from it, and openSUSE, they import the project's signing
   key first: openSUSE then installs without asking about the key, and dnf asks once, with the fingerprint to
   check. A downloaded `.rpm`'s signature is checked with `rpm --checksig`.
+- The libraries LimarePDF is built from are updated to their latest versions.
 
 ## [0.14.0] - 2026-11-24
 
