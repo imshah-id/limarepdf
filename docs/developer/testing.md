@@ -665,6 +665,10 @@ and the 12-page document is the report four times, the second with its comments.
 full stop is typed last. The other five, taken again with the release build, differ only in the page text's
 anti-aliasing and the day's date, so they stay; the code behind the other nine hasn't changed since 2026-11-11.
 
+For 0.14.1 (2026-11-25) the seven were taken again with the release build: `forms` is the same pixel for pixel, and
+the other six differ only in the page text's anti-aliasing and the day's date and time, so none was retaken. Nothing
+the app shows has changed since 0.14.0, so the other nine stay too.
+
 D2's flow (build plan 6.4): fields filled in one flow (BUG-03, BUG-04, BUG-10), and a photographed or flat form
 finished in Fill and sign (batch 42, ENH-09), each step with its test:
 
