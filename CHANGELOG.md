@@ -6,7 +6,7 @@
 
 - LimarePDF for Arm64 computers: Linux (a `.deb`, an `.rpm` and a `.tar.gz`) and Windows 11 on Arm (an installer
   and a `.zip`), built and tested like the x86_64 ones. The package repository carries both, and picks the right
-  one itself ([Install](docs/install.md)).
+  one itself; the Arm64 installer replaces an x64 LimarePDF of the same version or older ([Install](docs/install.md)).
 
 ### Changed
 

@@ -51,7 +51,8 @@ you give `DESKTOPSHORTCUT` again (`DESKTOPSHORTCUT=0` removes the shortcut).
 The installer is not code-signed yet, so SmartScreen warns: choose More info, then Run anyway.
 
 To make LimarePDF the default PDF app, choose it in Settings > Apps > Default apps. Installing a newer version
-replaces the old one; uninstall from Settings > Apps.
+replaces the old one, as the Arm64 installer replaces an x64 LimarePDF of the same version; uninstall from
+Settings > Apps.
 
 ## macOS app
 

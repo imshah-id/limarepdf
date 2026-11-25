@@ -125,20 +125,22 @@ checks the app's files and that both halves of each binary say macOS 11.
 
 The Windows jobs also build `limarepdf-<version>-x86_64.msi`, and on Arm `limarepdf-<version>-arm64.msi` (`-arch
 arm64`), from `packaging/windows/limarepdf.wxs` with WiX 5 (a .NET tool, pinned because later versions add an EULA
-step) and its UI extension, `WixToolset.UI.wixext` (the same version), for the installer screens. Its `UpgradeCode` must never change. The folder page is the installer's own (`LimareDirDlg`,
-written for LimarePDF rather than copied from WiX, whose source is under the MS-RL licence), laid out like the
-extension's pages and using its strings, with the desktop shortcut checkbox; two `Publish` lines route the
-extension's Welcome and Ready pages to it. The checkbox sets `DESKTOPSHORTCUT`, which can also be given to
-`msiexec`; the shortcut's registry value records the choice, and two property actions, run once before the
-screens (or before installing, without them), keep it at an upgrade unless `DESKTOPSHORTCUT` is given, and turn
-`DESKTOPSHORTCUT=0` into an unticked box. The job also builds the same installer as versions 255.0.0 and 255.0.1
-and then installs on the runner without the screens: the files, the Start menu shortcut and the installed folder's
-check; `limarepdf.exe`'s name in its version information (`FileDescription`), which `build.rs` embeds with the icon
-and a failed resource compile leaves out with only a build warning; uninstalling; the desktop shortcut asked for,
-kept by an upgrade and removed by one with `DESKTOPSHORTCUT=0`; and uninstalling again, leaving nothing. On Arm,
-which runs x64 programs too, it then installs an x64 MSI of the same version and the Arm64 one over it, and expects
-one LimarePDF installed, and none after uninstalling. The screens themselves are only checked by hand (testing.md's
-platform smoke checks).
+step) and its UI extension, `WixToolset.UI.wixext` (the same version), for the installer screens. Its
+`UpgradeCode` must never change; both architectures share it, and `MajorUpgrade` replaces a LimarePDF of the same
+version too (`AllowSameVersionUpgrades`), so the Arm64 installer takes the place of an x64 LimarePDF rather than
+installing a second one beside it. The folder page is the installer's own (`LimareDirDlg`, written for LimarePDF
+rather than copied from WiX, whose source is under the MS-RL licence), laid out like the extension's pages and
+using its strings, with the desktop shortcut checkbox; two `Publish` lines route the extension's Welcome and Ready
+pages to it. The checkbox sets `DESKTOPSHORTCUT`, which can also be given to `msiexec`; the shortcut's registry
+value records the choice, and two property actions, run once before the screens (or before installing, without
+them), keep it at an upgrade unless `DESKTOPSHORTCUT` is given, and turn `DESKTOPSHORTCUT=0` into an unticked box.
+The job also builds the same installer as versions 255.0.0 and 255.0.1 and then installs on the runner without the
+screens: the files, the Start menu shortcut and the installed folder's check; `limarepdf.exe`'s name in its version
+information (`FileDescription`), which `build.rs` embeds with the icon and a failed resource compile leaves out with
+only a build warning; uninstalling; the desktop shortcut asked for, kept by an upgrade and removed by one with
+`DESKTOPSHORTCUT=0`; and uninstalling again, leaving nothing. On Arm, which runs x64 programs too, it then installs
+an x64 MSI of the same version and the Arm64 one over it, and expects one LimarePDF installed, and none after
+uninstalling. The screens themselves are only checked by hand (testing.md's platform smoke checks).
 
 After the release build, the platform jobs and `macos-dmg` check that neither program has core's test seam (the
 `test-seams` feature, which only the app's and the CLI's tests turn on: architecture.md's "atomic.rs" paragraph),
