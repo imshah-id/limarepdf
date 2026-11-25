@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+### Added
+
+- LimarePDF for Arm64 computers: Linux (a `.deb`, an `.rpm` and a `.tar.gz`) and Windows 11 on Arm (an installer
+  and a `.zip`), built and tested like the x86_64 ones. The package repository carries both, and picks the right
+  one itself ([Install](docs/install.md)).
+
 ### Changed
 
 - The Linux builds, the `.deb` and the `.rpm` need glibc 2.39 or later again, as in 0.13.0 (0.14.0 needed 2.43),

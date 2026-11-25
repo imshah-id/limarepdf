@@ -15,16 +15,16 @@ Pick your system:
 
 ## Requirements
 
-- **Windows:** Windows 10 or 11, 64-bit (x64).
+- **Windows:** Windows 10 or 11, 64-bit (x64), or Windows 11 on Arm.
 - **macOS:** macOS 11 (Big Sur) or later, on Apple Silicon or Intel.
-- **Linux:** 64-bit (x86_64) with glibc 2.39 or later, as in Ubuntu 24.04, Debian 13, Fedora, Red Hat Enterprise
-  Linux 10 and the systems built from it (AlmaLinux, Rocky Linux), openSUSE Leap 16 and Tumbleweed, current Arch
-  Linux, and later; a working Vulkan or OpenGL graphics driver; and an X11 or Wayland desktop session. On older
-  systems, you can [build LimarePDF from source](#build-from-source). If you'd like packages for an older system,
-  [say so](troubleshooting.md#reporting-a-problem): they could be made if enough people need them.
+- **Linux:** 64-bit (x86_64 or Arm64) with glibc 2.39 or later, as in Ubuntu 24.04, Debian 13, Fedora, Red Hat
+  Enterprise Linux 10 and the systems built from it (AlmaLinux, Rocky Linux), openSUSE Leap 16 and Tumbleweed,
+  current Arch Linux, and later; a working Vulkan or OpenGL graphics driver; and an X11 or Wayland desktop session.
+  On older systems, you can [build LimarePDF from source](#build-from-source). If you'd like packages for an older
+  system, [say so](troubleshooting.md#reporting-a-problem): they could be made if enough people need them.
 - **Printing:** CUPS on Linux and macOS (macOS includes it).
 
-Support for all three is **provisional** for now. Every change is built and its automated tests run on each of
+Support for all of them is **provisional** for now. Every change is built and its automated tests run on each of
 them, but the release checks by hand haven't all passed on each yet: installing and uninstalling, opening a PDF
 from the file manager, editing and saving, recovery after a crash, printing, and display scaling. They are run
 before LimarePDF 1.0. So far:
@@ -32,15 +32,17 @@ before LimarePDF 1.0. So far:
 | System | Checked by hand |
 | --- | --- |
 | Linux | Used every day; printing on paper checked; not yet the whole set of release checks |
+| Linux on Arm64 | None yet |
 | Windows | Installing and starting (0.5); the print dialog |
+| Windows on Arm | None yet |
 | macOS | None yet |
 
 ## Windows installer
 
-Download `limarepdf-<version>-x86_64.msi` and open it. The installer lets you choose the folder
-(`Program Files\LimarePDF` by default) and, under it, whether to create a desktop shortcut (not ticked unless you
-tick it). It installs LimarePDF for all users, adds it to the Start menu and to Open with for PDF files, and puts
-`limarepdf-cli` on the `PATH` (open a new terminal to use it).
+Download `limarepdf-<version>-x86_64.msi`, or `limarepdf-<version>-arm64.msi` for Windows on Arm, and open it. The
+installer lets you choose the folder (`Program Files\LimarePDF` by default) and, under it, whether to create a
+desktop shortcut (not ticked unless you tick it). It installs LimarePDF for all users, adds it to the Start menu
+and to Open with for PDF files, and puts `limarepdf-cli` on the `PATH` (open a new terminal to use it).
 
 For an install without the screens, `msiexec /i limarepdf-<version>-x86_64.msi /qn` installs with no desktop
 shortcut; add `DESKTOPSHORTCUT=1` for one. Installing a newer version keeps the shortcut choice made before, unless
@@ -87,24 +89,27 @@ Fedora: `sudo dnf config-manager addrepo --from-repofile=https://smaug42.github.
 
 Each release also has a `.deb` (Debian 13, Ubuntu 24.04 and later) and an `.rpm` (Fedora, Red Hat Enterprise
 Linux 10, AlmaLinux and Rocky Linux 10, openSUSE Leap 16 and Tumbleweed) to download and install by hand. Like the
-archives, they need glibc 2.39 or later; on older systems, [build from source](#build-from-source). They install `limarepdf` and `limarepdf-cli` in `/usr/bin`, with
-the menu entry, the icon, the licences and a README that links to this guide online, and pull in the libraries the
-app needs.
+archives, they need glibc 2.39 or later; on older systems, [build from source](#build-from-source). They install
+`limarepdf` and `limarepdf-cli` in `/usr/bin`, with the menu entry, the icon, the licences and a README that links
+to this guide online, and pull in the libraries the app needs.
 
 ```
 sudo apt install ./limarepdf_<version>-1_amd64.deb
 sudo dnf install ./limarepdf-<version>-1.x86_64.rpm
 ```
 
+On Arm64 computers, take `limarepdf_<version>-1_arm64.deb` or `limarepdf-<version>-1.aarch64.rpm` instead; the
+package repository above picks the right one itself.
+
 The `.rpm` is signed with the project's key; to have rpm check it, import the key first with
 `sudo rpm --import limarepdf-signing-key.asc`.
 
 ## Archives
 
-To use LimarePDF without installing it, download the archive for your system: Linux (`.tar.gz`), Windows (`.zip`),
-or macOS for Intel or for Apple Silicon (`.tar.gz`). Unpack it anywhere and run `limarepdf` from there. Each
-archive holds the desktop app, the command-line tool, these docs, the changelog, and the licences, including those
-of the bundled text recognition model and fonts.
+To use LimarePDF without installing it, download the archive for your system: Linux (`.tar.gz`) or Windows
+(`.zip`), each for x86_64 or Arm64, or macOS for Intel or for Apple Silicon (`.tar.gz`). Unpack it anywhere and run
+`limarepdf` from there. Each archive holds the desktop app, the command-line tool, these docs, the changelog, and
+the licences, including those of the bundled text recognition model and fonts.
 
 The programs are not code-signed yet, so the system warns the first time you run them. On Windows, choose More
 info, then Run anyway. On macOS, run `xattr -d com.apple.quarantine limarepdf-cli limarepdf` in the unpacked

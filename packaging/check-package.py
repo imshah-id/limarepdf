@@ -8,6 +8,9 @@ for the folder's targets, by name and version, and none for a crate that isn't. 
 normal dependencies as `cargo tree` lists them (cargo metadata's graph also has optional dependencies whose features
 are off), less the workspace's own. The notices for fonts and code that crates bundle must be there too.
 
+Each program must be built for the targets' architectures, as its header says (ELF, PE, or Mach-O, universal or
+not): a toolchain for another architecture, an emulated one say, builds programs that run but aren't the package's.
+
     python3 packaging/check-package.py [--target TRIPLE]... <folder>
     python3 packaging/check-package.py --self-test
 
@@ -43,8 +46,13 @@ NEEDED = [
     "LICENSE-MPL-2.0.txt",
     NOTICES,
 ]
-# The programs whose dependencies are shipped.
+# The programs, and the crates whose dependencies are shipped in them.
+PROGRAMS = ["limarepdf", "limarepdf-cli"]
 SHIPPED = ["limarepdf-gui", "limarepdf-cli"]
+# A target triple's architecture, by the machine number in each kind of program header.
+ELF = {62: "x86_64", 183: "aarch64"}
+PE = {0x8664: "x86_64", 0xAA64: "aarch64"}
+MACHO = {0x01000007: "x86_64", 0x0100000C: "aarch64"}
 # What a crate's bundled fonts or code need in the folder when the crate is built: (crate, file, text). cargo-about
 # finds most of these only through about.toml's clarifications, which drop a notice with no more than a warning
 # when the crate's file changes.
@@ -122,6 +130,39 @@ def built(targets, root=REPO, programs=SHIPPED):
     return crates
 
 
+def machines(head):
+    """The architectures a program's first bytes say it is built for: ELF (Linux), PE (Windows), Mach-O, universal
+    or not (macOS)."""
+
+    def number(start, size, order="little"):
+        return int.from_bytes(head[start : start + size], order)
+
+    pe = number(0x3C, 4)
+    if head[:4] == b"\x7fELF":
+        found = [ELF.get(number(18, 2))]
+    elif head[:2] == b"MZ" and head[pe : pe + 4] == b"PE\0\0":
+        found = [PE.get(number(pe + 4, 2))]
+    elif head[:4] == b"\xca\xfe\xba\xbe":  # universal: a count, then 20 bytes per architecture, big-endian
+        found = [MACHO.get(number(8 + 20 * i, 4, "big")) for i in range(number(4, 4, "big"))]
+    elif head[:4] == b"\xcf\xfa\xed\xfe":
+        found = [MACHO.get(number(4, 4))]
+    else:
+        found = [None]
+    return {f or "an unknown architecture" for f in found}
+
+
+def architectures(programs, targets):
+    """The problems with the programs' architectures, given each program's first bytes (name: bytes) and the
+    targets."""
+    wanted = {t.split("-")[0] for t in targets}
+    problems = []
+    for name, head in sorted(programs.items()):
+        got = machines(head)
+        if got != wanted:
+            problems.append(f"{name}: built for {' and '.join(sorted(got))}, not {' and '.join(sorted(wanted))}")
+    return problems
+
+
 def notices(files, crates):
     """The problems with the notices, given the folder's notice files (name: text) and the crates built."""
     problems = []
@@ -144,7 +185,7 @@ def notices(files, crates):
 def check(folder, targets):
     problems = []
     names = {p.name for p in folder.rglob("*") if p.is_file()}
-    for name in NEEDED + ["limarepdf", "limarepdf-cli"]:
+    for name in NEEDED + PROGRAMS:
         if name not in names and name + ".exe" not in names:
             problems.append(f"missing: {name}")
     online = f"{SITE}/(?:blob|raw)/v{re.escape(version())}/"
@@ -170,12 +211,17 @@ def check(folder, targets):
                     problems.append(f"{md.relative_to(folder)}:{number}: {link}: {why}")
     wanted = {NOTICES} | {file for _, file, _ in BUNDLED}
     files = {p.name: p.read_text(encoding="utf-8") for p in folder.rglob("*") if p.name in wanted and p.is_file()}
-    return problems + notices(files, built(targets))
+    heads = {}
+    for p in folder.rglob("*"):
+        if p.name.removesuffix(".exe") in PROGRAMS and p.is_file():
+            with p.open("rb") as f:
+                heads[p.name] = f.read(4096)
+    return problems + architectures(heads, targets) + notices(files, built(targets))
 
 
 def self_test():
-    """The crates built, from a workspace with each kind of dependency (tools/tests/package), and the notices
-    checked against them."""
+    """The crates built, from a workspace with each kind of dependency (tools/tests/package), the notices checked
+    against them, and the programs' architectures read from made-up headers."""
     ws = REPO / "tools" / "tests" / "package" / "ws"
     every = {("common", "1.0.0"), ("common", "2.0.0"), ("mid", "0.1.0"), ("derive-it", "0.1.0"), ("via-inner", "0.1.0")}
     linux = every | {("linux-only", "0.1.0")}
@@ -186,7 +232,46 @@ def self_test():
 
     foxit = {("hayro-font", "0.5.0")}
     cantarell = {("sctk-adwaita", "0.10.1")}
+
+    def elf(machine):
+        return b"\x7fELF" + bytes(14) + machine.to_bytes(2, "little")
+
+    def pe(machine):
+        return b"MZ" + bytes(0x3A) + (0x40).to_bytes(4, "little") + b"PE\0\0" + machine.to_bytes(2, "little")
+
+    def macho(*cpus):
+        if len(cpus) == 1:
+            return b"\xcf\xfa\xed\xfe" + cpus[0].to_bytes(4, "little")
+        entries = b"".join(c.to_bytes(4, "big") + bytes(16) for c in cpus)
+        return b"\xca\xfe\xba\xbe" + len(cpus).to_bytes(4, "big") + entries
+
+    linux_x86, linux_arm = ["x86_64-unknown-linux-gnu"], ["aarch64-unknown-linux-gnu"]
+    windows_arm, both_macs = ["aarch64-pc-windows-msvc"], ["aarch64-apple-darwin", "x86_64-apple-darwin"]
     cases = [
+        ("Linux programs for x86_64", lambda: architectures({"limarepdf": elf(62), "cli": elf(62)}, linux_x86), []),
+        ("Linux programs for Arm64", lambda: architectures({"limarepdf": elf(183)}, linux_arm), []),
+        (
+            "an x86_64 program in an Arm64 package",
+            lambda: architectures({"limarepdf": elf(183), "limarepdf-cli": elf(62)}, linux_arm),
+            ["limarepdf-cli: built for x86_64, not aarch64"],
+        ),
+        ("Windows programs for Arm64", lambda: architectures({"limarepdf.exe": pe(0xAA64)}, windows_arm), []),
+        (
+            "an emulated toolchain's x64 program for Windows on Arm",
+            lambda: architectures({"limarepdf.exe": pe(0x8664)}, windows_arm),
+            ["limarepdf.exe: built for x86_64, not aarch64"],
+        ),
+        ("the universal Mac app", lambda: architectures({"limarepdf": macho(0x0100000C, 0x01000007)}, both_macs), []),
+        (
+            "a half missing from the universal Mac app",
+            lambda: architectures({"limarepdf": macho(0x0100000C)}, both_macs),
+            ["limarepdf: built for aarch64, not aarch64 and x86_64"],
+        ),
+        (
+            "not a program",
+            lambda: architectures({"limarepdf": b"#!/bin/sh\n"}, linux_x86),
+            ["limarepdf: built for an unknown architecture, not x86_64"],
+        ),
         ("Linux's crates", lambda: built(["x86_64-unknown-linux-gnu"], ws, ["app"]), linux),
         ("both Macs' crates", lambda: built(["aarch64-apple-darwin", "x86_64-apple-darwin"], ws, ["app"]), macs),
         ("every notice", lambda: notices({NOTICES: page(linux)}, linux), []),
