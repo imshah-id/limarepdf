@@ -15,6 +15,10 @@
   Rocky Linux), openSUSE Leap 16 and Fedora. The package repository works there too: on Red Hat Enterprise Linux,
   AlmaLinux and Rocky Linux, add it with `sudo dnf config-manager --add-repo
   https://smaug42.github.io/limarepdf/rpm/limarepdf.repo` ([Install](docs/install.md#linux-packages)).
+- [Install](docs/install.md#linux-packages) gives each Linux system its own commands, as Debian and Ubuntu had. On
+  Fedora, Red Hat Enterprise Linux and the systems built from it, and openSUSE, they import the project's signing
+  key first: openSUSE then installs without asking about the key, and dnf asks once, with the fingerprint to
+  check. A downloaded `.rpm`'s signature is checked with `rpm --checksig`.
 
 ## [0.14.0] - 2026-11-24
 

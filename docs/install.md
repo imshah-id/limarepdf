@@ -71,39 +71,94 @@ sudo ln -s /Applications/LimarePDF.app/Contents/MacOS/limarepdf-cli /usr/local/b
 
 ## Linux packages
 
-The easiest way is LimarePDF's package repository, which brings updates with the rest of your system. It is signed
-with the project's key (see [Checking a download](#checking-a-download)).
+The easiest way is LimarePDF's package repository, which brings updates with the rest of your system. It has
+packages for x86_64 and Arm64 computers, and your system picks the right one itself. It is signed with the
+project's key (see [Checking a download](#checking-a-download)).
 
-Debian and Ubuntu:
+### Debian and Ubuntu
+
+Debian 13, Ubuntu 24.04 and later.
 
 ```
 sudo install -d /etc/apt/keyrings
 sudo curl -fsSLo /etc/apt/keyrings/limarepdf.asc https://smaug42.github.io/limarepdf/limarepdf-signing-key.asc
 sudo curl -fsSLo /etc/apt/sources.list.d/limarepdf.sources https://smaug42.github.io/limarepdf/apt/limarepdf.sources
-sudo apt update && sudo apt install limarepdf
+sudo apt update
+sudo apt install limarepdf
 ```
 
-Fedora: `sudo dnf config-manager addrepo --from-repofile=https://smaug42.github.io/limarepdf/rpm/limarepdf.repo`, then
-`sudo dnf install limarepdf`. Red Hat Enterprise Linux 10, AlmaLinux and Rocky Linux: `sudo dnf config-manager
---add-repo https://smaug42.github.io/limarepdf/rpm/limarepdf.repo`, then `sudo dnf install limarepdf`. openSUSE:
-`sudo zypper addrepo https://smaug42.github.io/limarepdf/rpm/limarepdf.repo`, then `sudo zypper install limarepdf`.
+### Fedora
+
+```
+sudo rpm --import https://smaug42.github.io/limarepdf/limarepdf-signing-key.asc
+sudo dnf config-manager addrepo --from-repofile=https://smaug42.github.io/limarepdf/rpm/limarepdf.repo
+sudo dnf install limarepdf
+```
+
+The first time, dnf still asks once to import the key, for the repository's own signature: check that the
+fingerprint it shows is `0CF9 7E88 BAFE E9B6 38D2 14CB EB40 041A 7A8D C801` (Fedora shows it without the spaces),
+then answer `y`.
+
+### Red Hat Enterprise Linux, AlmaLinux and Rocky Linux
+
+Version 10 and later.
+
+```
+sudo rpm --import https://smaug42.github.io/limarepdf/limarepdf-signing-key.asc
+sudo dnf config-manager --add-repo https://smaug42.github.io/limarepdf/rpm/limarepdf.repo
+sudo dnf install limarepdf
+```
+
+As on Fedora, dnf still asks once to import the key the first time: check the fingerprint, then answer `y`.
+
+### openSUSE
+
+Leap 16 and Tumbleweed.
+
+```
+sudo rpm --import https://smaug42.github.io/limarepdf/limarepdf-signing-key.asc
+sudo zypper addrepo https://smaug42.github.io/limarepdf/rpm/limarepdf.repo
+sudo zypper install limarepdf
+```
+
+### Downloaded packages
 
 Each release also has a `.deb` (Debian 13, Ubuntu 24.04 and later) and an `.rpm` (Fedora, Red Hat Enterprise
 Linux 10, AlmaLinux and Rocky Linux 10, openSUSE Leap 16 and Tumbleweed) to download and install by hand. Like the
 archives, they need glibc 2.39 or later; on older systems, [build from source](#build-from-source). They install
 `limarepdf` and `limarepdf-cli` in `/usr/bin`, with the menu entry, the icon, the licences and a README that links
-to this guide online, and pull in the libraries the app needs.
+to this guide online, and pull in the libraries the app needs. Take the one for your computer (the commands below
+use the x86_64 names):
+
+| Package | x86_64 | Arm64 |
+| --- | --- | --- |
+| `.deb` | `limarepdf_<version>-1_amd64.deb` | `limarepdf_<version>-1_arm64.deb` |
+| `.rpm` | `limarepdf-<version>-1.x86_64.rpm` | `limarepdf-<version>-1.aarch64.rpm` |
+
+Debian and Ubuntu:
 
 ```
 sudo apt install ./limarepdf_<version>-1_amd64.deb
+```
+
+Fedora, Red Hat Enterprise Linux, AlmaLinux and Rocky Linux:
+
+```
+sudo rpm --import https://smaug42.github.io/limarepdf/limarepdf-signing-key.asc
+rpm --checksig limarepdf-<version>-1.x86_64.rpm
 sudo dnf install ./limarepdf-<version>-1.x86_64.rpm
 ```
 
-On Arm64 computers, take `limarepdf_<version>-1_arm64.deb` or `limarepdf-<version>-1.aarch64.rpm` instead; the
-package repository above picks the right one itself.
+openSUSE:
 
-The `.rpm` is signed with the project's key; to have rpm check it, import the key first with
-`sudo rpm --import limarepdf-signing-key.asc`.
+```
+sudo rpm --import https://smaug42.github.io/limarepdf/limarepdf-signing-key.asc
+rpm --checksig limarepdf-<version>-1.x86_64.rpm
+sudo zypper install ./limarepdf-<version>-1.x86_64.rpm
+```
+
+The `.rpm` is signed with the project's key, and `rpm --checksig` checks it: it should say `digests signatures OK`.
+The `.deb` is checked as any download is ([below](#checking-a-download)).
 
 ## Archives
 
