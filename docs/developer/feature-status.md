@@ -545,19 +545,19 @@ approval; a dry run of the release job rehearses the signing with a key of its o
 Linux `.deb` and `.rpm` packages (the rpm signed), signed apt and dnf repositories on the project's GitHub Pages
 (rebuilt when a release is published), a universal macOS `LimarePDF.app` in a `.dmg`, and a Windows MSI installer that
 offers a desktop shortcut (also for installs without its screens: `DESKTOPSHORTCUT=1`). The Linux packages, the
-MSI and the Linux and Windows archives come for Arm64 too (after 0.14.0), built and tested by CI on Arm runners, and
-the repositories carry both architectures. For other Linux systems, an AppImage of each architecture (after
-0.14.0) holds both programs in one file, with AppImage's static runtime, so it needs no libfuse2. The packages carry
+MSI and the Linux and Windows archives come for Arm64 too (since 0.14.1), built and tested by CI on Arm runners, and
+the repositories carry both architectures. For other Linux systems, an AppImage of each architecture (since
+0.14.1) holds both programs in one file, with AppImage's static runtime, so it needs no libfuse2. The packages carry
 every licence, the security notes and a README linking to the guide online for their version, each checked by CI as
 installed; CI also installs the `.deb` and `.rpm` of each architecture on Ubuntu 24.04, Debian 13, AlmaLinux 10,
 openSUSE Leap 16 and a current Fedora, checks that both programs load there, from the package and from the
-AppImage, and removes them, and a release waits for it. For Arch Linux, two AUR packages (after 0.14.0):
+AppImage, and removes them, and a release waits for it. For Arch Linux, two AUR packages (since 0.14.1):
 `limarepdf`, built from the release's source archive, and `limarepdf-bin`, from its Linux archives, for x86_64
 and aarch64; CI builds both from each change's files in a current Arch Linux container, checks them, and installs,
 upgrades, replaces and removes them on x86_64, opening the app's window under X11 and Wayland after each step, and a
 release waits for it; the release has `limarepdf` built for x86_64 too. For Windows, winget
 (`ClaytonCornell.LimarePDF`, the MSI) and a Scoop bucket (`smaug42/scoop-limarepdf`, the zip), for x64 and Arm64
-(after 0.14.0): a script writes their manifests from a release's signed `SHA256SUMS` and its MSIs, and CI writes
+(since 0.14.1): a script writes their manifests from a release's signed `SHA256SUMS` and its MSIs, and CI writes
 them from each change's files and, on Windows x64 and Arm64, installs and removes LimarePDF with each, and a release
 waits for it. The archives stay, with the guide inside. Support for every system is provisional for now
 ([requirements](../install.md#requirements)). A release waits for the check of every library against known security advisories, and is

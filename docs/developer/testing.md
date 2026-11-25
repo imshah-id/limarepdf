@@ -665,6 +665,10 @@ and the 12-page document is the report four times, the second with its comments.
 full stop is typed last. The other five, taken again with the release build, differ only in the page text's
 anti-aliasing and the day's date, so they stay; the code behind the other nine hasn't changed since 2026-11-11.
 
+For 0.14.1 (2026-11-25) the seven were taken again with the release build: `forms` is the same pixel for pixel, and
+the other six differ only in the page text's anti-aliasing and the day's date and time, so none was retaken. Nothing
+the app shows has changed since 0.14.0, so the other nine stay too.
+
 D2's flow (build plan 6.4): fields filled in one flow (BUG-03, BUG-04, BUG-10), and a photographed or flat form
 finished in Fill and sign (batch 42, ENH-09), each step with its test:
 
@@ -1825,6 +1829,11 @@ product codes wrong (installed, then "No installed package found" to remove), on
 folder wrong (Scoop's "Could not find") and no shortcut ("is missing"). Found while writing it: Scoop's scripts ran
 with the check's own error settings, so after a failed checksum Scoop stopped inside its own code at a `git` call;
 they now run in a PowerShell of their own.
+
+On 0.14.1's pull request (#318, run 45691124491, 2026-11-25) the x64 check failed once: the winget 1.29.380 it had
+just installed exited with 0x8A150002 (invalid command line arguments) on `winget --version`, on the same runner
+image as #317's passing runs, and the job run again passed. The check now tries `winget --version` for up to a
+minute after installing it, logging each failed try.
 
 ## Acceptance checks
 

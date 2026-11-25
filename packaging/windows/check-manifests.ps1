@@ -94,7 +94,15 @@ try {
     Add-AppxPackage "$files\Microsoft.DesktopAppInstaller_8wekyb3d8bbwe.msixbundle" -DependencyPath $dependencies `
       -ForceUpdateFromAnyVersion -ForceApplicationShutdown
     $env:PATH = "$env:LOCALAPPDATA\Microsoft\WindowsApps;$env:PATH"
-    Write-Output "winget: $(winget --version)"
+    # Just installed, winget can fail its first run (0x8A150002), and pass when run again: give it a minute.
+    for ($i = 1; ; $i++) {
+      try { $have = winget --version; break } catch {
+        if ($i -eq 20) { throw }
+        Write-Output "winget --version, try $i`: $($_.Exception.Message)"
+        Start-Sleep 3
+      }
+    }
+    Write-Output "winget: $have"
   }
   $manifest = "manifests\c\ClaytonCornell\LimarePDF\$version"
   winget validate --manifest (Join-Path $Manifests "winget-pkgs\$manifest")

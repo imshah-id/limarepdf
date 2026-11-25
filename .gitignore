@@ -7,3 +7,6 @@ __pycache__/
 /crates/limarepdf-core/tests/data/signatures/dss/
 # Downloaded by crates/limarepdf-core/tools/fetch-render-samples.sh; never committed.
 /crates/limarepdf-core/tests/data/render/
+# The AUR's, winget-pkgs' and the Scoop bucket's clones a release updates (releasing.md); never committed.
+/aur/
+/win/
