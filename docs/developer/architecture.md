@@ -3393,7 +3393,7 @@ from the RustCrypto project unless noted, all final releases:
 | `pkcs1` | 0.8.0 | RSA key encoding |
 | `der`, `spki`, `x509-cert` | 0.8.3, 0.8.1, 0.3.1 | certificates; making self-signed ones |
 | `p256`, `p384` | 0.14.0 | ECDSA keys and signatures |
-| `sha1`, `sha2` | 0.11.0, 0.11.1 | digests |
+| `sha1`, `sha2` | 0.11.0, 0.11.2 | digests |
 | `hmac`, `pbkdf2` | 0.13.0 | ID file integrity checks and password stretching |
 | `aes`, `cbc` | 0.9.4, 0.2.1 | ID file encryption |
 | `des`, `rc2` | 0.9.0 | reading older ID files only (3DES, RC2) |
