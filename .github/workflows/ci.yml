@@ -131,12 +131,14 @@ jobs:
           RUSTFLAGS: --cfg fuzzing -D warnings
         run: cargo check --manifest-path fuzz/Cargo.toml --locked --bins
 
+  # Linux is built on Ubuntu 24.04, not ubuntu-latest: the binaries need the glibc they were
+  # built against, and 24.04's, 2.39, is the floor docs/install.md names.
   build:
     strategy:
       fail-fast: false
       matrix:
         include:
-          - { os: ubuntu-latest,  name: linux-x86_64 }
+          - { os: ubuntu-24.04,   name: linux-x86_64 }
           - { os: windows-latest, name: windows-x86_64 }
           - { os: macos-latest,   name: macos-arm64 }
           - { os: macos-15-intel, name: macos-x86_64 }
@@ -232,6 +234,7 @@ jobs:
           cargo generate-rpm -p crates/limarepdf-gui --output dist/
       # Each package's files as installed, and the glibc it asks for: the rpm names it by hand
       # (Cargo.toml), so it must match what the binaries use; the deb's is worked out by cargo-deb.
+      # A mismatch means the floor moved: releasing.md says what to change, not only the rpm.
       - name: Check the Linux packages
         if: runner.os == 'Linux'
         run: |
@@ -248,7 +251,7 @@ jobs:
           asked=$(rpm -qp --requires dist/*.rpm | sed -n 's/^libc\.so\.6(\(GLIBC_[0-9.]*\))(64bit).*/\1/p')
           echo "The binaries need $need; the rpm asks for $asked; the deb: $(dpkg-deb -f dist/*.deb Depends | grep -o 'libc6 ([^)]*)')"
           if [ "$need" != "$asked" ]; then
-            echo "Set the rpm's GLIBC_ requirement in crates/limarepdf-gui/Cargo.toml to $need"; exit 1
+            echo "::error::The binaries need $need, the rpm asks for $asked: see releasing.md's Linux packages"; exit 1
           fi
       # The MSI from packaging/windows/limarepdf.wxs, with the crates' licences from the Package step.
       # WiX is pinned to 5 (open source, no EULA step).
@@ -363,6 +366,32 @@ jobs:
           name: limarepdf-macos-dmg
           path: dist/*.dmg
 
+  # The .deb and .rpm installed, each in a clean container, on the oldest systems docs/install.md
+  # names and a current Fedora, then removed: packaging/check-linux-install.sh. A release waits
+  # for it, so packages these systems refuse never ship.
+  linux-install:
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        image:
+          - docker.io/library/ubuntu:24.04
+          - docker.io/library/debian:13
+          - docker.io/library/fedora:latest
+          - docker.io/library/almalinux:10
+          - registry.opensuse.org/opensuse/leap:16.0
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: limarepdf-linux-x86_64
+          path: dist
+      - name: Install, load and remove
+        env:
+          IMAGE: ${{ matrix.image }}
+        run: docker run --rm -v "$PWD:/w:ro" -w /w "$IMAGE" bash packaging/check-linux-install.sh dist
+
   # On a version tag (v0.3.0): a draft GitHub Release with the archives, their checksums,
   # GPG signatures, build attestations and this version's section of CHANGELOG.md.
   # Publish it on GitHub. The release key is only in the release-signing environment, so the
@@ -370,7 +399,7 @@ jobs:
   # stops before anything is signed or attested. It waits for the deny job, so it never
   # starts after a known advisory.
   release:
-    needs: [deny, build, macos-dmg]
+    needs: [deny, build, macos-dmg, linux-install]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     environment: release-signing
@@ -433,7 +462,7 @@ jobs:
   # published key must still be able to sign for 60 days. The files themselves get SHA256SUMS
   # only and are uploaded as release-dry-run-unsigned. Like a release, it waits for the deny job.
   dry-run:
-    needs: [deny, build, macos-dmg]
+    needs: [deny, build, macos-dmg, linux-install]
     if: inputs.dry_run && !startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:

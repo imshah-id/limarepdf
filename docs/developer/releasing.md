@@ -93,11 +93,22 @@ The Linux job also makes `limarepdf_<version>-1_amd64.deb` and `limarepdf-<versi
 `cargo-generate-rpm`, from the `[package.metadata.deb]` and `[package.metadata.generate-rpm]` sections of
 `crates/limarepdf-gui/Cargo.toml`. Their dependency lists name the libraries limarepdf loads at run time; check them when
 eframe or rfd changes (`strings target/release/limarepdf | grep '\.so'` lists them). The rpm's glibc version
-(`libc.so.6(GLIBC_2.43)(64bit)`) is written by hand, since the automatic scan is off; the job fails, naming the
-version to set, when the binaries need a different one (`ubuntu-latest` moving to a newer Ubuntu would do it:
-then update the floor in install.md, the README and feature-status.md too). The deb's comes from `dpkg-shlibdeps`. A quick install test:
-`podman run --rm -v $PWD:/p:Z debian:stable bash -c 'apt-get update && apt-get install -y /p/limarepdf_*.deb && limarepdf-cli --version'`
-(and the same with `fedora` and `dnf install -y /p/*.rpm`).
+(`libc.so.6(GLIBC_2.39)(64bit)`) is written by hand, since the automatic scan is off; the job fails when the
+binaries need a different one. That version is the floor install.md names. The binaries need the glibc of the
+Ubuntu they were built on, so the Linux job runs on `ubuntu-24.04` (glibc 2.39), not `ubuntu-latest`, whose move to
+Ubuntu 26.04 raised the floor to 2.43 for 0.14.0 (for a few float functions alone). Raising the floor is a decision, not a
+fix for this check: when GitHub retires the `ubuntu-24.04` runner, or a library comes to need a newer glibc, change
+the runner, the rpm's version, the `linux-install` job's images and the floor in install.md, the README,
+feature-status.md, testing.md and `packaging/pages/index.html` together. The deb's comes from `dpkg-shlibdeps`.
+
+The `linux-install` job installs the deb and the rpm, each in a clean container, on the oldest systems install.md
+names (Ubuntu 24.04, Debian 13, AlmaLinux 10, openSUSE Leap 16) and on a current Fedora, with
+`packaging/check-linux-install.sh`: the system's package manager installs the package with the libraries it
+depends on from the system's own repositories (recommended packages left out), `ldd` finds every library and glibc
+version both programs need, `limarepdf-cli --version` runs, and removing the package leaves neither program
+behind. The release and dry-run jobs wait for it. To run it locally, with the packages in `dist/`:
+`podman run --rm -v "$PWD:/w:ro" -w /w docker.io/library/ubuntu:24.04 bash packaging/check-linux-install.sh dist`,
+and the same with each of the job's other images.
 
 The `macos-dmg` job builds both Mac targets on one runner and runs `packaging/macos/make-dmg.sh`: it joins each
 binary with `lipo`, makes `LimarePDF.app` from `packaging/macos/Info.plist` (which registers LimarePDF for PDFs) and an icon made
@@ -183,7 +194,7 @@ signs and attests nothing for real:
 - the files themselves get `SHA256SUMS` only, and are uploaded unsigned as the `release-dry-run-unsigned` artifact,
   with a notice on the run and its summary saying so.
 
-Like a release, it waits for the `deny` job: the run's graph shows `dry-run` after `deny`, `build` and `macos-dmg`,
+Like a release, it waits for the `deny` job: the run's graph shows `dry-run` after `deny`, `build`, `macos-dmg` and `linux-install`,
 and a failed `deny` skips it. What it can't try is the release key itself in CI (the environment's secrets and the
 approval): a tag run, or `packages.yml`'s `sign` job, is the first to use them.
 

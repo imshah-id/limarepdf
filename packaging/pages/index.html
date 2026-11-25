@@ -23,9 +23,7 @@ signed with the <a href="limarepdf-signing-key.asc">LimarePDF release signing ke
 <code>0CF9 7E88 BAFE E9B6 38D2 14CB EB40 041A 7A8D C801</code>. Updates arrive with your system's own updates.</p>
 
 <h2>Debian and Ubuntu</h2>
-<p>Ubuntu 26.04 and later: the packages need glibc 2.43 or later, which Debian 13 doesn't have yet. On older
-systems, <a href="https://github.com/smaug42/limarepdf/blob/main/docs/install.md#build-from-source">build LimarePDF
-from source</a>.</p>
+<p>Debian 13, Ubuntu 24.04 and later.</p>
 <pre>sudo install -d /etc/apt/keyrings
 sudo curl -fsSLo /etc/apt/keyrings/limarepdf.asc https://smaug42.github.io/limarepdf/limarepdf-signing-key.asc
 sudo curl -fsSLo /etc/apt/sources.list.d/limarepdf.sources https://smaug42.github.io/limarepdf/apt/limarepdf.sources
@@ -36,7 +34,13 @@ sudo apt install limarepdf</pre>
 <pre>sudo dnf config-manager addrepo --from-repofile=https://smaug42.github.io/limarepdf/rpm/limarepdf.repo
 sudo dnf install limarepdf</pre>
 
+<h2>Red Hat Enterprise Linux, AlmaLinux and Rocky Linux</h2>
+<p>Version 10 and later.</p>
+<pre>sudo dnf config-manager --add-repo https://smaug42.github.io/limarepdf/rpm/limarepdf.repo
+sudo dnf install limarepdf</pre>
+
 <h2>openSUSE</h2>
+<p>Leap 16 and Tumbleweed.</p>
 <pre>sudo zypper addrepo https://smaug42.github.io/limarepdf/rpm/limarepdf.repo
 sudo zypper install limarepdf</pre>
 
