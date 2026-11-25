@@ -7,6 +7,9 @@
 - LimarePDF for Arm64 computers: Linux (a `.deb`, an `.rpm` and a `.tar.gz`) and Windows 11 on Arm (an installer
   and a `.zip`), built and tested like the x86_64 ones. The package repository carries both, and picks the right
   one itself; the Arm64 installer replaces an x64 LimarePDF of the same version or older ([Install](docs/install.md)).
+- An AppImage for Linux, x86_64 and Arm64, for systems the `.deb` and `.rpm` don't cover: one file holding the
+  desktop app and the command-line tool (give it `limarepdf-cli` as its first argument). Like the packages, it needs
+  glibc 2.39 or later; it doesn't need libfuse2 ([Install](docs/install.md#appimage)).
 
 ### Changed
 

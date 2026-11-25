@@ -212,11 +212,12 @@ The rest of the tests' waits and folders were bounded in S2-15 (2026-11-11, WP-1
 tests wait at most 60 seconds for the recovery thread and for files being read, then fail naming what they waited
 for; the CUPS test reading `localhost:631` stops at the tool deadline when CUPS takes the call and doesn't answer,
 rather than passing without the file; `COMPACT_EVERY` and `REDUCE_EVERY` stop the test saying so when given 0 or a
-word, rather than dividing by it; the preview font's test compares the time 5,000 glyphs take with 1,000's (at most
-12 times; work growing with the count takes about 5, measured 5.1 to 5.5, and with its square 25) rather than
-holding them to a limit a busy machine could miss; and core's integration tests make their folders with `Scratch`
-(`common/tool.rs`, under `target/tmp/tools`, removed afterwards unless the test failed), not in the system's
-temporary folder. The app's unit tests still make theirs there, named by process, and leave them (PB-155).
+word, rather than dividing by it; the preview font's test compares the time 5,000 glyphs take in one font with five
+fonts of 1,000 (at most 2.5 times; work growing with the count takes about as long either way, measured 1.05 to
+1.06, and with its square 5 times as long) rather than holding them to a limit a busy machine could miss; and
+core's integration tests make their folders with `Scratch` (`common/tool.rs`, under `target/tmp/tools`, removed
+afterwards unless the test failed), not in the system's temporary folder. The app's unit tests still make theirs
+there, named by process, and leave them (PB-155).
 
 The comparison with poppler needs `pdftoppm` (poppler-utils) and curl. From `crates/limarepdf-core`, run
 `sh tools/render-compare.sh`. It downloads the files listed in `tools/render-samples.txt` (the pdf.js and PDFBox test
@@ -989,6 +990,15 @@ wrote the picture back the way it came) and, opt-in, `cross_check_a_fax_picture_
 same, drawn by `pdftoppm`). Over the render corpus's 23 files with fax pictures, main's command line against the
 fix's: PDFBox's `2779.pdf` pages 2 and 3 were negative before (83% of pixels changed at 20 dpi), now within 0.02%
 (straightened by 0.2°); every other page drew the same with both.
+
+A timing test failing on a busy machine, PB-221 (2026-11-24; logs in the cycle folder's `runs/pkg-appimage/`): core's
+`preview_font.rs` test compared 5,000 glyphs with 1,000 (at most 12 times) and failed on CI's Mac at 12.1. A
+scheduler that pauses a busy program 10 ms at a time could miss the 4 ms run of 1,000 every time, but not the 22 ms
+run of 5,000. Stopping the test for 10 ms after runs of 2 to 20 ms reproduced it: 23 of 100 runs failed, at up to
+15.6 times. `five_thousand_glyphs_take_about_as_long_as_five_fonts_of_a_thousand` compares one font of 5,000 glyphs
+with five fonts of 1,000 instead, runs as long as each other, the quickest of six turns each, taking turns at going
+first: at most 2.5 times, 1.05 to 1.06 on a quiet machine, and all 100 passed under the same pauses (0.51 to 1.94
+times). Work growing with the square of the count still takes 5 times as long.
 
 Later additions (recent files, document notices, fit width, the theme button, crop)
 were checked by screenshot under a virtual X server; not every one has been clicked through by hand. Of the newest:

@@ -11,6 +11,7 @@ Pick your system:
 - **Windows:** the [installer](#windows-installer).
 - **macOS:** the [app](#macos-app).
 - **Linux:** the [package repository](#linux-packages), which keeps LimarePDF updated with the rest of your system.
+  On systems it doesn't cover, the [AppImage](#appimage).
 - **Without installing**, on any of them: an [archive](#archives) you unpack anywhere.
 
 ## Requirements
@@ -159,6 +160,39 @@ sudo zypper install ./limarepdf-<version>-1.x86_64.rpm
 
 The `.rpm` is signed with the project's key, and `rpm --checksig` checks it: it should say `digests signatures OK`.
 The `.deb` is checked as any download is ([below](#checking-a-download)).
+
+## AppImage
+
+For Linux systems the packages don't cover, the AppImage is LimarePDF in a single file that runs without
+installing: `LimarePDF-<version>-x86_64.AppImage`, or `LimarePDF-<version>-aarch64.AppImage` for Arm64. Like the
+packages, it needs glibc 2.39 or later ([Requirements](#requirements)). Make it executable and run it:
+
+```
+chmod +x LimarePDF-<version>-x86_64.AppImage
+./LimarePDF-<version>-x86_64.AppImage
+```
+
+The command-line tool is in the same file: give `limarepdf-cli` as the first argument
+(`./LimarePDF-<version>-x86_64.AppImage limarepdf-cli --help`), or start the AppImage through a link named
+`limarepdf-cli`.
+
+The AppImage runs through FUSE, which most desktops have. If it says "Cannot mount AppImage", install your
+system's `fuse3` package. Or put `--appimage-extract-and-run` before the other arguments: it runs without FUSE, but
+leaves an unpacked copy (about 100 MB) in `/tmp`.
+
+To keep it, with both programs on your `PATH` and a menu entry, run in the folder you downloaded it to:
+
+```
+install -Dm755 LimarePDF-<version>-x86_64.AppImage ~/.local/bin/limarepdf
+ln -sf limarepdf ~/.local/bin/limarepdf-cli
+~/.local/bin/limarepdf --appimage-extract 'usr/share/*' > /dev/null
+install -Dm644 squashfs-root/usr/share/applications/io.github.smaug42.limarepdf.desktop ~/.local/share/applications/io.github.smaug42.limarepdf.desktop
+install -Dm644 squashfs-root/usr/share/icons/hicolor/256x256/apps/io.github.smaug42.limarepdf.png ~/.local/share/icons/hicolor/256x256/apps/io.github.smaug42.limarepdf.png
+rm -r squashfs-root
+```
+
+The menu entry runs `limarepdf`, so `~/.local/bin` must be on your `PATH` (it is on most systems). The AppImage
+doesn't update itself: for a new version, download it from the Releases page and run the first command again.
 
 ## Archives
 

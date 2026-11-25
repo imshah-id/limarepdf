@@ -31,6 +31,11 @@ How a release is made, for maintainers.
      clarification there and a line in `check-package.py`'s `BUNDLED`, and its fonts named in the About window's
      credits and in licence.md. Move cargo-about to its latest release here, after reading its changelog: the
      version is set in `package-notices.sh` and in `ci.yml`'s two Install cargo-about steps;
+   - move the AppImage's runtime (`AppImage/type2-runtime`) and `appimagetool` (`AppImage/appimagetool`) to their
+     latest numbered releases (not `continuous`) in `packaging/linux/make-appimage.sh`, after reading their
+     changes, with each file's SHA-256 for both architectures from GitHub: `gh release view <tag> -R
+     AppImage/type2-runtime --json assets --jq '.assets[] | [.name, .digest] | @tsv'`, and the same for
+     appimagetool ([AppImage](#appimage));
    - merge or close Dependabot's open pull requests for the workflows' actions ([Pinned
      actions](#pinned-actions)), and check that `dtolnay/rust-toolchain` is at its `stable` branch's latest commit;
    - check that the user guide's screenshots (`docs/images/`) still show the app as it is, and retake any that
@@ -58,8 +63,8 @@ How a release is made, for maintainers.
    the run's page choose Review deployments, tick `release-signing` and approve. Before signing anything, it checks
    that the tag matches `Cargo.toml`, takes the release notes from the matching `CHANGELOG.md` section, and ends
    them with a link comparing the tag with the previous version tag. It then signs and creates a draft GitHub
-   Release with the archives, the Linux packages, the MSIs and the dmg, `SHA256SUMS`, and a GPG signature (`.asc`)
-   for each, and records a build attestation for every file.
+   Release with the archives, the Linux packages and AppImages, the MSIs and the dmg, `SHA256SUMS`, and a GPG
+   signature (`.asc`) for each, and records a build attestation for every file.
 5. On GitHub, open the draft under Releases, choose Edit, check the notes and files, and publish it. Publishing
    starts the `packages` workflow, which updates the apt and dnf repositories ([below](#package-repositories)); its
    `sign` job waits for approval in the same way.
@@ -92,8 +97,8 @@ targets' architectures (each one's ELF, PE or Mach-O header says, universal or n
 security notes, OCR model notes and every licence (the font ones and the crates' included) there, every relative
 link reaching a file and heading in the folder, every link to the version's tag reaching one in the repository, and
 the crates' licences matching the crates built ([below](#third-party-licences)). CI runs it on each archive before
-packing it, on the deb and rpm unpacked, on the MSI installed, and on the app in the mounted dmg; the logs list each
-package's files.
+packing it, on the deb, rpm and AppImage unpacked, on the MSI installed, and on the app in the mounted dmg; the logs
+list each package's files.
 
 The Linux jobs also make `limarepdf_<version>-1_amd64.deb` and `limarepdf-<version>-1.x86_64.rpm` (on Arm,
 `limarepdf_<version>-1_arm64.deb` and `limarepdf-<version>-1.aarch64.rpm`) with `cargo-deb` and
@@ -114,7 +119,10 @@ that architecture, on the oldest systems install.md names (Ubuntu 24.04, Debian 
 and on a current Fedora, with `packaging/check-linux-install.sh`: the system's package manager installs the package
 with the libraries it depends on from the system's own repositories (recommended packages left out), `ldd` finds
 every library and glibc version both programs need, `limarepdf-cli --version` runs, and removing the package leaves
-neither program behind. The release and dry-run jobs wait for it. To run it locally, with the packages in `dist/`:
+neither program behind. Before removing it, the script unpacks the AppImage ([below](#appimage)) there, checks with
+`ldd` that both programs load on the libraries the package brought (those a desktop has), and runs `limarepdf-cli
+--version` through the AppImage with `APPIMAGE_EXTRACT_AND_RUN=1`, since containers have no FUSE. The release and
+dry-run jobs wait for it. To run it locally, with the packages and the AppImage in `dist/`:
 `podman run --rm -v "$PWD:/w:ro" -w /w docker.io/library/ubuntu:24.04 bash packaging/check-linux-install.sh dist`,
 and the same with each of the job's other images.
 
@@ -167,6 +175,31 @@ and `packaging/sign-release.sh` signs the rpms, writes `SHA256SUMS`, and signs i
 checking each signature against `docs/limarepdf-signing-key.asc` as rpm and gpgv will. The job then records build
 provenance with `actions/attest-build-provenance`, which users check with `gh attestation verify`. A tag run whose
 environment has no `GPG_SIGNING_KEY` fails at the signing step, with nothing signed or released.
+
+### AppImage
+
+After the deb and rpm, the Linux jobs make `LimarePDF-<version>-x86_64.AppImage` (on Arm,
+`LimarePDF-<version>-aarch64.AppImage`) from the archive with `packaging/linux/make-appimage.sh`. The AppImage holds
+the programs in `usr/bin`, the desktop entry and icon where a package puts them (and at the top, as an AppImage has
+them), the rest of the archive in `usr/share/doc/limarepdf`, and `packaging/linux/AppRun`. AppRun starts
+`limarepdf-cli` when the AppImage is started through a link of that name or given it as its first argument, and
+`limarepdf` otherwise. The runtime, the program at the front of the file that mounts the rest, is AppImage's static
+one: it needs no library, libfuse2 included, only `fusermount3` to mount itself, or nothing with
+`--appimage-extract-and-run`. The script downloads it and `appimagetool` at set versions, checking each by its
+SHA-256 (step 1 moves them). Nothing else is bundled: the programs load glibc and the desktop's libraries from the
+system, as the packages' do, so the AppImage has the same glibc floor. `appimagetool` runs `desktop-file-validate`
+on the desktop entry when it is installed, as the job installs it.
+
+`packaging/linux/check-appimage.sh` then checks that the runtime is static and built for the job's architecture, the
+files unpacked with `check-package.py`, AppRun with stand-ins for the programs (which one starts, by the name and by
+the first argument, with the arguments passed on unchanged), and `limarepdf-cli --version` through the AppImage
+both ways, with FUSE (`fuse3`). The `linux-install` job then runs the AppImage on each system
+([above](#what-ci-builds)). To make and check one locally, on Linux with FUSE, from the archive in `dist/`:
+
+```
+bash packaging/linux/make-appimage.sh dist/limarepdf-<version>-linux-x86_64.tar.gz dist
+bash packaging/linux/check-appimage.sh dist/LimarePDF-<version>-x86_64.AppImage x86_64-unknown-linux-gnu
+```
 
 ### Third-party licences
 

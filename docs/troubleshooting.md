@@ -22,10 +22,17 @@ To check that a download really comes from this project, see [Checking a downloa
 The desktop app needs a working Vulkan or OpenGL graphics driver and an X11 or Wayland desktop session. Start
 `limarepdf` from a terminal to see why it stopped, and [report it](#reporting-a-problem) with that message.
 
+### The AppImage says "Cannot mount AppImage"
+
+The AppImage runs through FUSE, and the system doesn't have it: install your system's `fuse3` package. Or run it
+with `--appimage-extract-and-run` first, which works without FUSE but leaves an unpacked copy (about 100 MB) in
+`/tmp`. See [AppImage](install.md#appimage).
+
 ### The window has a plain icon on Linux
 
 Wayland desktops take a window's icon from its menu entry. The packages install one; for the archive, see
-[Menu entry and icon on Linux](install.md#menu-entry-and-icon-on-linux).
+[Menu entry and icon on Linux](install.md#menu-entry-and-icon-on-linux), and for the AppImage,
+[AppImage](install.md#appimage).
 
 ## Opening documents
 
