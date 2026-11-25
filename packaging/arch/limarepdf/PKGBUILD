@@ -1,0 +1,73 @@
+# Maintainer: Clayton Cornell <clayton at smaug42 dot com>
+#
+# LimarePDF built from the release's signed source archive: the AUR's limarepdf. The version and the
+# archive's checksum here are placeholders; packaging/arch/update.sh fills them in for each release and
+# writes the copy the AUR gets, with its .SRCINFO. ci.yml's arch-source job builds it, and its arch job checks
+# and installs it (packaging/arch/check-arch.sh). It installs what the release archive holds, as limarepdf-bin
+# does.
+
+pkgname=limarepdf
+pkgver=0.14.1
+pkgrel=1
+pkgdesc='PDF viewer and editor'
+arch=(x86_64 aarch64)
+url='https://github.com/smaug42/limarepdf'
+license=('MIT OR Apache-2.0')
+# The libraries limarepdf loads at run time (windowing, OpenGL, file dialogs over D-Bus), and the icons'
+# folders.
+depends=(dbus glibc hicolor-icon-theme libgcc libglvnd libx11 libxcursor libxi libxkbcommon libxkbcommon-x11
+         wayland)
+makedepends=(cargo python)
+optdepends=('cups: printing'
+            'xdg-desktop-portal: file dialogs'
+            'xdg-utils: opening links')
+# The release profile strips the programs, so a debug package would be empty, and does Rust's own link-time
+# optimisation; makepkg's builds C code (ring's, in cargo-about) that Rust's linker can't read.
+options=(!debug !lto)
+# The crates' licences come from cargo-about at the version packaging/package-notices.sh asks for.
+_about=0.9.3
+source=("https://github.com/smaug42/limarepdf/releases/download/v$pkgver/limarepdf-$pkgver-source.tar.gz"{,.asc}
+        "cargo-about-$_about.tar.gz::https://static.crates.io/crates/cargo-about/cargo-about-$_about.crate")
+sha256sums=('SKIP'
+            'SKIP'
+            'f2309e4e7cd6fbb25c4c8d68e69c728936dec58a0cb7940dcb382d5be32aa52b')
+# The release signing key, docs/limarepdf-signing-key.asc.
+validpgpkeys=('0CF97E88BAFEE9B638D214CBEB40041A7A8DC801')
+
+prepare() {
+  export RUSTUP_TOOLCHAIN=stable
+  # Every platform's crates: package-notices.sh reads the whole workspace's metadata.
+  cargo fetch --locked --manifest-path "limarepdf-$pkgver/Cargo.toml"
+  cargo fetch --locked --manifest-path "cargo-about-$_about/Cargo.toml"
+}
+
+build() {
+  export RUSTUP_TOOLCHAIN=stable CARGO_NET_OFFLINE=true
+  cargo build --frozen --release --features cli --manifest-path "cargo-about-$_about/Cargo.toml" \
+    --target-dir "$srcdir/cargo-about-target"
+  cd "limarepdf-$pkgver"
+  CARGO_TARGET_DIR=target cargo build --frozen --release -p limarepdf-gui -p limarepdf-cli
+  rm -rf "$srcdir/archive"
+  PATH="$srcdir/cargo-about-target/release:$PATH" bash packaging/package-archive.sh "$srcdir/archive"
+}
+
+check() {
+  cd archive
+  ./limarepdf-cli --version
+  local sample="$srcdir/limarepdf-$pkgver/crates/limarepdf-core/tests/data/paragraphs/madeup/ch01_ragged_sans11.pdf"
+  ./limarepdf-cli rotate --degrees 90 -o "$srcdir/check.pdf" "$sample"
+  ./limarepdf-cli info "$srcdir/check.pdf" | grep -qx 'pages:    6'
+}
+
+package() {
+  cd archive
+  install -Dm755 -t "$pkgdir/usr/bin" limarepdf limarepdf-cli
+  install -Dm644 -t "$pkgdir/usr/share/applications" io.github.smaug42.limarepdf.desktop
+  install -Dm644 -t "$pkgdir/usr/share/icons/hicolor/256x256/apps" io.github.smaug42.limarepdf.png
+  install -Dm644 -t "$pkgdir/usr/share/licenses/$pkgname" LICENSE-* *-LICENSE-*.txt THIRD-PARTY-LICENSES.html
+  # The guide, whose links reach the README and the licences beside it, as in the archive.
+  install -Dm644 -t "$pkgdir/usr/share/doc/limarepdf" README.md CHANGELOG.md SECURITY.md OCR-MODEL.md
+  cp -r --no-preserve=mode docs "$pkgdir/usr/share/doc/limarepdf/"
+  ln -s "../../licenses/$pkgname/LICENSE-MIT" "$pkgdir/usr/share/doc/limarepdf/LICENSE-MIT"
+  ln -s "../../licenses/$pkgname/LICENSE-APACHE" "$pkgdir/usr/share/doc/limarepdf/LICENSE-APACHE"
+}

@@ -403,6 +403,56 @@ jobs:
           IMAGE: ${{ matrix.image }}
         run: docker run --rm -v "$PWD:/w:ro" -w /w "$IMAGE" bash packaging/check-linux-install.sh dist
 
+  # The release's source archive (git archive), and from it the AUR's limarepdf built as an Arch
+  # Linux user's makepkg builds it, while the other platforms build: packaging/arch/check-arch.sh's
+  # first run. The package is kept for the arch job only; the archive goes in the release.
+  arch-source:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Source archive
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          mkdir dist
+          git archive --prefix="limarepdf-$version/" HEAD | gzip -n > "dist/limarepdf-$version-source.tar.gz"
+      - name: Build limarepdf
+        run: |
+          docker run --rm -v "$PWD:/w:ro" -v "$PWD/dist:/dist" -w /w docker.io/library/archlinux:base-devel \
+            bash packaging/arch/check-arch.sh source /dist
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: limarepdf-source
+          path: dist/*-source.tar.gz
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: arch-limarepdf
+          path: dist/*.pkg.tar.zst
+
+  # The AUR's limarepdf-bin built from the Linux archives for both architectures, and both packages
+  # checked, then installed, upgraded, replaced and removed on x86_64, the programs at work after each
+  # step: check-arch.sh's second run. A release waits for it, so the AUR's PKGBUILDs are known to
+  # build from its files before they are made.
+  arch:
+    needs: [build, arch-source]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: limarepdf-linux-*
+          path: dist
+          merge-multiple: true
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: limarepdf-source
+          path: dist
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: arch-limarepdf
+          path: dist
+      - name: Build, check, install and remove
+        run: docker run --rm -v "$PWD:/w:ro" -w /w docker.io/library/archlinux:base-devel bash packaging/arch/check-arch.sh dist
+
   # On a version tag (v0.3.0): a draft GitHub Release with the archives, their checksums,
   # GPG signatures, build attestations and this version's section of CHANGELOG.md.
   # Publish it on GitHub. The release key is only in the release-signing environment, so the
@@ -410,7 +460,7 @@ jobs:
   # stops before anything is signed or attested. It waits for the deny job, so it never
   # starts after a known advisory.
   release:
-    needs: [deny, build, macos-dmg, linux-install]
+    needs: [deny, build, macos-dmg, linux-install, arch]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     environment: release-signing
@@ -443,8 +493,11 @@ jobs:
             printf '\n**All changes:** https://github.com/%s/compare/%s...%s\n' \
               "$GITHUB_REPOSITORY" "$prev" "$tag" >> notes.md
           fi
+      # The release's files: the artifacts named limarepdf-* (not the Arch package, built for the
+      # arch job's checks).
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
+          pattern: limarepdf-*
           path: assets
           merge-multiple: true
       # The rpm's own signature, SHA256SUMS, and a detached signature (.asc) for it and for every
@@ -473,13 +526,14 @@ jobs:
   # published key must still be able to sign for 60 days. The files themselves get SHA256SUMS
   # only and are uploaded as release-dry-run-unsigned. Like a release, it waits for the deny job.
   dry-run:
-    needs: [deny, build, macos-dmg, linux-install]
+    needs: [deny, build, macos-dmg, linux-install, arch]
     if: inputs.dry_run && !startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
+          pattern: limarepdf-*
           path: assets
           merge-multiple: true
       - name: The release key's expiry
