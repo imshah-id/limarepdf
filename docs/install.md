@@ -191,8 +191,14 @@ cd limarepdf-bin
 makepkg -si
 ```
 
-The AUR helper's upgrade brings new versions; by hand, run `git pull` in that folder, then `makepkg -si` again. To
-remove LimarePDF, `sudo pacman -R limarepdf-bin` (or `limarepdf`); your documents and settings stay. On Arm64 the
+The AUR helper's upgrade brings new versions; by hand, run `git pull` in that folder, then `makepkg -si` again.
+
+Each release also has `limarepdf` built for x86_64, `limarepdf-<version>-1-x86_64.pkg.tar.zst`, signed like the
+other files: check it as under [Checking a download](#checking-a-download), then install it with `sudo pacman -U
+limarepdf-<version>-1-x86_64.pkg.tar.zst`. An AUR helper then takes it for the AUR's `limarepdf`, and builds the
+next versions from source; for upgrades ready to install, use `limarepdf-bin`.
+
+To remove LimarePDF, `sudo pacman -R limarepdf-bin` (or `limarepdf`); your documents and settings stay. On Arm64 the
 packages haven't been installed and run yet, and `limarepdf` hasn't been built there.
 
 ## AppImage

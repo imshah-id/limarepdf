@@ -65,8 +65,9 @@ How a release is made, for maintainers.
    the run's page choose Review deployments, tick `release-signing` and approve. Before signing anything, it checks
    that the tag matches `Cargo.toml`, takes the release notes from the matching `CHANGELOG.md` section, and ends
    them with a link comparing the tag with the previous version tag. It then signs and creates a draft GitHub
-   Release with the archives, the source archive, the Linux packages and AppImages, the MSIs and the dmg,
-   `SHA256SUMS`, and a GPG signature (`.asc`) for each, and records a build attestation for every file.
+   Release with the archives, the source archive, the Linux packages and AppImages, the Arch Linux package (x86_64,
+   built from source), the MSIs and the dmg, `SHA256SUMS`, and a GPG signature (`.asc`) for each, and records a
+   build attestation for every file.
 5. On GitHub, open the draft under Releases, choose Edit, check the notes and files, and publish it. Publishing
    starts the `packages` workflow, which updates the apt and dnf repositories ([below](#package-repositories)); its
    `sign` job waits for approval in the same way.
@@ -227,8 +228,9 @@ version, the checksums and its `.SRCINFO`: for a release, from its `SHA256SUMS` 
 version already on the AUR (2, then 3).
 
 The `arch-source` job makes the release's source archive, `limarepdf-<version>-source.tar.gz` (`git archive`), and
-builds `limarepdf` from it in a current `archlinux:base-devel` container while the platforms build; the archive goes
-in the release, and the package to the `arch` job only. After the builds, the `arch` job builds `limarepdf-bin` for
+builds `limarepdf` from it in a current `archlinux:base-devel` container while the platforms build. Both go in the
+release, the package as `limarepdf-<version>-1-x86_64.pkg.tar.zst` for users who would rather not build it, and the
+package to the `arch` job's checks too. After the builds, the `arch` job builds `limarepdf-bin` for
 both architectures from the Linux archives, and one with pkgrel 0.1 to upgrade from, then checks the three packages:
 namcap (an error fails it; its warnings that the libraries the app loads at run time look unneeded are expected,
 and that `limarepdf-bin` should say `$CARCH` for the x86_64 in the archive's name, which is arm64 on aarch64),

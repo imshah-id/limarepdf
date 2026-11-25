@@ -13,7 +13,8 @@
 - Packages for Arch Linux on the AUR, x86_64 and aarch64: `limarepdf`, built from source on your computer, and
   `limarepdf-bin`, the release's programs ([Install](docs/install.md#arch-linux)).
 - Each release has its source as a signed archive, `limarepdf-<version>-source.tar.gz`, which the AUR's
-  `limarepdf` builds from.
+  `limarepdf` builds from, and that package built for x86_64, for `sudo pacman -U`
+  ([Install](docs/install.md#arch-linux)).
 
 ### Changed
 

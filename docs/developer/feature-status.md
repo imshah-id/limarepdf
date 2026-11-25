@@ -555,7 +555,7 @@ AppImage, and removes them, and a release waits for it. For Arch Linux, two AUR 
 `limarepdf`, built from the release's source archive, and `limarepdf-bin`, from its Linux archives, for x86_64
 and aarch64; CI builds both from each change's files in a current Arch Linux container, checks them, and installs,
 upgrades, replaces and removes them on x86_64, opening the app's window under X11 and Wayland after each step, and a
-release waits for it. The archives stay, with the guide inside. Support for every system is provisional for now
+release waits for it; the release has `limarepdf` built for x86_64 too. The archives stay, with the guide inside. Support for every system is provisional for now
 ([requirements](../install.md#requirements)). A release waits for the check of every library against known security advisories, and is
 built from exactly the versions in `Cargo.lock`; security problems are reported privately, as
 [SECURITY.md](../../SECURITY.md) describes.
