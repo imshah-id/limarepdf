@@ -1,0 +1,24 @@
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.installer.1.28.0.schema.json
+
+PackageIdentifier: ClaytonCornell.LimarePDF
+PackageVersion: @VERSION@
+InstallerType: wix
+Scope: machine
+UpgradeBehavior: install
+Commands:
+- limarepdf-cli
+FileExtensions:
+- pdf
+AppsAndFeaturesEntries:
+- UpgradeCode: '@UPGRADE_CODE@'
+Installers:
+- Architecture: x64
+  InstallerUrl: https://github.com/smaug42/limarepdf/releases/download/v@VERSION@/limarepdf-@VERSION@-x86_64.msi
+  InstallerSha256: @X64_MSI_SHA256@
+  ProductCode: '@X64_PRODUCT_CODE@'
+- Architecture: arm64
+  InstallerUrl: https://github.com/smaug42/limarepdf/releases/download/v@VERSION@/limarepdf-@VERSION@-arm64.msi
+  InstallerSha256: @ARM64_MSI_SHA256@
+  ProductCode: '@ARM64_PRODUCT_CODE@'
+ManifestType: installer
+ManifestVersion: 1.28.0

@@ -8,7 +8,8 @@ way of installing below gives you both. Downloads are on the project's
 
 Pick your system:
 
-- **Windows:** the [installer](#windows-installer).
+- **Windows:** the [installer](#windows-installer), or [winget or Scoop](#winget-and-scoop), which keep it
+  updated.
 - **macOS:** the [app](#macos-app).
 - **Linux:** the [package repository](#linux-packages), which keeps LimarePDF updated with the rest of your system;
   on Arch Linux, the [AUR](#arch-linux). On systems they don't cover, the [AppImage](#appimage).
@@ -54,6 +55,35 @@ The installer is not code-signed yet, so SmartScreen warns: choose More info, th
 To make LimarePDF the default PDF app, choose it in Settings > Apps > Default apps. Installing a newer version
 replaces the old one, as the Arm64 installer replaces an x64 LimarePDF of the same version; uninstall from
 Settings > Apps.
+
+## winget and Scoop
+
+**Not in winget or Scoop yet:** LimarePDF goes there with the next release.
+
+winget, Windows' own package manager, installs the [installer](#windows-installer) (the Arm64 one on Windows on Arm)
+and brings new versions:
+
+```
+winget install ClaytonCornell.LimarePDF
+```
+
+It installs for all users, so Windows asks for an administrator's permission. `winget upgrade --all` (or `winget
+upgrade ClaytonCornell.LimarePDF`) brings new versions, and `winget uninstall ClaytonCornell.LimarePDF` removes it.
+
+[Scoop](https://scoop.sh) installs LimarePDF for you alone, without an administrator, from the
+[archive](#archives):
+
+```
+scoop bucket add limarepdf https://github.com/smaug42/scoop-limarepdf
+scoop install limarepdf
+```
+
+That puts LimarePDF in the Start menu (under Scoop Apps) and `limarepdf-cli` on the `PATH`. It isn't added to Open
+with for PDF files: open them from the app, or choose another app under Open with and find `limarepdf.exe` in
+`scoop\apps\limarepdf\current` in your user folder. `scoop update`, then `scoop update limarepdf`, brings new
+versions, and `scoop uninstall limarepdf` removes it.
+
+Both check each download against its checksum, taken from the release's signed `SHA256SUMS`.
 
 ## macOS app
 
@@ -191,8 +221,14 @@ cd limarepdf-bin
 makepkg -si
 ```
 
-The AUR helper's upgrade brings new versions; by hand, run `git pull` in that folder, then `makepkg -si` again. To
-remove LimarePDF, `sudo pacman -R limarepdf-bin` (or `limarepdf`); your documents and settings stay. On Arm64 the
+The AUR helper's upgrade brings new versions; by hand, run `git pull` in that folder, then `makepkg -si` again.
+
+Each release also has `limarepdf` built for x86_64, `limarepdf-<version>-1-x86_64.pkg.tar.zst`, signed like the
+other files: check it as under [Checking a download](#checking-a-download), then install it with `sudo pacman -U
+limarepdf-<version>-1-x86_64.pkg.tar.zst`. An AUR helper then takes it for the AUR's `limarepdf`, and builds the
+next versions from source; for upgrades ready to install, use `limarepdf-bin`.
+
+To remove LimarePDF, `sudo pacman -R limarepdf-bin` (or `limarepdf`); your documents and settings stay. On Arm64 the
 packages haven't been installed and run yet, and `limarepdf` hasn't been built there.
 
 ## AppImage

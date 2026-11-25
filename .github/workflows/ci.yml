@@ -405,7 +405,7 @@ jobs:
 
   # The release's source archive (git archive), and from it the AUR's limarepdf built as an Arch
   # Linux user's makepkg builds it, while the other platforms build: packaging/arch/check-arch.sh's
-  # first run. The package is kept for the arch job only; the archive goes in the release.
+  # first run. Both go in the release, and the package to the arch job's checks.
   arch-source:
     runs-on: ubuntu-latest
     steps:
@@ -425,7 +425,7 @@ jobs:
           path: dist/*-source.tar.gz
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: arch-limarepdf
+          name: limarepdf-arch
           path: dist/*.pkg.tar.zst
 
   # The AUR's limarepdf-bin built from the Linux archives for both architectures, and both packages
@@ -448,10 +448,57 @@ jobs:
           path: dist
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          name: arch-limarepdf
+          name: limarepdf-arch
           path: dist
       - name: Build, check, install and remove
         run: docker run --rm -v "$PWD:/w:ro" -w /w docker.io/library/archlinux:base-devel bash packaging/arch/check-arch.sh dist
+
+  # The winget and Scoop manifests written from the MSIs and zips as for a release, with msitools reading
+  # the MSIs' codes (packaging/windows/update.sh), then checked by winget-scoop-check.
+  winget-scoop:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: limarepdf-windows-*
+          path: dist
+          merge-multiple: true
+      - name: Write the manifests
+        run: |
+          sudo apt-get install -y msitools > /dev/null
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          bash packaging/windows/update.sh "$version" manifests dist
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: winget-scoop
+          path: manifests
+
+  # On Windows x64 and Arm64, with the files served on the runner in place of the release: winget
+  # validates its manifests, installs LimarePDF from them and removes it, then Scoop does the same
+  # (packaging/windows/check-manifests.ps1). A release waits for it.
+  winget-scoop-check:
+    needs: [build, winget-scoop]
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, windows-11-arm]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: limarepdf-windows-*
+          path: dist
+          merge-multiple: true
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: winget-scoop
+          path: manifests
+      - name: Install from the manifests, and remove
+        shell: pwsh
+        run: packaging/windows/check-manifests.ps1 manifests dist
 
   # On a version tag (v0.3.0): a draft GitHub Release with the archives, their checksums,
   # GPG signatures, build attestations and this version's section of CHANGELOG.md.
@@ -460,7 +507,7 @@ jobs:
   # stops before anything is signed or attested. It waits for the deny job, so it never
   # starts after a known advisory.
   release:
-    needs: [deny, build, macos-dmg, linux-install, arch]
+    needs: [deny, build, macos-dmg, linux-install, arch, winget-scoop-check]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     environment: release-signing
@@ -493,8 +540,7 @@ jobs:
             printf '\n**All changes:** https://github.com/%s/compare/%s...%s\n' \
               "$GITHUB_REPOSITORY" "$prev" "$tag" >> notes.md
           fi
-      # The release's files: the artifacts named limarepdf-* (not the Arch package, built for the
-      # arch job's checks).
+      # The release's files: the artifacts named limarepdf-*.
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: limarepdf-*
@@ -526,7 +572,7 @@ jobs:
   # published key must still be able to sign for 60 days. The files themselves get SHA256SUMS
   # only and are uploaded as release-dry-run-unsigned. Like a release, it waits for the deny job.
   dry-run:
-    needs: [deny, build, macos-dmg, linux-install, arch]
+    needs: [deny, build, macos-dmg, linux-install, arch, winget-scoop-check]
     if: inputs.dry_run && !startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
