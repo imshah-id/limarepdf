@@ -15,6 +15,8 @@
 - Each release has its source as a signed archive, `limarepdf-<version>-source.tar.gz`, which the AUR's
   `limarepdf` builds from, and that package built for x86_64, for `sudo pacman -U`
   ([Install](docs/install.md#arch-linux)).
+- LimarePDF in winget (`winget install ClaytonCornell.LimarePDF`, the installer) and in its own Scoop bucket (the
+  `.zip`), for x64 and Arm64 Windows, so either keeps it up to date ([Install](docs/install.md#winget-and-scoop)).
 
 ### Changed
 

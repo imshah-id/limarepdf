@@ -76,6 +76,13 @@ How a release is made, for maintainers.
    It checks the published `SHA256SUMS` against the release key and writes each package's `PKGBUILD` and
    `.SRCINFO`. Read the changes (`git -C aur/limarepdf diff`), then in each repository commit both files with the
    message `X.Y.Z` and push.
+7. Update winget and Scoop ([winget and Scoop](#winget-and-scoop)): with the clones in `win/winget-pkgs` and
+   `win/scoop-limarepdf`, run `bash packaging/windows/update.sh X.Y.Z win`. It checks the published `SHA256SUMS`
+   against the release key, downloads the MSIs to read their codes, and writes winget's three manifests and Scoop's
+   `bucket/limarepdf.json`. In the bucket, read the change, commit it with the message `limarepdf: Update to version
+   X.Y.Z` and push. In winget-pkgs, on a new branch from the fork's updated `master`, commit the new folder with the
+   message `New version: ClaytonCornell.LimarePDF version X.Y.Z`, push it and open a pull request to
+   `microsoft/winget-pkgs`; its checks and a moderator's review take a day or more.
 
 Do not create the release on GitHub by hand, or the tag from GitHub's release form: the `release` job then finds a
 release already there and fails.
@@ -255,6 +262,47 @@ ssh://aur@aur.archlinux.org/limarepdf.git aur/limarepdf`, and the same for `lima
 clones empty, and the first push makes the package. After that first push, remove install.md's "Not on the AUR yet"
 line.
 
+### winget and Scoop
+
+`packaging/windows/` holds the templates of winget's three manifests for `ClaytonCornell.LimarePDF` (`winget/`:
+version, installer and the en-US locale), which install the x64 and Arm64 MSIs, and of Scoop's manifest
+(`scoop/limarepdf.json`), which unpacks the Windows zip of the computer's architecture. Each fill-in is written
+`@NAME@`. `packaging/windows/update.sh <version> <out> [<dist>]` fills them in: the version, the checksums (for a
+release, from its `SHA256SUMS` once the signature checks against `docs/limarepdf-signing-key.asc`; given `<dist>`,
+from the files there), and each MSI's product code with the upgrade code, publisher and name they share, read with
+msitools' `msiinfo`. It fails when an MSI doesn't match `SHA256SUMS`, isn't for the version, or the two differ in
+those, and when a fill-in is left. It writes winget's into
+`<out>/winget-pkgs/manifests/c/ClaytonCornell/LimarePDF/<version>/` and Scoop's into
+`<out>/scoop-limarepdf/bucket/limarepdf.json`.
+
+After the builds, the `winget-scoop` job writes the manifests from the MSIs and zips, and `winget-scoop-check` checks
+them on Windows x64 and Arm64 with `packaging/windows/check-manifests.ps1 <manifests> <dist>`. Every download address
+in them must be the release's, for one of the four files; copies then point at the files served on the runner
+(Python's `http.server`) in place of the release. winget validates its manifests as written, installs LimarePDF from
+the copies and removes it again; Scoop then installs it from its copy and removes it. After each install, the
+programs are the same as in the architecture's zip and `limarepdf-cli --version` names the version (through Scoop's
+shim, for Scoop), with Scoop's Start menu shortcut there; after each removal, nothing is left. A runner's winget
+older than 1.28, which can't read the manifests' schema, or none (the Arm64 runner's) is replaced by the release
+the script names, and Scoop is installed with its installer at the commit the script names, each checked against
+the checksum written there; update them there by hand. The release and dry-run jobs wait for
+`winget-scoop-check`. To run it on a Windows computer, as an administrator, with the Windows files in `dist\` and
+the manifests written from them (`update.sh` on Linux): `pwsh packaging/windows/check-manifests.ps1 manifests dist`.
+It installs LimarePDF and removes it, and installs Scoop.
+
+Set up once: a repository `smaug42/scoop-limarepdf` holding `bucket/limarepdf.json` and a README with the two
+commands in install.md, cloned into `win/scoop-limarepdf`; and a fork of `microsoft/winget-pkgs`, which is large,
+cloned sparse:
+
+```
+gh repo fork microsoft/winget-pkgs --clone=false
+git clone --filter=blob:none --sparse https://github.com/smaug42/winget-pkgs win/winget-pkgs
+git -C win/winget-pkgs sparse-checkout set manifests/c/ClaytonCornell
+```
+
+Before each version, bring the fork up to date (`gh repo sync smaug42/winget-pkgs`, then `git -C win/winget-pkgs
+pull`). The first pull request asks for Microsoft's contributor licence agreement to be signed. Once the first
+version is in both, remove install.md's "Not in winget or Scoop yet" line.
+
 ### Third-party licences
 
 Every package carries `THIRD-PARTY-LICENSES.html`, the licences of the crates built into its programs.
@@ -294,7 +342,7 @@ signs and attests nothing for real:
 - the files themselves get `SHA256SUMS` only, and are uploaded unsigned as the `release-dry-run-unsigned` artifact,
   with a notice on the run and its summary saying so.
 
-Like a release, it waits for the `deny` job: the run's graph shows `dry-run` after `deny`, `build`, `macos-dmg`, `linux-install` and `arch`,
+Like a release, it waits for the `deny` job: the run's graph shows `dry-run` after `deny`, `build`, `macos-dmg`, `linux-install`, `arch` and `winget-scoop-check`,
 and a failed `deny` skips it. What it can't try is the release key itself in CI (the environment's secrets and the
 approval): a tag run, or `packages.yml`'s `sign` job, is the first to use them.
 

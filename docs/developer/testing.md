@@ -10,9 +10,9 @@ it against the rpm's requirement), macOS 11 from both halves of the dmg's (the d
 | Platform | Status |
 | --- | --- |
 | Linux x86_64 | Needs glibc 2.39 or later (built on `ubuntu-24.04`; 0.14.0 alone, built on Ubuntu 26.04, needed 2.43). Provisional. Built and tested; the command line run on real PDFs; the desktop app used by hand and checked by screenshot under a virtual X server, including the narrow-window layout; the acceptance checks below run, including printing on paper |
-| Windows x86_64 | Windows 10 and 11. Provisional. Built and tested by continuous integration (`.github/workflows/ci.yml`, GitHub Actions), which also packages every platform. Printing has been tried by hand up to the print dialog; nothing has been printed on paper. The rest of the code that differs by platform has run only in CI's tests there, not by hand: replacing files in one step (`atomic.rs`), free disk space (`disk.rs`), recovery copies and their folder (`recovery/`), settings, digital IDs and trust files kept private (`write_private`), opening documents and links and showing files in the file manager, and the installer package's screens (CI installs, upgrades and uninstalls it without them) |
+| Windows x86_64 | Windows 10 and 11. Provisional. Built and tested by continuous integration (`.github/workflows/ci.yml`, GitHub Actions), which also packages every platform. Printing has been tried by hand up to the print dialog; nothing has been printed on paper. The rest of the code that differs by platform has run only in CI's tests there, not by hand: replacing files in one step (`atomic.rs`), free disk space (`disk.rs`), recovery copies and their folder (`recovery/`), settings, digital IDs and trust files kept private (`write_private`), opening documents and links and showing files in the file manager, and the installer package's screens (CI installs, upgrades and uninstalls it without them). CI also installs it with winget and with Scoop from the manifests written for a release, and removes it ([releasing](releasing.md#winget-and-scoop)) |
 | Linux Arm64 | Needs glibc 2.39 or later, as Linux x86_64 (built on `ubuntu-24.04-arm`). Provisional. Built and tested by continuous integration on an Arm runner, which also installs the deb and rpm on the same systems as for x86_64. Not run by hand |
-| Windows Arm64 | Windows 11 on Arm. Provisional. Built and tested by continuous integration on an Arm runner (`windows-11-arm`), which also installs, upgrades and uninstalls the MSI, and checks that it replaces an x64 LimarePDF of the same version. Not run by hand |
+| Windows Arm64 | Windows 11 on Arm. Provisional. Built and tested by continuous integration on an Arm runner (`windows-11-arm`), which also installs, upgrades and uninstalls the MSI, and checks that it replaces an x64 LimarePDF of the same version, and installs and removes it with winget and with Scoop. Not run by hand |
 | macOS (Intel and Apple Silicon) | macOS 11 or later. Provisional. Built and tested by continuous integration. Not run by hand |
 | Arch Linux x86_64 | The AUR's packages: `limarepdf`, built from the source archive, and `limarepdf-bin`, the Linux x86_64 archive's programs (so its glibc floor). Provisional. Both built by continuous integration in a current `archlinux:base-devel` container, checked, and installed, upgraded, replaced and removed there, the command line and the app's window run after each step ([releasing](releasing.md#arch-linux-packages)); not on the AUR yet. LimarePDF is built from source and used by hand on an Arch-based system (CachyOS, glibc 2.44) |
 | Arch Linux ARM (aarch64) | `limarepdf-bin` for aarch64, the Linux Arm64 archive's programs. Built and checked by continuous integration but not installed: there is no official Arch Linux image for Arm64. `limarepdf` isn't built on Arm |
@@ -1806,6 +1806,25 @@ the guide's licence link pointing nowhere (namcap's errors), the icon not instal
 docs installed 600 ("wrong modes") and a file added ("holds files its archive doesn't"). Found while writing it:
 makepkg's own link-time optimisation fails to link cargo-about (ring's C code), hence `!lto`, and the image's
 `NoExtract` left the docs out of what pacman installed, so the check removes it.
+
+winget and Scoop (#217; 2026-11-25). `update.sh` run locally in podman (`ubuntu:24.04` with msitools) on the
+Windows files of main's run 45663359253 (0.14.0, both architectures) wrote winget's three manifests and Scoop's,
+with the MSIs' product codes, upgrade code, publisher and name. Run for 0.14.0's release, it checked `SHA256SUMS`
+against the release key ("Good signature") and stopped at the Arm64 MSI, which 0.14.0 doesn't have. It failed on a
+version that isn't one, on 0.14.0's files named 0.14.1 ("isn't version 0.14.1"), with the Arm64 zip missing, with
+the x64 MSI cut short (msiinfo can't read it) and on a template with a fill-in it doesn't know. `check-manifests.ps1`
+ran on those files and manifests in a workflow of its own on a scratch branch (runs 45671797296 and 45673207605):
+on x64, whose winget 1.11.510 it replaced with 1.29.380, and on Arm64, which had none, winget validated the
+manifests, installed LimarePDF from them and removed it, then Scoop did the same, each install's programs those of
+the architecture's zip and nothing left after. Its first run failed on both: `winget uninstall` doesn't take
+`--accept-package-agreements`, and on Arm64 winget's own install stopped on an app in use (now
+`-ForceApplicationShutdown`). Copies of the manifests each broken once failed the check: an address not the
+release's ("isn't the release's"), the x64 installer's checksum wrong ("Installer hash does not match"), both
+product codes wrong (installed, then "No installed package found" to remove), one checksum for both installers
+(`winget validate` exits non-zero on its warning), the x64 zip's checksum wrong (Scoop's "Hash check failed"), its
+folder wrong (Scoop's "Could not find") and no shortcut ("is missing"). Found while writing it: Scoop's scripts ran
+with the check's own error settings, so after a failed checksum Scoop stopped inside its own code at a `git` call;
+they now run in a PowerShell of their own.
 
 ## Acceptance checks
 
