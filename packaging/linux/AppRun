@@ -1,0 +1,15 @@
+#!/bin/sh
+# Starts LimarePDF from its AppImage (packaging/linux/make-appimage.sh): the command-line tool when
+# the AppImage is started through a link named limarepdf-cli, or with limarepdf-cli as its first
+# argument; the desktop app otherwise. The AppImage's runtime sets ARGV0 to the name it was started
+# by; unpacked (--appimage-extract), the name this file was started by counts.
+here=$(dirname "$(readlink -f "$0")")
+name=${ARGV0:-$0}
+if [ "${name##*/}" = limarepdf-cli ]; then
+    exec "$here/usr/bin/limarepdf-cli" "$@"
+fi
+if [ "${1-}" = limarepdf-cli ]; then
+    shift
+    exec "$here/usr/bin/limarepdf-cli" "$@"
+fi
+exec "$here/usr/bin/limarepdf" "$@"

@@ -259,6 +259,16 @@ jobs:
           if [ "$need" != "$asked" ]; then
             echo "::error::The binaries need $need, the rpm asks for $asked: see releasing.md's Linux packages"; exit 1
           fi
+      # The AppImage from the archive just made (packaging/linux/make-appimage.sh), its runtime and
+      # appimagetool at set versions; appimagetool checks the desktop entry with desktop-file-validate.
+      # Then checked here, through FUSE (fuse3), as packaging/linux/check-appimage.sh says.
+      - name: AppImage
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get install -y desktop-file-utils fuse3 > /dev/null
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          bash packaging/linux/make-appimage.sh "dist/limarepdf-$version-${{ matrix.name }}.tar.gz" dist
+          bash packaging/linux/check-appimage.sh dist/*.AppImage "${{ matrix.target }}"
       # The MSI from packaging/windows/limarepdf.wxs, with the crates' licences from the Package step.
       # WiX is pinned to 5 (open source, no EULA step).
       # Two later versions of it, for the upgrade checks below, go to the runner's temporary folder;
@@ -348,6 +358,7 @@ jobs:
             dist/*.zip
             dist/*.deb
             dist/*.rpm
+            dist/*.AppImage
             dist/*.msi
 
   # A universal LimarePDF.app (Apple Silicon and Intel) in a .dmg; packaging/macos/make-dmg.sh.
@@ -398,9 +409,9 @@ jobs:
           path: dist/*.dmg
 
   # The .deb and .rpm installed, each in a clean container, on the oldest systems docs/install.md
-  # names and a current Fedora, then removed: packaging/check-linux-install.sh. Both
-  # architectures', each on a runner of its own. A release waits for it, so packages these
-  # systems refuse never ship.
+  # names and a current Fedora, then removed, and the AppImage run there on the libraries the
+  # package brought: packaging/check-linux-install.sh. Both architectures', each on a runner of
+  # its own. A release waits for it, so packages these systems refuse never ship.
   linux-install:
     needs: build
     strategy:
