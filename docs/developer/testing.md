@@ -1830,6 +1830,11 @@ folder wrong (Scoop's "Could not find") and no shortcut ("is missing"). Found wh
 with the check's own error settings, so after a failed checksum Scoop stopped inside its own code at a `git` call;
 they now run in a PowerShell of their own.
 
+On 0.14.1's pull request (#318, run 45691124491, 2026-11-25) the x64 check failed once: the winget 1.29.380 it had
+just installed exited with 0x8A150002 (invalid command line arguments) on `winget --version`, on the same runner
+image as #317's passing runs, and the job run again passed. The check now tries `winget --version` for up to a
+minute after installing it, logging each failed try.
+
 ## Acceptance checks
 
 The automated tests cover the library and the command line. These checks cover what they can't: the desktop app used
