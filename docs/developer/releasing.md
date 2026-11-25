@@ -30,7 +30,9 @@ How a release is made, for maintainers.
      clarification's licence and checksum. A crate that brings new fonts or code under another licence needs a
      clarification there and a line in `check-package.py`'s `BUNDLED`, and its fonts named in the About window's
      credits and in licence.md. Move cargo-about to its latest release here, after reading its changelog: the
-     version is set in `package-notices.sh` and in `ci.yml`'s two Install cargo-about steps;
+     version is set in `package-notices.sh`, in `ci.yml`'s two Install cargo-about steps, and in
+     `packaging/arch/limarepdf/PKGBUILD` (`_about`, with the crate's checksum: `curl -fsSL
+     https://static.crates.io/crates/cargo-about/cargo-about-<version>.crate | sha256sum`);
    - move the AppImage's runtime (`AppImage/type2-runtime`) and `appimagetool` (`AppImage/appimagetool`) to their
      latest numbered releases (not `continuous`) in `packaging/linux/make-appimage.sh`, after reading their
      changes, with each file's SHA-256 for both architectures from GitHub: `gh release view <tag> -R
@@ -63,11 +65,16 @@ How a release is made, for maintainers.
    the run's page choose Review deployments, tick `release-signing` and approve. Before signing anything, it checks
    that the tag matches `Cargo.toml`, takes the release notes from the matching `CHANGELOG.md` section, and ends
    them with a link comparing the tag with the previous version tag. It then signs and creates a draft GitHub
-   Release with the archives, the Linux packages and AppImages, the MSIs and the dmg, `SHA256SUMS`, and a GPG
-   signature (`.asc`) for each, and records a build attestation for every file.
+   Release with the archives, the source archive, the Linux packages and AppImages, the MSIs and the dmg,
+   `SHA256SUMS`, and a GPG signature (`.asc`) for each, and records a build attestation for every file.
 5. On GitHub, open the draft under Releases, choose Edit, check the notes and files, and publish it. Publishing
    starts the `packages` workflow, which updates the apt and dnf repositories ([below](#package-repositories)); its
    `sign` job waits for approval in the same way.
+6. Update the AUR's packages ([Arch Linux packages](#arch-linux-packages)): on Arch Linux, with the AUR's two
+   repositories cloned in `aur/limarepdf` and `aur/limarepdf-bin`, run `bash packaging/arch/update.sh X.Y.Z aur`.
+   It checks the published `SHA256SUMS` against the release key and writes each package's `PKGBUILD` and
+   `.SRCINFO`. Read the changes (`git -C aur/limarepdf diff`), then in each repository commit both files with the
+   message `X.Y.Z` and push.
 
 Do not create the release on GitHub by hand, or the tag from GitHub's release form: the `release` job then finds a
 release already there and fails.
@@ -97,14 +104,15 @@ targets' architectures (each one's ELF, PE or Mach-O header says, universal or n
 security notes, OCR model notes and every licence (the font ones and the crates' included) there, every relative
 link reaching a file and heading in the folder, every link to the version's tag reaching one in the repository, and
 the crates' licences matching the crates built ([below](#third-party-licences)). CI runs it on each archive before
-packing it, on the deb, rpm and AppImage unpacked, on the MSI installed, and on the app in the mounted dmg; the logs
-list each package's files.
+packing it, on the deb, rpm, AppImage and Arch packages unpacked, on the MSI installed, and on the app in the mounted
+dmg; the logs list each package's files.
 
 The Linux jobs also make `limarepdf_<version>-1_amd64.deb` and `limarepdf-<version>-1.x86_64.rpm` (on Arm,
 `limarepdf_<version>-1_arm64.deb` and `limarepdf-<version>-1.aarch64.rpm`) with `cargo-deb` and
 `cargo-generate-rpm`, from the `[package.metadata.deb]` and `[package.metadata.generate-rpm]` sections of
-`crates/limarepdf-gui/Cargo.toml`. Their dependency lists name the libraries limarepdf loads at run time; check them when
-eframe or rfd changes (`strings target/release/limarepdf | grep '\.so'` lists them). The rpm's glibc version
+`crates/limarepdf-gui/Cargo.toml`. Their dependency lists, and the Arch packages' `depends`, name the libraries
+limarepdf loads at run time; check them when eframe or rfd changes (`strings target/release/limarepdf | grep
+'\.so'` lists them). The rpm's glibc version
 (`libc.so.6(GLIBC_2.39)(64bit)`) is written by hand, since the automatic scan is off; each job fails when the
 binaries need a different one. That version is the floor install.md names. The binaries need the glibc of the
 Ubuntu they were built on, so the Linux jobs run on `ubuntu-24.04` and `ubuntu-24.04-arm` (glibc 2.39), not
@@ -201,6 +209,50 @@ bash packaging/linux/make-appimage.sh dist/limarepdf-<version>-linux-x86_64.tar.
 bash packaging/linux/check-appimage.sh dist/LimarePDF-<version>-x86_64.AppImage x86_64-unknown-linux-gnu
 ```
 
+### Arch Linux packages
+
+`packaging/arch/` holds the PKGBUILDs of the AUR's two packages, each for x86_64 and aarch64: `limarepdf`, built
+from the release's source archive, and `limarepdf-bin`, from its Linux archives. Both install what the release
+archive holds: the programs in `/usr/bin`, the desktop entry and icon, the licences in
+`/usr/share/licenses/<package>`, and the rest in `/usr/share/doc/limarepdf`, with links there to the two licences
+the guide links to. `limarepdf` makes that archive with `packaging/package-archive.sh`, as the Linux jobs do, with
+cargo-about built at the version it names. makepkg's own link-time optimisation is off there (`!lto`): it builds C
+code (ring's, in cargo-about) as GCC LTO objects that Rust's linker can't read, and the release profile does Rust's
+own. Each package checks the release files' signatures against the release key (`validpgpkeys`).
+
+The PKGBUILDs here carry a placeholder version and checksums (`SKIP`). `packaging/arch/update.sh [--pkgrel N]
+<version> <out> [<dist>]` writes the AUR's copies into `<out>/limarepdf` and `<out>/limarepdf-bin`, each with the
+version, the checksums and its `.SRCINFO`: for a release, from its `SHA256SUMS` once the signature checks against
+`docs/limarepdf-signing-key.asc`; given `<dist>`, from the files there. `--pkgrel N` is for a changed PKGBUILD of a
+version already on the AUR (2, then 3).
+
+The `arch-source` job makes the release's source archive, `limarepdf-<version>-source.tar.gz` (`git archive`), and
+builds `limarepdf` from it in a current `archlinux:base-devel` container while the platforms build; the archive goes
+in the release, and the package to the `arch` job only. After the builds, the `arch` job builds `limarepdf-bin` for
+both architectures from the Linux archives, and one with pkgrel 0.1 to upgrade from, then checks the three packages:
+namcap (an error fails it; its warnings that the libraries the app loads at run time look unneeded are expected,
+and that `limarepdf-bin` should say `$CARCH` for the x86_64 in the archive's name, which is arm64 on aarch64),
+every file of the release archive in its place and nothing else, pacman's modes, no test seam, and
+`check-package.py`. On x86_64 it then installs the earlier `limarepdf-bin`, upgrades it, replaces it with
+`limarepdf` and removes that. After each step: `pacman -Qkk`, the command line rotating a document, and the app's
+window open on it under X11 (Xvfb, found by its title) and Wayland (headless Weston: the title set and the window's
+surface drawn, read from `WAYLAND_DEBUG`); after removing, nothing left, and the user's files unchanged throughout.
+The Arm64 package is built and checked but not installed, as there is no official Arch Linux image for Arm64
+(testing.md's platforms). Both jobs run `packaging/arch/check-arch.sh`, which signs the files with a key made for the
+run, and the release and dry-run jobs wait for `arch`. To run it locally, with the linux-x86_64 and linux-arm64
+archives in `dist/`:
+
+```
+git archive --prefix="limarepdf-<version>/" HEAD | gzip -n > dist/limarepdf-<version>-source.tar.gz
+podman run --rm -v "$PWD:/w:ro" -v "$PWD/dist:/dist" -w /w docker.io/library/archlinux:base-devel bash packaging/arch/check-arch.sh source /dist
+podman run --rm -v "$PWD:/w:ro" -w /w docker.io/library/archlinux:base-devel bash packaging/arch/check-arch.sh dist
+```
+
+Set up once: an account on aur.archlinux.org with the maintainer's SSH key, then `git clone
+ssh://aur@aur.archlinux.org/limarepdf.git aur/limarepdf`, and the same for `limarepdf-bin`. A name not yet taken
+clones empty, and the first push makes the package. After that first push, remove install.md's "Not on the AUR yet"
+line.
+
 ### Third-party licences
 
 Every package carries `THIRD-PARTY-LICENSES.html`, the licences of the crates built into its programs.
@@ -240,7 +292,7 @@ signs and attests nothing for real:
 - the files themselves get `SHA256SUMS` only, and are uploaded unsigned as the `release-dry-run-unsigned` artifact,
   with a notice on the run and its summary saying so.
 
-Like a release, it waits for the `deny` job: the run's graph shows `dry-run` after `deny`, `build`, `macos-dmg` and `linux-install`,
+Like a release, it waits for the `deny` job: the run's graph shows `dry-run` after `deny`, `build`, `macos-dmg`, `linux-install` and `arch`,
 and a failed `deny` skips it. What it can't try is the release key itself in CI (the environment's secrets and the
 approval): a tag run, or `packages.yml`'s `sign` job, is the first to use them.
 

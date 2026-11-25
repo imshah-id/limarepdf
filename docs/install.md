@@ -10,8 +10,8 @@ Pick your system:
 
 - **Windows:** the [installer](#windows-installer).
 - **macOS:** the [app](#macos-app).
-- **Linux:** the [package repository](#linux-packages), which keeps LimarePDF updated with the rest of your system.
-  On systems it doesn't cover, the [AppImage](#appimage).
+- **Linux:** the [package repository](#linux-packages), which keeps LimarePDF updated with the rest of your system;
+  on Arch Linux, the [AUR](#arch-linux). On systems they don't cover, the [AppImage](#appimage).
 - **Without installing**, on any of them: an [archive](#archives) you unpack anywhere.
 
 ## Requirements
@@ -161,6 +161,40 @@ sudo zypper install ./limarepdf-<version>-1.x86_64.rpm
 The `.rpm` is signed with the project's key, and `rpm --checksig` checks it: it should say `digests signatures OK`.
 The `.deb` is checked as any download is ([below](#checking-a-download)).
 
+## Arch Linux
+
+**Not on the AUR yet:** its packages go there with the next release.
+
+On Arch Linux and the systems built from it (EndeavourOS, CachyOS, Manjaro and others), LimarePDF comes from the
+Arch User Repository (AUR), in two packages:
+
+- `limarepdf-bin`, the programs as released, ready to install;
+- `limarepdf`, built on your computer from the release's source, which takes a while (about 20 minutes on two
+  processor cores, less with more) and a few GB of memory.
+
+Both are for x86_64 and Arm64 (Arch Linux ARM), and install the same: `limarepdf` and `limarepdf-cli` in
+`/usr/bin`, the menu entry, the icon, this guide (in `/usr/share/doc/limarepdf`) and the licences, with the libraries
+the app needs. Installing one replaces the other.
+
+They check the release's signature, so import the project's key first, once, and check its fingerprint as under
+[Checking a download](#checking-a-download):
+
+```
+curl -fsSL https://smaug42.github.io/limarepdf/limarepdf-signing-key.asc | gpg --import
+```
+
+Then install with an AUR helper (`yay -S limarepdf-bin`, `paru -S limarepdf-bin`), or by hand:
+
+```
+git clone https://aur.archlinux.org/limarepdf-bin.git
+cd limarepdf-bin
+makepkg -si
+```
+
+The AUR helper's upgrade brings new versions; by hand, run `git pull` in that folder, then `makepkg -si` again. To
+remove LimarePDF, `sudo pacman -R limarepdf-bin` (or `limarepdf`); your documents and settings stay. On Arm64 the
+packages haven't been installed and run yet, and `limarepdf` hasn't been built there.
+
 ## AppImage
 
 For Linux systems the packages don't cover, the AppImage is LimarePDF in a single file that runs without
@@ -249,7 +283,8 @@ are under the run's artifacts (this needs a GitHub sign-in).
 
 ## Build from source
 
-You need the latest stable Rust (`rustup update stable`); older versions aren't supported.
+You need the latest stable Rust (`rustup update stable`); older versions aren't supported. Build in a clone of the
+repository, or in a release's source, `limarepdf-<version>-source.tar.gz` (signed like the other files):
 
 ```
 cargo build --release --locked

@@ -14,7 +14,8 @@ it against the rpm's requirement), macOS 11 from both halves of the dmg's (the d
 | Linux Arm64 | Needs glibc 2.39 or later, as Linux x86_64 (built on `ubuntu-24.04-arm`). Provisional. Built and tested by continuous integration on an Arm runner, which also installs the deb and rpm on the same systems as for x86_64. Not run by hand |
 | Windows Arm64 | Windows 11 on Arm. Provisional. Built and tested by continuous integration on an Arm runner (`windows-11-arm`), which also installs, upgrades and uninstalls the MSI, and checks that it replaces an x64 LimarePDF of the same version. Not run by hand |
 | macOS (Intel and Apple Silicon) | macOS 11 or later. Provisional. Built and tested by continuous integration. Not run by hand |
-| Arch Linux x86_64 | The target of the Arch package and AUR recipe (REL-14, not built yet); its tested snapshot, date and package dependencies are recorded here when it is, apart from the Ubuntu-built binaries' glibc floor. LimarePDF is built from source and used by hand on an Arch-based system (CachyOS, glibc 2.44) |
+| Arch Linux x86_64 | The AUR's packages: `limarepdf`, built from the source archive, and `limarepdf-bin`, the Linux x86_64 archive's programs (so its glibc floor). Provisional. Both built by continuous integration in a current `archlinux:base-devel` container, checked, and installed, upgraded, replaced and removed there, the command line and the app's window run after each step ([releasing](releasing.md#arch-linux-packages)); not on the AUR yet. LimarePDF is built from source and used by hand on an Arch-based system (CachyOS, glibc 2.44) |
+| Arch Linux ARM (aarch64) | `limarepdf-bin` for aarch64, the Linux Arm64 archive's programs. Built and checked by continuous integration but not installed: there is no official Arch Linux image for Arm64. `limarepdf` isn't built on Arm |
 
 ## Automated tests
 
@@ -1792,6 +1793,20 @@ The deb and rpm built locally carry both files (under `/usr/share/doc/limarepdf/
 `/usr/share/licenses/limarepdf/`), with no problems; the MSI and the dmg are checked in CI only. `about.rs`'s
 `the_credits_name_every_font_the_interface_loads` failed first, naming Hack, Ubuntu Light and egui's icons.
 
+Arch Linux packages (#216; 2026-11-25). `check-arch.sh` run locally in podman (`archlinux:base-devel`, 2 CPUs,
+7 GB) on 52e141e's source archive and the Linux archives from PR #220's CI (c29881c; the files packed are the same).
+The source run built `limarepdf` 0.14.0 in 21 minutes (cargo-about 2 min 24 s, LimarePDF 16 min 36 s), its `check()`
+rotating the sample. The check run, 1 min 34 s: namcap with no errors (its warnings: the eight libraries loaded at
+run time, and `$CARCH` for the x86_64 in `limarepdf-bin`'s archive name); each of the three packages holding its
+archive's files in their places and nothing else, with no problems from `check-package.py`; `limarepdf-bin`
+0.14.0-0.1 installed, upgraded to 0.14.0-1, replaced by `limarepdf` and removed, the command line and the app's
+window under X11 and Wayland working after each step, nothing left and the user's files unchanged. Copies of
+`limarepdf-bin`'s PKGBUILD each broken once failed the check: `hicolor-icon-theme` left out of its dependencies and
+the guide's licence link pointing nowhere (namcap's errors), the icon not installed ("isn't the archive's"), the
+docs installed 600 ("wrong modes") and a file added ("holds files its archive doesn't"). Found while writing it:
+makepkg's own link-time optimisation fails to link cargo-about (ring's C code), hence `!lto`, and the image's
+`NoExtract` left the docs out of what pacman installed, so the check removes it.
+
 ## Acceptance checks
 
 The automated tests cover the library and the command line. These checks cover what they can't: the desktop app used
@@ -1929,7 +1944,8 @@ down as a limit.
 ## Platform smoke checks
 
 A short pass on each platform after installing a release build. Continuous integration builds and tests every
-platform but never runs the app, so nothing here counts as checked from CI. "Not recorded" means it has likely
+platform but runs the app only in the Arch Linux check, where it opens a document's window in a container, so nothing
+here counts as checked from CI. "Not recorded" means it has likely
 happened in everyday use but no result was written down.
 
 | Check | Linux | Windows | macOS |
