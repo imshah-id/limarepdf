@@ -1377,7 +1377,7 @@ mod tests {
     }
 
     #[test]
-    fn five_thousand_glyphs_take_about_five_times_as_long_as_a_thousand() {
+    fn five_thousand_glyphs_take_about_as_long_as_five_fonts_of_a_thousand() {
         // Each about as much as a Chinese character: twelve contours of lines and curves.
         let glyphs: Vec<Glyph> = (0..5000)
             .map(|i| {
@@ -1411,22 +1411,39 @@ mod tests {
                 }
             })
             .collect();
-        // The machine's speed, and how busy it is, change both counts alike, so the times are
-        // compared rather than held to a limit: work growing with the count takes about five
-        // times as long, work growing with its square 25 times. The quickest of three runs,
-        // taken in turn, so a busy moment doesn't land on one count only.
+        // The machine's speed, and how busy it is, change both alike, so the times are compared
+        // rather than held to a limit: the 5,000 glyphs in one font, and in five fonts of 1,000.
+        // Work growing with the count takes about as long either way, work growing with its
+        // square five times as long. Both take about as long, so a pause while the machine is
+        // busy is as likely to land in either (PB-221: a run of 1,000 alone was short enough to
+        // miss every pause that the 5,000 couldn't). The quickest of six turns each, which goes
+        // first changing every turn, so pauses coming at a steady pace land on both.
+        let in_parts = || {
+            for part in glyphs.chunks(1000) {
+                opentype("Many", part, METRICS);
+            }
+        };
+        let whole = || {
+            opentype("Many", &glyphs, METRICS);
+        };
+        let runs: [&dyn Fn(); 2] = [&in_parts, &whole];
         let mut quickest = [Duration::MAX; 2];
-        for _ in 0..3 {
-            for (q, n) in quickest.iter_mut().zip([1000, 5000]) {
+        for turn in 0..6 {
+            for i in [turn % 2, 1 - turn % 2] {
                 let start = Instant::now();
-                opentype("Many", &glyphs[..n], METRICS);
-                *q = (*q).min(start.elapsed());
+                runs[i]();
+                quickest[i] = quickest[i].min(start.elapsed());
             }
         }
-        let [thousand, all] = quickest;
-        let times = all.as_secs_f64() / thousand.as_secs_f64();
-        println!("1000 glyphs written in {thousand:?}, 5000 in {all:?}: {times:.1} times");
-        assert!(times < 12.0, "1000 glyphs in {thousand:?}, 5000 in {all:?}");
+        let [parts, all] = quickest;
+        let times = all.as_secs_f64() / parts.as_secs_f64();
+        println!(
+            "5000 glyphs written as five fonts in {parts:?}, as one in {all:?}: {times:.2} times"
+        );
+        assert!(
+            times < 2.5,
+            "five fonts of 1000 glyphs in {parts:?}, one of 5000 in {all:?}"
+        );
         let bytes = opentype("Many", &glyphs, METRICS);
         let font = FontRef::new(&bytes).unwrap();
         assert_eq!(font.maxp().unwrap().num_glyphs(), 5001);
