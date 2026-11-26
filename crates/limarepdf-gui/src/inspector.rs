@@ -850,7 +850,7 @@ fn tool_ui(ui: &mut Ui, s: Section, f: &mut Forms, p: &Parts) -> Option<Apply> {
             stamp_change(ui, Stamp::HeaderFooter, press, p.hf_behind)
         }
         Section::Ocr => {
-            note(ui, "Pages without text, Latin script only.");
+            note(ui, "Pages without text. Accented letters come out as ?.");
             range_row(ui, &mut f.ocr);
             let run = egui::Button::new("Recognise");
             ui.add_enabled(!p.busy, run).clicked().then_some(Apply::Ocr)

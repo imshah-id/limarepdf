@@ -196,7 +196,7 @@ enum Cmd {
         jpeg_quality: Option<u8>,
     },
     /// Recognise text on pages that have none (scans) and add it as an invisible,
-    /// searchable layer. Latin script only
+    /// searchable layer. Letters without accents only: an accented letter comes out as ?
     Ocr {
         #[command(flatten)]
         io: Io,

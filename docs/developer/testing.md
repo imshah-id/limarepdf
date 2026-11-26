@@ -1655,10 +1655,17 @@ blocks fewer, the run sharing the machine with the test suite. Its timings aren'
   G4 TIFF.
 - Optimising: `crates/limarepdf-core/tests/scan.rs`, and by hand on ImageMagick-made 300 dpi scans (5.3 MB down to 0.5 MB, a
   1.2° tilt corrected). Resolution in both directions and colour profiles (S1-17) are checked against poppler by
-  opt-in tests (`pdfimages -list`'s pixels per inch; `pdftoppm`'s drawing). The black-and-white or greyscale choice is a heuristic not yet tried on real scanner output.
-- OCR: `crates/limarepdf-core/tests/ocr.rs`, the measurements in
-  [Scans and OCR](../scanning-and-ocr.md#accuracy-and-speed), and one real scan. Correcting recognised text was
-  tested in code.
+  opt-in tests (`pdfimages -list`'s pixels per inch; `pdftoppm`'s drawing). The black-and-white or greyscale
+  choice was tried on real scans for #221: Automatic makes faxes under 150 dpi black and white, which costs OCR a
+  third to a half of the words it read; Greyscale keeps them. At the 200 dpi default, small print loses words too.
+- OCR: `crates/limarepdf-core/tests/ocr.rs`, the unit test in `ocr.rs` (the pieces of a word make one box), and
+  the measurements in [Scans and OCR](../scanning-and-ocr.md#accuracy-and-speed), made with
+  `tools/ocr-accuracy.py` for #221 (2026-11-25): the test sheet in `tools/ocr-sheet/` rendered at 100, 150 and 300
+  dpi and turned 1°, 2.5° and 4°; four Wikisource pages with their proofread text (Buies, 1884, pp. 363, 373 and
+  378; Revue des Deux Mondes, 1849, p. 87); five faxes from FUNSD's test set, scored by words found; and the
+  owner's own office, flatbed and phone scans, scored against Tesseract's reading, then deleted. Tesseract 5.5.4
+  (eng) read the same pages. The sheet hasn't been printed and scanned or photographed yet. Correcting recognised
+  text was tested in code.
 - The GUI's inspector sections for these were not clicked through in testing.
 
 ### Digital signatures
