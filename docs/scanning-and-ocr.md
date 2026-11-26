@@ -12,7 +12,8 @@ the pictures in LimarePDF.
 2. Choose **Make a PDF from images…** on the start screen (or **Insert > From images**, or ☰ > Make a PDF from
    images…) and pick the files. They open as a new document, one page per picture.
 3. Optional: choose **Pages > Optimise**, which opens **Optimise scanned pages** in the inspector, and press
-   **Optimise**, to make the file smaller and straighten tilted pages.
+   **Optimise**, to make the file smaller and straighten tilted pages. Do this for tilted pages: text recognition
+   doesn't straighten them. See [Getting good results](#getting-good-results) for small print and faxes.
 4. Choose **Pages > Recognise text**, which opens **Recognise text (OCR)** in the inspector, and press
    **Recognise**. The pages look the same, but their text can now be searched, selected and copied.
 5. Close the tool with the × at the top of the inspector, and save.
@@ -66,12 +67,17 @@ or all. It runs in the background and can be undone. On the command line: `limar
 OCR adds an invisible text layer to pages without text, so they can be searched, selected and copied. The page
 looks the same.
 
-- **Languages:** Latin script only.
+- **Languages:** English, or any text in letters without accents. The recognition model knows only the letters,
+  digits and punctuation of an English keyboard: an accented letter (é, à, ç, ñ, ü, ß, ł) usually comes out as `?`,
+  as do signs such as £, ° and ©; some come out as a letter like them (ê as e, ñ as n, € as E, ¡ as i). French,
+  Spanish and German pages are still read, but their words with accents can't be found by searching.
 - **How:** LimarePDF's own image processing finds the words, and the recognition model from the
   [ocrs](https://github.com/robertknight/ocrs) project, built into LimarePDF, reads them. A local (Sauvola) threshold decides
   black and white, so shadows and uneven lighting in phone photos are handled.
 - **Text layer:** Helvetica with WinAnsi characters; other characters become `?`.
-- **Not handled:** text in pictures, handwriting, vertical text.
+- **Not handled:** text in pictures, handwriting, vertical text, tilted pages that weren't optimised first.
+- **Reading order:** a table with wide gaps, or a form whose fields are far apart, can come out column by column, so
+  copied text may not keep its rows together. Each word is still where it shows, so searching and selecting work.
 
 Where: **Pages > Recognise text**, which opens the Recognise text (OCR) tool in the inspector, for the selected
 pages or all. It runs in the background and can be undone. On the command line: `limarepdf-cli ocr`.
@@ -83,27 +89,86 @@ line and shows its text on hover. With the arrow tool, select a line and choose 
 its text on the page; it stays invisible and in place, and clearing it removes the line. `limarepdf-cli objects`
 lists these lines as "(hidden)".
 
+### Getting good results
+
+- **Tilted pages:** optimise them first, with Straighten tilted pages on. Recognising text doesn't straighten a
+  page, and a page tilted 2.5° lost about a third of its characters when it wasn't optimised first.
+- **Small print:** scan at 300 dpi, and before optimising, set Optimise's **Image resolution** to 300 dpi
+  (`--max-dpi 300` on the command line). At the 200 dpi default a page of small print lost about one word in seven.
+- **Faxes and other scans under 150 dpi:** in Optimise, set **Store as** to Greyscale (`--mode gray`), or don't
+  optimise them. Made black and white at that resolution, as Automatic does with text, they lost a third to a half
+  of the words read.
+- **Ordinary print:** 150 dpi is enough. A clean page read as well at 100 and 150 dpi as at 300.
+
 ### Accuracy and speed
 
-Measured on test pages made with ImageMagick:
+Two measures are used. Character errors are the share of the true text's characters misread, missed or added:
+lower is better. Words found is the share of the true words read, in any order: higher is better. Tesseract 5.5, a
+widely used open-source OCR program, read the same pages with its English model, for comparison.
 
-| Pages | Character errors |
+**A clean test sheet:** the two-page notice in `tools/ocr-sheet/`, rendered at 300 dpi.
+
+| Page | Character errors | Tesseract |
+| --- | --- | --- |
+| English: a letter with a table, a receipt, an email and a web address | 3.3% | 0.7% |
+| French, Spanish, German, Polish, Czech and Hungarian, and signs such as € and ° | 9.0%, mostly `?` for accented letters | 6.8% |
+
+The English page's errors are small slips: a small letter read as a capital (so as S0, or as Or), spaces added
+inside an email address and lost in "3 x 6 m", and one line read out of place.
+
+**Old French books:** four scanned pages from Wikisource, against their proofread text.
+
+| Pages | Character errors | Tesseract |
+| --- | --- | --- |
+| Three pages of an 1884 book | 5.9–7.2% | 1.3–3.6% |
+| A page of an 1849 magazine | 4.3% | 2.3% |
+
+Most of the errors are accented letters. Optimising first changed them by about a point either way.
+
+**Faxes:** five faxed forms from the FUNSD dataset, greyscale at about 90 dpi, with their fax headers.
+
+| | Words found |
 | --- | --- |
-| Clean 300 dpi text, serif, sans and mono | 0.4–1.7% |
-| Deliberately blurred, noisy and tilted scans | 4–14%, mostly punctuation |
-| Strong shadows | 0–1.2% |
+| Recognised as they are | 52–81% |
+| Optimised first, Automatic | 26–56% |
+| Optimised first, Greyscale | 52–79% |
+| Tesseract | 56–76% |
 
-One real phone scan, a photocopied card with textured bands, has been tried: all its body text and headings were
-read, plus a few short junk lines from the texture, and a two-column table came out column by column.
+**Scanners and phones:** letters, bills and forms scanned by their owner. Their true text isn't known, so they were
+scored against Tesseract's reading: the share of its words LimarePDF found too. That says how closely the two agree,
+not how right either is.
 
-Speed: two Letter pages in 2.2 seconds on a 6-core machine, about 5 seconds of CPU time per page; pages run in
-parallel.
+| Scans | Words found |
+| --- | --- |
+| Office scanners at 150 dpi | 90–98% |
+| Office scanners at 200–300 dpi | 68–86% |
+| A flatbed scanner at 300 dpi | 93–99% |
+| A flatbed scanner, greyscale at 150 dpi | 55% |
+| A phone's scanning app, a plain printed page | 90% |
+| A phone's scanning app, forms on patterned security backgrounds | 27–67% |
+
+Patterned backgrounds read worst. One phone scan of a photocopied card with textured bands was tried earlier: all
+its body text and headings were read, plus a few short junk lines from the texture.
+
+**Tilt:** the English page of the test sheet, turned.
+
+| Tilt | Character errors | Optimised first |
+| --- | --- | --- |
+| 1° | 3.8% | 1.1% |
+| 2.5° | 36.8% | 3.5% |
+| 4° | 47.7% | 3.5% |
+
+On pages made with ImageMagick, an earlier measure found 0.4–1.7% character errors on clean 300 dpi text, 4–14% on
+blurred and noisy pages and 0–1.2% under strong shadows. Real scans read worse than those made-up pages.
+
+Speed: about 1.5–2 seconds a page on a 6-core machine, start-up included, and 3.4 seconds for a large magazine
+page. Pages run in parallel.
 
 ## How this was tested
 
-Importing, optimising and OCR have automated tests, and were tried by hand on made-up scans (CMYK JPEG and 300 dpi
-TIFF among them) and one real scan. The black-and-white or greyscale choice hasn't been tried on real scanner
-output yet, and the app's inspector tools for these weren't clicked through. The full record is in
+Importing, optimising and OCR have automated tests. OCR was measured with `tools/ocr-accuracy.py` on the test
+sheet, public scans with known text (old French books, faxes) and real office, flatbed and phone scans, as above.
+The app's inspector tools for these weren't clicked through. The full record is in
 [Testing](developer/testing.md#scanning-and-ocr).
 
 ## Licence of the OCR model

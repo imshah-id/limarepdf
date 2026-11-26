@@ -14,7 +14,7 @@ it against the rpm's requirement), macOS 11 from both halves of the dmg's (the d
 | Linux Arm64 | Needs glibc 2.39 or later, as Linux x86_64 (built on `ubuntu-24.04-arm`). Provisional. Built and tested by continuous integration on an Arm runner, which also installs the deb and rpm on the same systems as for x86_64. Not run by hand |
 | Windows Arm64 | Windows 11 on Arm. Provisional. Built and tested by continuous integration on an Arm runner (`windows-11-arm`), which also installs, upgrades and uninstalls the MSI, and checks that it replaces an x64 LimarePDF of the same version, and installs and removes it with winget and with Scoop. Not run by hand |
 | macOS (Intel and Apple Silicon) | macOS 11 or later. Provisional. Built and tested by continuous integration. Not run by hand |
-| Arch Linux x86_64 | The AUR's packages: `limarepdf`, built from the source archive, and `limarepdf-bin`, the Linux x86_64 archive's programs (so its glibc floor). Provisional. Both built by continuous integration in a current `archlinux:base-devel` container, checked, and installed, upgraded, replaced and removed there, the command line and the app's window run after each step ([releasing](releasing.md#arch-linux-packages)); not on the AUR yet. LimarePDF is built from source and used by hand on an Arch-based system (CachyOS, glibc 2.44) |
+| Arch Linux x86_64 | The packages written for the AUR: `limarepdf`, built from the source archive, and `limarepdf-bin`, the Linux x86_64 archive's programs (so its glibc floor). Provisional. Both built by continuous integration in a current `archlinux:base-devel` container, checked, and installed, upgraded, replaced and removed there, the command line and the app's window run after each step ([releasing](releasing.md#arch-linux-packages)); not on the AUR, which isn't taking new accounts (#319): the release's `limarepdf` is installed with `pacman -U`. LimarePDF is built from source and used by hand on an Arch-based system (CachyOS, glibc 2.44) |
 | Arch Linux ARM (aarch64) | `limarepdf-bin` for aarch64, the Linux Arm64 archive's programs. Built and checked by continuous integration but not installed: there is no official Arch Linux image for Arm64. `limarepdf` isn't built on Arm |
 
 ## Automated tests
@@ -1655,10 +1655,17 @@ blocks fewer, the run sharing the machine with the test suite. Its timings aren'
   G4 TIFF.
 - Optimising: `crates/limarepdf-core/tests/scan.rs`, and by hand on ImageMagick-made 300 dpi scans (5.3 MB down to 0.5 MB, a
   1.2° tilt corrected). Resolution in both directions and colour profiles (S1-17) are checked against poppler by
-  opt-in tests (`pdfimages -list`'s pixels per inch; `pdftoppm`'s drawing). The black-and-white or greyscale choice is a heuristic not yet tried on real scanner output.
-- OCR: `crates/limarepdf-core/tests/ocr.rs`, the measurements in
-  [Scans and OCR](../scanning-and-ocr.md#accuracy-and-speed), and one real scan. Correcting recognised text was
-  tested in code.
+  opt-in tests (`pdfimages -list`'s pixels per inch; `pdftoppm`'s drawing). The black-and-white or greyscale
+  choice was tried on real scans for #221: Automatic makes faxes under 150 dpi black and white, which costs OCR a
+  third to a half of the words it read; Greyscale keeps them. At the 200 dpi default, small print loses words too.
+- OCR: `crates/limarepdf-core/tests/ocr.rs`, the unit test in `ocr.rs` (the pieces of a word make one box), and
+  the measurements in [Scans and OCR](../scanning-and-ocr.md#accuracy-and-speed), made with
+  `tools/ocr-accuracy.py` for #221 (2026-11-25): the test sheet in `tools/ocr-sheet/` rendered at 100, 150 and 300
+  dpi and turned 1°, 2.5° and 4°; four Wikisource pages with their proofread text (Buies, 1884, pp. 363, 373 and
+  378; Revue des Deux Mondes, 1849, p. 87); five faxes from FUNSD's test set, scored by words found; and the
+  owner's own office, flatbed and phone scans, scored against Tesseract's reading, then deleted. Tesseract 5.5.4
+  (eng) read the same pages. The sheet hasn't been printed and scanned or photographed yet. Correcting recognised
+  text was tested in code.
 - The GUI's inspector sections for these were not clicked through in testing.
 
 ### Digital signatures

@@ -61,22 +61,25 @@ How a release is made, for maintainers.
    new advisory published since the pull request stops the release: fix it (an update, or an `ignore` entry with
    its reason in `deny.toml`, and in `docs/signatures-in-depth.md` for a signing crate, when it doesn't apply), then delete the tag
    (`git push --delete origin vX.Y.Z`, `git tag -d vX.Y.Z`) and tag the fixed `main` again. The job then waits for
-   approval, since the signing key is only in the `release-signing` environment ([Signing key](#signing-key)): on
-   the run's page choose Review deployments, tick `release-signing` and approve. Before signing anything, it checks
-   that the tag matches `Cargo.toml`, takes the release notes from the matching `CHANGELOG.md` section, and ends
-   them with a link comparing the tag with the previous version tag. It then signs and creates a draft GitHub
-   Release with the archives, the source archive, the Linux packages and AppImages, the Arch Linux package (x86_64,
-   built from source), the MSIs and the dmg, `SHA256SUMS`, and a GPG signature (`.asc`) for each, and records a
-   build attestation for every file.
+   approval, since the signing key is only in the `release-signing` environment ([Signing key](#signing-key)).
+   Nothing else links to the approval: open the run itself (the repository's Actions tab, the `ci` run for the tag),
+   where a box says it is waiting for review; choose Review deployments, tick `release-signing`, then Approve and
+   deploy. From a terminal instead, with the run's number:
+
+   ```
+   gh api repos/smaug42/limarepdf/actions/runs/<run>/pending_deployments --jq '.[].environment.id'
+   gh api -X POST repos/smaug42/limarepdf/actions/runs/<run>/pending_deployments -F 'environment_ids[]=<id>' -f state=approved -f comment=X.Y.Z
+   ```
+
+   Before signing anything, the job checks that the tag matches `Cargo.toml`, takes the release notes from the
+   matching `CHANGELOG.md` section, and ends them with a link comparing the tag with the previous version tag. It
+   then signs and creates a draft GitHub Release with the archives, the source archive, the Linux packages and
+   AppImages, the Arch Linux package (x86_64, built from source), the MSIs and the dmg, `SHA256SUMS`, and a GPG
+   signature (`.asc`) for each, and records a build attestation for every file.
 5. On GitHub, open the draft under Releases, choose Edit, check the notes and files, and publish it. Publishing
    starts the `packages` workflow, which updates the apt and dnf repositories ([below](#package-repositories)); its
-   `sign` job waits for approval in the same way.
-6. Update the AUR's packages ([Arch Linux packages](#arch-linux-packages)): on Arch Linux, with the AUR's two
-   repositories cloned in `aur/limarepdf` and `aur/limarepdf-bin`, run `bash packaging/arch/update.sh X.Y.Z aur`.
-   It checks the published `SHA256SUMS` against the release key and writes each package's `PKGBUILD` and
-   `.SRCINFO`. Read the changes (`git -C aur/limarepdf diff`), then in each repository commit both files with the
-   message `X.Y.Z` and push.
-7. Update winget and Scoop ([winget and Scoop](#winget-and-scoop)): with the clones in `win/winget-pkgs` and
+   `sign` job waits for approval in the same way, on the `packages` run the release started.
+6. Update winget and Scoop ([winget and Scoop](#winget-and-scoop)): with the clones in `win/winget-pkgs` and
    `win/scoop-limarepdf`, run `bash packaging/windows/update.sh X.Y.Z win`. It checks the published `SHA256SUMS`
    against the release key, downloads the MSIs to read their codes, and writes winget's three manifests and Scoop's
    `bucket/limarepdf.json`. In the bucket, read the change, commit it with the message `limarepdf: Update to version
@@ -219,9 +222,9 @@ bash packaging/linux/check-appimage.sh dist/LimarePDF-<version>-x86_64.AppImage 
 
 ### Arch Linux packages
 
-`packaging/arch/` holds the PKGBUILDs of the AUR's two packages, each for x86_64 and aarch64: `limarepdf`, built
-from the release's source archive, and `limarepdf-bin`, from its Linux archives. Both install what the release
-archive holds: the programs in `/usr/bin`, the desktop entry and icon, the licences in
+`packaging/arch/` holds the PKGBUILDs of two packages written for the AUR, each for x86_64 and aarch64:
+`limarepdf`, built from the release's source archive, and `limarepdf-bin`, from its Linux archives. Both install
+what the release archive holds: the programs in `/usr/bin`, the desktop entry and icon, the licences in
 `/usr/share/licenses/<package>`, and the rest in `/usr/share/doc/limarepdf`, with links there to the two licences
 the guide links to. `limarepdf` makes that archive with `packaging/package-archive.sh`, as the Linux jobs do, with
 cargo-about built at the version it names. makepkg's own link-time optimisation is off there (`!lto`): it builds C
@@ -257,10 +260,15 @@ podman run --rm -v "$PWD:/w:ro" -v "$PWD/dist:/dist" -w /w docker.io/library/arc
 podman run --rm -v "$PWD:/w:ro" -w /w docker.io/library/archlinux:base-devel bash packaging/arch/check-arch.sh dist
 ```
 
-Set up once: an account on aur.archlinux.org with the maintainer's SSH key, then `git clone
+The packages aren't on the AUR: it isn't taking new accounts for now (found 2026-11-25), so the release's x86_64
+`limarepdf` is how users install them, with `pacman -U` (#319). When it takes new accounts again, set up once: an
+account on aur.archlinux.org with the maintainer's SSH key, then `git clone
 ssh://aur@aur.archlinux.org/limarepdf.git aur/limarepdf`, and the same for `limarepdf-bin`. A name not yet taken
-clones empty, and the first push makes the package. After that first push, remove install.md's "Not on the AUR yet"
-line.
+clones empty, and the first push makes the package. Then, after each release is published, on Arch Linux: `bash
+packaging/arch/update.sh X.Y.Z aur` checks the published `SHA256SUMS` against the release key and writes each
+package's `PKGBUILD` and `.SRCINFO`; read the changes (`git -C aur/limarepdf diff`), then in each repository commit
+both files with the message `X.Y.Z` and push. After the first push, this becomes a release step again, and
+install.md's Arch Linux section names the AUR.
 
 ### winget and Scoop
 
@@ -301,7 +309,7 @@ git -C win/winget-pkgs sparse-checkout set manifests/c/ClaytonCornell
 
 Before each version, bring the fork up to date (`gh repo sync smaug42/winget-pkgs`, then `git -C win/winget-pkgs
 pull`). The first pull request asks for Microsoft's contributor licence agreement to be signed. Once the first
-version is in both, remove install.md's "Not in winget or Scoop yet" line.
+version is in winget (Scoop's bucket has had it since 0.14.1), remove install.md's "Not in winget yet" line.
 
 ### Third-party licences
 

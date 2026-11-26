@@ -12,7 +12,7 @@ Pick your system:
   updated.
 - **macOS:** the [app](#macos-app).
 - **Linux:** the [package repository](#linux-packages), which keeps LimarePDF updated with the rest of your system;
-  on Arch Linux, the [AUR](#arch-linux). On systems they don't cover, the [AppImage](#appimage).
+  on Arch Linux, the release's [package](#arch-linux). On systems they don't cover, the [AppImage](#appimage).
 - **Without installing**, on any of them: an [archive](#archives) you unpack anywhere.
 
 ## Requirements
@@ -58,7 +58,7 @@ Settings > Apps.
 
 ## winget and Scoop
 
-**Not in winget or Scoop yet:** LimarePDF goes there with the next release.
+**Not in winget yet:** LimarePDF goes there once winget's moderators accept it. Scoop has it.
 
 winget, Windows' own package manager, installs the [installer](#windows-installer) (the Arm64 one on Windows on Arm)
 and brings new versions:
@@ -193,43 +193,24 @@ The `.deb` is checked as any download is ([below](#checking-a-download)).
 
 ## Arch Linux
 
-**Not on the AUR yet:** its packages go there with the next release.
+**Not on the AUR:** the Arch User Repository isn't taking new accounts for now, so LimarePDF's packages aren't
+there yet.
 
-On Arch Linux and the systems built from it (EndeavourOS, CachyOS, Manjaro and others), LimarePDF comes from the
-Arch User Repository (AUR), in two packages:
+On Arch Linux and the systems built from it (EndeavourOS, CachyOS, Manjaro and others), on x86_64, install the
+package each release has, `limarepdf-<version>-1-x86_64.pkg.tar.zst`, built from the release's source. It installs
+`limarepdf` and `limarepdf-cli` in `/usr/bin`, the menu entry, the icon, this guide (in `/usr/share/doc/limarepdf`)
+and the licences, with the libraries the app needs.
 
-- `limarepdf-bin`, the programs as released, ready to install;
-- `limarepdf`, built on your computer from the release's source, which takes a while (about 20 minutes on two
-  processor cores, less with more) and a few GB of memory.
-
-Both are for x86_64 and Arm64 (Arch Linux ARM), and install the same: `limarepdf` and `limarepdf-cli` in
-`/usr/bin`, the menu entry, the icon, this guide (in `/usr/share/doc/limarepdf`) and the licences, with the libraries
-the app needs. Installing one replaces the other.
-
-They check the release's signature, so import the project's key first, once, and check its fingerprint as under
-[Checking a download](#checking-a-download):
+It's signed like the other files: check it as under [Checking a download](#checking-a-download), then install it:
 
 ```
-curl -fsSL https://smaug42.github.io/limarepdf/limarepdf-signing-key.asc | gpg --import
+sudo pacman -U limarepdf-<version>-1-x86_64.pkg.tar.zst
 ```
 
-Then install with an AUR helper (`yay -S limarepdf-bin`, `paru -S limarepdf-bin`), or by hand:
+Nothing brings new versions for you: for a new one, download its package and install it the same way, which
+replaces the one before. To remove LimarePDF, `sudo pacman -R limarepdf`; your documents and settings stay.
 
-```
-git clone https://aur.archlinux.org/limarepdf-bin.git
-cd limarepdf-bin
-makepkg -si
-```
-
-The AUR helper's upgrade brings new versions; by hand, run `git pull` in that folder, then `makepkg -si` again.
-
-Each release also has `limarepdf` built for x86_64, `limarepdf-<version>-1-x86_64.pkg.tar.zst`, signed like the
-other files: check it as under [Checking a download](#checking-a-download), then install it with `sudo pacman -U
-limarepdf-<version>-1-x86_64.pkg.tar.zst`. An AUR helper then takes it for the AUR's `limarepdf`, and builds the
-next versions from source; for upgrades ready to install, use `limarepdf-bin`.
-
-To remove LimarePDF, `sudo pacman -R limarepdf-bin` (or `limarepdf`); your documents and settings stay. On Arm64 the
-packages haven't been installed and run yet, and `limarepdf` hasn't been built there.
+On Arm64 (Arch Linux ARM), use the [AppImage](#appimage) or an [archive](#archives).
 
 ## AppImage
 

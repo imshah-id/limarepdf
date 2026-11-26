@@ -68,7 +68,8 @@ jobs:
       # relative links and anchors; the signing secrets only in release-signing jobs that no pull
       # request starts; every ignored test listed once in tools/ignored-tests.toml, with its
       # group. Each tool's self-test first, so a broken tool can't pass. The package check's
-      # self-test is here too; the packages themselves are checked where they're built.
+      # self-test is here too; the packages themselves are checked where they're built. So is the
+      # OCR measure's, which needs scans and a release build to run.
       - name: Repository checks
         run: |
           python3 -I tools/check-scratch.py --self-test
@@ -80,6 +81,7 @@ jobs:
           python3 -I tools/check-ignored-tests.py --self-test
           python3 -I tools/check-ignored-tests.py
           python3 -I packaging/check-package.py --self-test
+          python3 -I tools/ocr-accuracy.py --self-test
       - name: Formatting
         run: cargo fmt --all --check
       # Each platform in turn, all of them reported even when one fails.

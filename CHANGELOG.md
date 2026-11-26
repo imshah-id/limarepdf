@@ -1,5 +1,22 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed
+
+- LimarePDF isn't on the AUR, though 0.14.1's notes said it was: the AUR isn't taking new accounts for now. On Arch
+  Linux, x86_64, install the release's `limarepdf-<version>-1-x86_64.pkg.tar.zst` with `sudo pacman -U`
+  ([Install](docs/install.md#arch-linux)).
+- Recognised text no longer splits lines of old print and of large scans into pieces: a letter broken in two, or a
+  word whose letters barely touch, made part of a line read as a line of its own. On pages of old French books,
+  the character errors fell from 12–26% to 4–7%.
+
+### Changed
+
+- The guide says what text recognition reads today: letters without accents, so an accented letter comes out as
+  `?`. Its accuracy is measured on real scans: office, flatbed and phone scans, faxes and old French books, with
+  advice for tilted pages, small print and faxes ([Scans and OCR](docs/scanning-and-ocr.md#getting-good-results)).
+
 ## [0.14.1] - 2026-11-25
 
 ### Added

@@ -64,7 +64,8 @@ impl OcrLine {
 static MODEL: &[u8] = include_bytes!("../models/text-recognition.rten");
 
 impl Ocr {
-    /// The recogniser with the model built into LimarePDF (Latin script).
+    /// The recogniser with the model built into LimarePDF (ASCII letters, digits and
+    /// punctuation: it writes `?` for an accented letter).
     pub fn bundled() -> Result<Self> {
         let model = rten::Model::load_static_slice(MODEL)
             .map_err(|e| anyhow!("cannot load the OCR model: {e}"))?;
@@ -440,12 +441,22 @@ fn find_words(g: &GrayImage) -> Vec<[f32; 4]> {
     // Join boxes of about the same height that touch or overlap on the same row (widely
     // spaced letters, as in logos). Measuring the overlap against the taller box keeps a
     // group spanning several lines (blurred letters that touch) from swallowing words.
+    // Pieces of one word are joined too: a broken letter, the loose loop of a g, or
+    // letters whose facing sides share no row, so their gap was not filled. Their boxes
+    // overlap, or would with the margin added below, and line grouping cannot chain
+    // overlapping boxes: it reads one of them as a line of its own. Joined, they must
+    // still fit in one line.
     words.sort_unstable_by_key(|c| c.x0);
     let mut joined: Vec<Comp> = Vec::with_capacity(words.len());
     for c in words {
         let near = joined.iter_mut().rev().find(|j| {
             let overlap_y = j.y1.min(c.y1).saturating_sub(j.y0.max(c.y0)) as f32;
-            c.x0 as f32 <= j.x1 as f32 + 0.1 * th && overlap_y >= 0.6 * c.h().max(j.h()) as f32
+            let spaced =
+                c.x0 as f32 <= j.x1 as f32 + 0.1 * th && overlap_y >= 0.6 * c.h().max(j.h()) as f32;
+            let pieces = (c.x0 as f32) < j.x1 as f32 + 0.3 * th
+                && overlap_y >= 0.5 * c.h().min(j.h()) as f32
+                && (j.y1.max(c.y1) - j.y0.min(c.y0)) as f32 <= 3.0 * th;
+            spaced || pieces
         });
         match near {
             Some(j) => {
@@ -503,4 +514,49 @@ fn find_words(g: &GrayImage) -> Vec<[f32; 4]> {
             ]
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The pieces of one word make one box, and its neighbours keep theirs: line grouping
+    /// reads one of two overlapping boxes as a line of its own, which split lines of old
+    /// print and of large scans.
+    #[test]
+    fn pieces_of_a_word_make_one_box() {
+        let mut img = GrayImage::from_pixel(400, 200, image::Luma([255]));
+        let mut ink = |x0: u32, y0: u32, x1: u32, y1: u32| {
+            for y in y0..y1 {
+                for x in x0..x1 {
+                    img.put_pixel(x, y, image::Luma([0]));
+                }
+            }
+        };
+        // Three lines of four-letter words; letters 12 by 20 pixels, 4 apart.
+        for top in [40, 90, 140] {
+            for start in [20, 100, 200, 280] {
+                for x in (start..start + 64).step_by(16) {
+                    // These two are drawn below.
+                    if (top, x) != (90, 100) && (top, x) != (140, 148) {
+                        ink(x, top, x + 12, top + 20);
+                    }
+                }
+            }
+        }
+        // A letter whose lower part broke off and sits low, starting left of the word.
+        ink(100, 90, 112, 99);
+        ink(97, 101, 107, 115);
+        // Facing sides that share no row: the gap between them is not filled.
+        ink(148, 140, 160, 150);
+        ink(163, 151, 175, 166);
+        let boxes = find_words(&img);
+        assert_eq!(boxes.len(), 12, "{boxes:?}");
+        for (i, a) in boxes.iter().enumerate() {
+            for b in &boxes[i + 1..] {
+                let apart = a[2] <= b[0] || b[2] <= a[0] || a[3] <= b[1] || b[3] <= a[1];
+                assert!(apart, "{a:?} overlaps {b:?}");
+            }
+        }
+    }
 }
