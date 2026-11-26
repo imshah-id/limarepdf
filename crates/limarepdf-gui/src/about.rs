@@ -251,7 +251,7 @@ fn credits(ui: &mut Ui) {
             row(
                 ui,
                 "Text recognition model:",
-                "ocrs by Robert Knight, CC BY-SA 4.0, included unmodified",
+                "PaddleOCR's PP-OCRv6 small by PaddlePaddle, Apache-2.0, included unmodified",
             );
             row(ui, "Fonts:", FONTS);
             row(ui, "Icons:", ICONS);

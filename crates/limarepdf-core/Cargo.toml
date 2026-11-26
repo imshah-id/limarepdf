@@ -64,9 +64,12 @@ spellbook = "0.4.2"
 # Dictionaries added from LibreOffice's dictionary extensions (an .oxt is a zip file), read
 # only, unpacked through the zlib-rs backend flate2 uses above.
 zip = { version = "9.3", default-features = false, features = ["deflate-flate2-zlib-rs"] }
-ocrs = { version = "0.14", default-features = false, features = ["rten"] }
-rten = { version = "0.28", default-features = false, features = ["rten_format"] }
+# OCR (ocr.rs): ocrs groups the words found into lines; rten runs the recognition model, an ONNX
+# file (models/README.md).
+ocrs = { version = "0.14", default-features = false }
+rten = { version = "0.28", default-features = false, features = ["onnx_format"] }
 rten-imageproc = "0.28"
+rten-tensor = "0.28"
 
 # Digital signatures (docs/developer/architecture.md lists these crates and their release status).
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }

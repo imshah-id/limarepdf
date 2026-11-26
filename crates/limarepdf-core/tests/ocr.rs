@@ -1,7 +1,13 @@
-//! OCR text layers, with the bundled recognition model.
+//! OCR text layers, with the bundled recognition model. Opt-in, Poppler reads the layer as
+//! LimarePDF does: `cargo test -p limarepdf-core --test ocr -- --ignored cross_check`.
 
+mod common;
+
+use common::saved::tools;
 use image::{DynamicImage, GrayImage, Luma};
-use limarepdf_core::{render, ImageImport, ObjectKind, Ocr, OcrResult, PageObject, Pdf, TextEdit};
+use limarepdf_core::{
+    render, FontChoice, ImageImport, ObjectKind, Ocr, OcrResult, PageObject, Pdf, TextEdit,
+};
 use lopdf::{dictionary, Dictionary, Stream};
 use std::io::Cursor;
 
@@ -37,6 +43,48 @@ fn text_image() -> GrayImage {
         dictionary! { "Font" => dictionary! { "F1" => font } },
     );
     gray(&mut p, 300.0 / 72.0)
+}
+
+/// Lines in languages written with accented letters: French, Spanish, German, Polish, Czech
+/// and Hungarian.
+const ACCENTED: [&str; 6] = [
+    "Le café ouvre à huit heures, près de la gare.",
+    "El niño comió una manzana en el jardín.",
+    "Die Brücke über den Fluss ist gesperrt, sagt Jörg.",
+    "Łódź leży w środkowej Polsce, nad rzeką.",
+    "Příliš žluťoučký kůň úpěl ďábelské ódy.",
+    "Árvíztűrő tükörfúrógép és gyöngyös ősz.",
+];
+
+/// A 6 x 3 inch page of ACCENTED in a font LimarePDF embeds, as a greyscale image at 300 dpi.
+fn accented_image() -> GrayImage {
+    let mut p = Pdf::new();
+    p.insert_blank(0, 432.0, 216.0).unwrap();
+    for (i, l) in ACCENTED.iter().enumerate() {
+        let y = 40.0 + 26.0 * i as f32;
+        p.add_text(0, (16.0, y), l, FontChoice::default(), 12.0, [0.0; 3])
+            .unwrap();
+    }
+    gray(&mut p, 300.0 / 72.0)
+}
+
+/// The words of `text` with a letter outside ASCII, end punctuation stripped.
+fn accented_words(text: &str) -> Vec<String> {
+    let strip = |w: &str| w.trim_matches(|c: char| ".,;:".contains(c)).to_string();
+    (text.split_whitespace())
+        .filter(|w| !w.is_ascii())
+        .map(strip)
+        .collect()
+}
+
+/// Whether `text` has four in five of ACCENTED's words with a letter outside ASCII. The
+/// bundled model reads 22 of the 24: the font draws the carons of Czech ť and ď like
+/// apostrophes, and they are read as t and d'.
+fn reads_accented(text: &str) -> bool {
+    let got = accented_words(text);
+    let want = accented_words(&ACCENTED.join("\n"));
+    let hits = want.iter().filter(|w| got.contains(w)).count();
+    hits * 5 >= want.len() * 4
 }
 
 fn gray(p: &mut Pdf, scale: f32) -> GrayImage {
@@ -91,6 +139,59 @@ fn adds_an_invisible_searchable_layer() {
     // Survives a save and reload.
     let again = Pdf::from_bytes(&p.to_bytes().unwrap(), None).unwrap();
     assert!(recall(&again.page_text(0)) > 0.9);
+}
+
+#[test]
+fn reads_accented_letters() {
+    let ocr = Ocr::bundled().unwrap();
+    let img = accented_image();
+    let lines = ocr.read(img.as_raw(), img.width(), img.height()).unwrap();
+    let read: Vec<String> = lines.iter().map(|l| l.text()).collect();
+    assert_eq!(read.len(), 6, "{read:#?}");
+    assert!(reads_accented(&read.join("\n")), "{read:#?}");
+}
+
+/// The accented letters read reach the text layer, those beyond Western European too: it
+/// was written in WinAnsi, which has no Ł, ő or ř.
+#[test]
+fn accented_letters_reach_the_text_layer() {
+    let ocr = Ocr::bundled().unwrap();
+    let mut p = scanned(accented_image());
+    p.ocr_pages(&[0], &ocr).unwrap();
+    let text = p.page_text(0);
+    assert!(reads_accented(&text), "{text}");
+    for c in ['Ł', 'ő', 'ř'] {
+        assert!(text.contains(c), "{c}: {text}");
+    }
+    let again = Pdf::from_bytes(&p.to_bytes().unwrap(), None).unwrap();
+    assert_eq!(again.page_text(0), text);
+}
+
+/// Poppler reads the accented page's text layer as LimarePDF does.
+/// `cargo test -p limarepdf-core --test ocr -- --ignored cross_check`.
+#[test]
+#[ignore]
+fn cross_check_accented_text_layer_with_poppler() {
+    let ocr = Ocr::bundled().unwrap();
+    let mut p = scanned(accented_image());
+    p.ocr_pages(&[0], &ocr).unwrap();
+    let ours: Vec<String> = p.page_text(0).split_whitespace().map(Into::into).collect();
+    let poppler = tools::pdftotext(&p.to_bytes().unwrap());
+    let theirs: Vec<&str> = poppler.split_whitespace().collect();
+    assert_eq!(theirs, ours, "{poppler}");
+    assert!(poppler.contains('Ł') && poppler.contains('ő'), "{poppler}");
+}
+
+#[test]
+fn a_page_asked_twice_is_read_once() {
+    let ocr = Ocr::bundled().unwrap();
+    let mut p = scanned(text_image());
+    let r = p.ocr_pages(&[0, 0], &ocr).unwrap();
+    assert!(
+        matches!(r[..], [(0, OcrResult::Added { lines: 6, .. })]),
+        "{r:?}"
+    );
+    assert_eq!(hidden_lines(&p).len(), 6);
 }
 
 /// The OCR (hidden) text lines of page 1, top to bottom.
@@ -206,9 +307,10 @@ fn correcting_recognised_text_keeps_it_invisible_and_in_place() {
         .into_iter()
         .find(|o| o.text.as_deref().unwrap_or("").contains("Tuesday"))
         .expect("no line with Tuesday");
-    // Non-ASCII text would take the "append new visible text" path for normal text.
+    // Non-ASCII text would take the "append new visible text" path for normal text; Ł
+    // is beyond Western European.
     let edit = TextEdit {
-        text: "The committee met on Wednesday morning, café.".into(),
+        text: "The committee met on Wednesday morning, café, Łódź.".into(),
         font: None,
         size: None,
         color: None,
@@ -218,6 +320,7 @@ fn correcting_recognised_text_keeps_it_invisible_and_in_place() {
     let after = gray(&mut p, 1.0);
     assert_eq!(before.as_raw(), after.as_raw(), "text became visible");
     assert!(p.page_text(0).contains("Wednesday"));
+    assert!(p.page_text(0).contains("café, Łódź."));
     let lines = hidden_lines(&p);
     assert_eq!(lines.len(), 6);
     let w = p.find_text_boxes(0, "wednesday").unwrap();
