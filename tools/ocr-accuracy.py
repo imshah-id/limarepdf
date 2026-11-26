@@ -11,6 +11,7 @@ A manifest (TOML) lists the cases, with paths relative to it:
     truth = ["page-1.txt", "page-2.txt"]   # the true text of each page in `pages`
     pages = [1, 2]                         # optional: 1, 2, ... one per truth file
     words_only = false                     # optional: truth in no known order, words found only
+    lang = "deu"                           # optional: Tesseract's language, eng by default
 
 tools/ocr-sheet/ holds a two-page test sheet with the true text of each page (page-1.txt, page-2.txt):
 print sheet.pdf, scan or photograph it, and list the scans with that truth. sheet.pdf is made from
@@ -27,9 +28,14 @@ Scores, per page:
             the letters the model can't write (signs with no ASCII form still count)
   words     the share of the true words found, in any order, ignoring case; (f) folded
   s/page    the OCR command's time over its pages, start-up included
-With --tesseract, Tesseract (eng) reads the same pages rendered as the OCR renders them.
+With --tesseract, Tesseract reads the same pages rendered as the OCR renders them, in the case's
+language, its models from --tessdata DIR if given. A page whose pictures are marked at a lower
+resolution than they have (phone scans often say 72 dpi) is rendered larger than its pixels, which
+hurts Tesseract more than LimarePDF; the measure notes it, and `images --dpi` with the true
+resolution makes a fairer reference.
 
-    python3 -I tools/ocr-accuracy.py MANIFEST --work DIR [--cli PATH] [--tesseract] [--json OUT]
+    python3 -I tools/ocr-accuracy.py MANIFEST --work DIR [--cli PATH] [--tesseract] [--tessdata DIR]
+                                     [--json OUT]
     python3 -I tools/ocr-accuracy.py --self-test
 """
 import argparse
@@ -65,6 +71,7 @@ class Case:
     pages: list
     truth: list
     words_only: bool = False
+    lang: str = "eng"
 
 
 def levenshtein(a, b):
@@ -121,14 +128,17 @@ def parse_cases(data, base):
     cases = []
     for c in data.get("case", []):
         name = c.get("name", "?")
-        unknown = set(c) - {"name", "input", "truth", "pages", "words_only"}
+        unknown = set(c) - {"name", "input", "truth", "pages", "words_only", "lang"}
         if unknown:
             raise ValueError(f"{name}: unknown keys {sorted(unknown)}")
         truth = [base / t for t in c["truth"]]
         pages = c.get("pages", list(range(1, len(truth) + 1)))
         if len(pages) != len(truth):
             raise ValueError(f"{name}: {len(pages)} pages but {len(truth)} truth files")
-        cases.append(Case(name, base / c["input"], pages, truth, c.get("words_only", False)))
+        lang = c.get("lang", "eng")
+        if not re.fullmatch(r"[a-z_]+(\+[a-z_]+)*", lang):
+            raise ValueError(f"{name}: lang {lang!r} isn't a Tesseract language like deu or fra+eng")
+        cases.append(Case(name, base / c["input"], pages, truth, c.get("words_only", False), lang))
     if not cases:
         raise ValueError("no [[case]] in the manifest")
     return cases
@@ -151,6 +161,31 @@ def page_size(pdf, page):
     return float(m.group(1)), float(m.group(2))
 
 
+def render_dpi(w, h):
+    """The dpi the OCR renders a `w` × `h` pt page at."""
+    return min(OCR_DPI, MAX_SIDE * 72 / max(w, h))
+
+
+def picture_ppi(pdf, page):
+    """The resolution the page's largest picture is marked at; None if it has none."""
+    pictures = [ln.split() for ln in run("pdfimages", "-f", page, "-l", page, "-list", pdf).splitlines()[2:]]
+    pictures = [p for p in pictures if len(p) > 13 and p[2] == "image"]
+    if not pictures:
+        return None
+    return float(max(pictures, key=lambda p: int(p[3]) * int(p[4]))[12])
+
+
+def upscale_note(page, ppi, w, h):
+    """A note when the page's pictures are rendered over 1.5 times larger than their pixels."""
+    k = render_dpi(w, h) / ppi if ppi else 0
+    if k <= 1.5:
+        return None
+    return (
+        f"page {page}: pictures marked {ppi:.0f} dpi, so read at {k:.1f} times their pixels, which"
+        " hurts Tesseract; `images --dpi` at their true resolution makes a fairer reference"
+    )
+
+
 def rebuild(cli, pdf, d, notes):
     """`pdf` without its text: its pictures saved and made into pages again, at their own dpi."""
     pictures = [ln.split() for ln in run("pdfimages", "-list", pdf).splitlines()[2:]]
@@ -170,12 +205,12 @@ def rebuild(cli, pdf, d, notes):
     return out
 
 
-def tesseract_read(pdf, page, d):
-    w, h = page_size(pdf, page)
-    dpi = min(OCR_DPI, MAX_SIDE * 72 / max(w, h))
+def tesseract_read(pdf, page, d, lang, tessdata):
+    dpi = render_dpi(*page_size(pdf, page))
     png = d / f"tesseract-page-{page}"
     run("pdftoppm", "-r", f"{dpi:.2f}", "-f", page, "-l", page, "-gray", "-png", "-singlefile", pdf, png)
-    return run("tesseract", png.with_suffix(".png"), "-", "-l", "eng")
+    models = ["--tessdata-dir", tessdata] if tessdata else []
+    return run("tesseract", png.with_suffix(".png"), "-", *models, "-l", lang)
 
 
 def score(case, label, read, secs):
@@ -198,7 +233,7 @@ def score(case, label, read, secs):
     return rows
 
 
-def measure(case, cli, work, tesseract):
+def measure(case, cli, work, tesseract, tessdata):
     """The case's score rows and notes; its outputs and read text left in a folder of `work`."""
     d = work / (re.sub(r"\W+", "-", case.name.lower()).strip("-") or "case")
     shutil.rmtree(d, ignore_errors=True)
@@ -212,6 +247,10 @@ def measure(case, cli, work, tesseract):
         notes.append("already carries text, which the OCR skips: that text scored, then rebuilt")
         rows += score(case, "own text", own, None)
         pdf = rebuild(cli, pdf, d, notes)
+    for p in case.pages:
+        note = upscale_note(p, picture_ppi(pdf, p), *page_size(pdf, p))
+        if note:
+            notes.append(note)
     pages = ",".join(map(str, case.pages))
     run(cli, "optimize-scans", "-o", d / "optimized.pdf", pdf, "--pages", pages)
     for label, src in (("as is", pdf), ("optimized", d / "optimized.pdf")):
@@ -226,7 +265,7 @@ def measure(case, cli, work, tesseract):
         rows += score(case, label, read, secs)
     if tesseract:
         start = time.perf_counter()
-        read = [tesseract_read(pdf, p, d) for p in case.pages]
+        read = [tesseract_read(pdf, p, d, case.lang, tessdata) for p in case.pages]
         rows += score(case, "Tesseract", read, (time.perf_counter() - start) / len(case.pages))
     return rows, notes
 
@@ -277,11 +316,23 @@ def self_test():
     )
     check("words found", words_found("the cat the dog", "The dog, cat!"), 0.75)
     check("cer", cer("abcd", "abed"), 0.25)
+    check("render dpi, letter", render_dpi(612, 792), 300)
+    check("render dpi, a 29 x 37 in phone scan", round(render_dpi(29 * 72, 37 * 72), 1), 189.2)
+    check("no note at the pictures' own size", upscale_note(1, 300, 612, 792), None)
+    check("no note without pictures", upscale_note(1, None, 612, 792), None)
+    check("note when upscaled", "2.6 times" in (upscale_note(2, 72, 29 * 72, 37 * 72) or ""), True)
     toml = '[[case]]\nname = "a"\ninput = "x.pdf"\ntruth = ["1.txt", "2.txt"]\n'
     cases = parse_cases(tomllib.loads(toml), pathlib.Path("/m"))
     check("default pages", cases[0].pages, [1, 2])
+    check("default lang", cases[0].lang, "eng")
+    check("lang", parse_cases(tomllib.loads(toml + 'lang = "fra+eng"\n'), pathlib.Path("/m"))[0].lang, "fra+eng")
     check("relative paths", (cases[0].input, cases[0].truth[1]), (pathlib.Path("/m/x.pdf"), pathlib.Path("/m/2.txt")))
-    for bad, why in ((toml + "pages = [2]\n", "1 pages but 2"), (toml + "dpi = 3\n", "unknown keys"), ("", "no [[case]]")):
+    for bad, why in (
+        (toml + "pages = [2]\n", "1 pages but 2"),
+        (toml + "dpi = 3\n", "unknown keys"),
+        (toml + 'lang = "-l x"\n', "isn't a Tesseract language"),
+        ("", "no [[case]]"),
+    ):
         try:
             parse_cases(tomllib.loads(bad), pathlib.Path("/m"))
             check(f"refuses {why}", "accepted", why)
@@ -301,13 +352,15 @@ if __name__ == "__main__":
     ap.add_argument("--work", type=pathlib.Path, required=True, help="where outputs and read text go")
     ap.add_argument("--cli", type=pathlib.Path, default=CLI)
     ap.add_argument("--tesseract", action="store_true")
+    ap.add_argument("--tessdata", type=pathlib.Path, help="Tesseract's models (*.traineddata), if not its own")
     ap.add_argument("--json", type=pathlib.Path, help="the scores and notes as JSON")
     args = ap.parse_args()
     manifest = args.manifest.resolve()
+    tessdata = args.tessdata and args.tessdata.resolve()
     results, failed = [], 0
     for case in parse_cases(tomllib.loads(manifest.read_text(encoding="utf-8")), manifest.parent):
         try:
-            rows, notes = measure(case, args.cli, args.work.resolve(), args.tesseract)
+            rows, notes = measure(case, args.cli, args.work.resolve(), args.tesseract, tessdata)
         except (RuntimeError, OSError) as e:
             rows, notes, failed = [], [f"failed: {e}"], failed + 1
         results.append({"case": case.name, "rows": rows, "notes": notes})
