@@ -1,0 +1,154 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- The OCR test sheet: two Letter pages whose text is page-1.txt and page-2.txt. sheet.pdf is made
+     from it with LibreOffice (testing.md, "Scanning and OCR"). -->
+<office:document xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0"
+  xmlns:style="urn:oasis:names:tc:opendocument:xmlns:style:1.0"
+  xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0"
+  xmlns:table="urn:oasis:names:tc:opendocument:xmlns:table:1.0"
+  xmlns:fo="urn:oasis:names:tc:opendocument:xmlns:xsl-fo-compatible:1.0"
+  xmlns:svg="urn:oasis:names:tc:opendocument:xmlns:svg-compatible:1.0"
+  office:version="1.3" office:mimetype="application/vnd.oasis.opendocument.text">
+  <office:font-face-decls>
+    <style:font-face style:name="Liberation Serif" svg:font-family="'Liberation Serif'" style:font-family-generic="roman"/>
+    <style:font-face style:name="Liberation Sans" svg:font-family="'Liberation Sans'" style:font-family-generic="swiss"/>
+    <style:font-face style:name="Liberation Mono" svg:font-family="'Liberation Mono'" style:font-family-generic="modern" style:font-pitch="fixed"/>
+  </office:font-face-decls>
+  <office:styles>
+    <style:default-style style:family="paragraph">
+      <style:text-properties style:font-name="Liberation Serif" fo:font-size="11pt" fo:language="en" fo:country="CA" fo:hyphenate="false"/>
+    </style:default-style>
+    <style:style style:name="Standard" style:family="paragraph">
+      <style:paragraph-properties fo:margin-top="0in" fo:margin-bottom="0.08in" fo:line-height="115%"/>
+    </style:style>
+    <style:style style:name="Title" style:family="paragraph" style:parent-style-name="Standard">
+      <style:paragraph-properties fo:margin-bottom="0.04in"/>
+      <style:text-properties style:font-name="Liberation Sans" fo:font-size="18pt" fo:font-weight="bold"/>
+    </style:style>
+    <style:style style:name="Subtitle" style:family="paragraph" style:parent-style-name="Standard">
+      <style:paragraph-properties fo:margin-bottom="0.2in"/>
+      <style:text-properties style:font-name="Liberation Sans" fo:font-size="11pt"/>
+    </style:style>
+    <style:style style:name="PageTitle" style:family="paragraph" style:parent-style-name="Standard">
+      <style:paragraph-properties fo:break-before="page" fo:margin-bottom="0.12in"/>
+      <style:text-properties style:font-name="Liberation Sans" fo:font-size="16pt" fo:font-weight="bold"/>
+    </style:style>
+    <style:style style:name="Subhead" style:family="paragraph" style:parent-style-name="Standard">
+      <style:paragraph-properties fo:margin-top="0.12in" fo:margin-bottom="0.04in"/>
+      <style:text-properties style:font-name="Liberation Sans" fo:font-size="11pt" fo:font-weight="bold"/>
+    </style:style>
+    <style:style style:name="Sans" style:family="paragraph" style:parent-style-name="Standard">
+      <style:text-properties style:font-name="Liberation Sans" fo:font-size="10pt"/>
+    </style:style>
+    <style:style style:name="Mono" style:family="paragraph" style:parent-style-name="Standard">
+      <style:paragraph-properties fo:margin-bottom="0.02in" fo:line-height="100%"/>
+      <style:text-properties style:font-name="Liberation Mono" fo:font-size="9pt"/>
+    </style:style>
+    <style:style style:name="Small" style:family="paragraph" style:parent-style-name="Standard">
+      <style:paragraph-properties fo:margin-top="0.12in" fo:margin-bottom="0.16in"/>
+      <style:text-properties fo:font-size="8pt"/>
+    </style:style>
+    <style:style style:name="TableHead" style:family="paragraph" style:parent-style-name="Standard">
+      <style:paragraph-properties fo:margin-bottom="0in"/>
+      <style:text-properties style:font-name="Liberation Sans" fo:font-size="10pt" fo:font-weight="bold"/>
+    </style:style>
+    <style:style style:name="TableCell" style:family="paragraph" style:parent-style-name="Standard">
+      <style:paragraph-properties fo:margin-bottom="0in"/>
+      <style:text-properties style:font-name="Liberation Sans" fo:font-size="10pt"/>
+    </style:style>
+  </office:styles>
+  <office:automatic-styles>
+    <style:page-layout style:name="Letter">
+      <style:page-layout-properties fo:page-width="8.5in" fo:page-height="11in" fo:margin-top="0.8in" fo:margin-bottom="0.8in" fo:margin-left="0.9in" fo:margin-right="0.9in"/>
+    </style:page-layout>
+    <style:style style:name="Plots" style:family="table">
+      <style:table-properties style:width="6.1in" table:align="left" fo:margin-top="0.06in" fo:margin-bottom="0.14in"/>
+    </style:style>
+    <style:style style:name="Plots.A" style:family="table-column">
+      <style:table-column-properties style:column-width="0.8in"/>
+    </style:style>
+    <style:style style:name="Plots.B" style:family="table-column">
+      <style:table-column-properties style:column-width="2.2in"/>
+    </style:style>
+    <style:style style:name="Plots.C" style:family="table-column">
+      <style:table-column-properties style:column-width="1.1in"/>
+    </style:style>
+    <style:style style:name="Plots.D" style:family="table-column">
+      <style:table-column-properties style:column-width="1in"/>
+    </style:style>
+    <style:style style:name="Plots.Cell" style:family="table-cell">
+      <style:table-cell-properties fo:padding="0.04in" fo:border="0.5pt solid #000000"/>
+    </style:style>
+  </office:automatic-styles>
+  <office:master-styles>
+    <style:master-page style:name="Standard" style:page-layout-name="Letter"/>
+  </office:master-styles>
+  <office:body>
+    <office:text>
+      <text:p text:style-name="Title">Harbour Street Community Garden</text:p>
+      <text:p text:style-name="Subtitle">Notice to plot holders, 14 March 2026</text:p>
+      <text:p text:style-name="Standard">Dear members,</text:p>
+      <text:p text:style-name="Standard">The garden opens for the season on Saturday, April 4, at 9:00 a.m. Keys can be collected from the tool shed between 9 and noon; please bring the receipt for your 2026 fee. Plots that are not claimed by April 25 will be offered to the 31 households on the waiting list, so let us know early if you need more time.</text:p>
+      <text:p text:style-name="Standard">Water is available from the two taps near the north fence. To keep our bill below last year's ($612.40), we ask everyone to water before 8 a.m. or after 7 p.m., to use a can rather than a hose where possible, and to report leaks at once. The rain barrels hold about 900 litres in total and fill quickly in a wet spring.</text:p>
+      <text:p text:style-name="Standard">Our first work party is on Sunday, April 12. We will turn the compost, repair the raised beds along the path and spread 6 cubic metres of wood chips. Gloves, rakes and wheelbarrows are provided. Children are welcome, but must stay with an adult near the pond.</text:p>
+      <text:p text:style-name="Sans">Questions? Write to the committee at plots@harbourstreet.example.org, call 613-555-0147 (evenings only), or visit https://harbourstreet.example.org/news for updates. Minutes of the February 19 meeting are posted on the board by the gate.</text:p>
+      <table:table table:name="Plots" table:style-name="Plots">
+        <table:table-column table:style-name="Plots.A"/>
+        <table:table-column table:style-name="Plots.B"/>
+        <table:table-column table:style-name="Plots.C"/>
+        <table:table-column table:style-name="Plots.D" table:number-columns-repeated="2"/>
+        <table:table-row>
+          <table:table-cell table:style-name="Plots.Cell" office:value-type="string"><text:p text:style-name="TableHead">Plot</text:p></table:table-cell>
+          <table:table-cell table:style-name="Plots.Cell" office:value-type="string"><text:p text:style-name="TableHead">Holder</text:p></table:table-cell>
+          <table:table-cell table:style-name="Plots.Cell" office:value-type="string"><text:p text:style-name="TableHead">Size</text:p></table:table-cell>
+          <table:table-cell table:style-name="Plots.Cell" office:value-type="string"><text:p text:style-name="TableHead">Fee</text:p></table:table-cell>
+          <table:table-cell table:style-name="Plots.Cell" office:value-type="string"><text:p text:style-name="TableHead">Paid</text:p></table:table-cell>
+        </table:table-row>
+        <table:table-row>
+          <table:table-cell table:style-name="Plots.Cell" office:value-type="string"><text:p text:style-name="TableCell">A-12</text:p></table:table-cell>
+          <table:table-cell table:style-name="Plots.Cell" office:value-type="string"><text:p text:style-name="TableCell">J. Okafor</text:p></table:table-cell>
+          <table:table-cell table:style-name="Plots.Cell" office:value-type="string"><text:p text:style-name="TableCell">3 x 6 m</text:p></table:table-cell>
+          <table:table-cell table:style-name="Plots.Cell" office:value-type="string"><text:p text:style-name="TableCell">$45.00</text:p></table:table-cell>
+          <table:table-cell table:style-name="Plots.Cell" office:value-type="string"><text:p text:style-name="TableCell">Feb 11</text:p></table:table-cell>
+        </table:table-row>
+        <table:table-row>
+          <table:table-cell table:style-name="Plots.Cell" office:value-type="string"><text:p text:style-name="TableCell">B-07</text:p></table:table-cell>
+          <table:table-cell table:style-name="Plots.Cell" office:value-type="string"><text:p text:style-name="TableCell">M. Lindqvist</text:p></table:table-cell>
+          <table:table-cell table:style-name="Plots.Cell" office:value-type="string"><text:p text:style-name="TableCell">3 x 3 m</text:p></table:table-cell>
+          <table:table-cell table:style-name="Plots.Cell" office:value-type="string"><text:p text:style-name="TableCell">$25.00</text:p></table:table-cell>
+          <table:table-cell table:style-name="Plots.Cell" office:value-type="string"><text:p text:style-name="TableCell">Mar 2</text:p></table:table-cell>
+        </table:table-row>
+        <table:table-row>
+          <table:table-cell table:style-name="Plots.Cell" office:value-type="string"><text:p text:style-name="TableCell">C-03</text:p></table:table-cell>
+          <table:table-cell table:style-name="Plots.Cell" office:value-type="string"><text:p text:style-name="TableCell">R. Thibodeau</text:p></table:table-cell>
+          <table:table-cell table:style-name="Plots.Cell" office:value-type="string"><text:p text:style-name="TableCell">4 x 6 m</text:p></table:table-cell>
+          <table:table-cell table:style-name="Plots.Cell" office:value-type="string"><text:p text:style-name="TableCell">$55.00</text:p></table:table-cell>
+          <table:table-cell table:style-name="Plots.Cell" office:value-type="string"><text:p text:style-name="TableCell">no</text:p></table:table-cell>
+        </table:table-row>
+        <table:table-row>
+          <table:table-cell table:style-name="Plots.Cell" office:value-type="string"><text:p text:style-name="TableCell">D-15</text:p></table:table-cell>
+          <table:table-cell table:style-name="Plots.Cell" office:value-type="string"><text:p text:style-name="TableCell">S. Patel &amp; K. Wong</text:p></table:table-cell>
+          <table:table-cell table:style-name="Plots.Cell" office:value-type="string"><text:p text:style-name="TableCell">3 x 6 m</text:p></table:table-cell>
+          <table:table-cell table:style-name="Plots.Cell" office:value-type="string"><text:p text:style-name="TableCell">$45.00</text:p></table:table-cell>
+          <table:table-cell table:style-name="Plots.Cell" office:value-type="string"><text:p text:style-name="TableCell">Jan 28</text:p></table:table-cell>
+        </table:table-row>
+      </table:table>
+      <text:p text:style-name="Mono">Receipt 20417<text:s text:c="3"/>Qty 12<text:s text:c="3"/>Unit 3.75<text:s text:c="3"/>Total 45.00</text:p>
+      <text:p text:style-name="Mono">Ref: HSG/2026/A-12<text:s text:c="3"/>Date: 2026-02-11<text:s text:c="3"/>Cash [x] Card [ ]</text:p>
+      <text:p text:style-name="Small">The committee meets on the third Thursday of each month at 7:30 p.m. in the library annex. All members may attend; votes require a quorum of 12.</text:p>
+      <text:p text:style-name="Standard">With thanks,</text:p>
+      <text:p text:style-name="Standard">Dana Morrow, Secretary</text:p>
+      <text:p text:style-name="PageTitle">Notes in other languages</text:p>
+      <text:p text:style-name="Subhead">French</text:p>
+      <text:p text:style-name="Standard">Le jardin communautaire de la rue du Port ouvrira ses parcelles le samedi 4 avril. Chaque membre pourra récupérer sa clé à l’accueil, près de la serre, à côté du puits, entre 9 h et 12 h. Nous rappelons que l’arrosage est interdit en journée pendant l’été : préférez le matin très tôt ou la soirée. Les outils prêtés doivent être nettoyés et rangés avant votre départ. Où trouver des semences ? À la bibliothèque, où une grainothèque gratuite est ouverte à tous. Éric, Zoé et Joël animeront un atelier sur le compost, suivi d’un goûter : crêpes, gâteau aux noix, maïs grillé et jus de pomme. Ça promet d’être une belle fête ! Pour toute question, passez à l’abri des bénévoles, au cœur de l’îlot fleuri. Les inscriptions à la « fête des récoltes » ouvriront en août.</text:p>
+      <text:p text:style-name="Sans">Rappel : l’assemblée générale aura lieu le jeudi 16 avril à 19 h 30, à la salle des fêtes. Ordre du jour : élection du comité, budget prévisionnel et règlement intérieur.</text:p>
+      <text:p text:style-name="Subhead">Spanish</text:p>
+      <text:p text:style-name="Standard">El huerto abrirá sus puertas en primavera. ¿Quiere participar? ¡Inscríbase antes del viernes, el último día! La señora Muñoz enseñará cómo podar los árboles frutales, y habrá café para todos. Los niños pueden traer su propia regadera; el pingüino de cerámica de la entrada les dará la bienvenida.</text:p>
+      <text:p text:style-name="Subhead">German</text:p>
+      <text:p text:style-name="Standard">Der Garten ist von März bis Oktober täglich geöffnet. Öffnungszeiten: täglich von 8 bis 20 Uhr. Bitte schließen Sie das Tor, wenn Sie gehen, und lassen Sie keine Abfälle zurück. Größere Geräte wie die Schubkarre oder der Häcksler stehen im Schuppen. Änderungen hängen wir am Tor aus. Für Fragen zur Bewässerung wenden Sie sich an Frau Weiß. Über Ihre Hilfe beim Herbstfest freuen wir uns sehr.</text:p>
+      <text:p text:style-name="Subhead">Other letters</text:p>
+      <text:p text:style-name="Standard">Polski: Zażółć gęślą jaźń w Łodzi. Čeština: Příliš žluťoučký kůň úpěl ďábelské ódy. Magyar: Árvíztűrő tükörfúrógép.</text:p>
+      <text:p text:style-name="Subhead">Signs</text:p>
+      <text:p text:style-name="Standard">“Bring gloves,” she said, ‘and a hat’ – it’s sunny. Prices: €12.50 per plot, £10 for students; soil at 18 °C; open 9–12 and 14–17 — every day… © 2026</text:p>
+    </office:text>
+  </office:body>
+</office:document>
