@@ -1,5 +1,13 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed
+
+- LimarePDF isn't on the AUR, though 0.14.1's notes said it was: the AUR isn't taking new accounts for now. On Arch
+  Linux, x86_64, install the release's `limarepdf-<version>-1-x86_64.pkg.tar.zst` with `sudo pacman -U`
+  ([Install](docs/install.md#arch-linux)).
+
 ## [0.14.1] - 2026-11-25
 
 ### Added
