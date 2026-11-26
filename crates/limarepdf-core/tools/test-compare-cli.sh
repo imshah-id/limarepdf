@@ -28,12 +28,14 @@ chmod +x "$scratch/bin/cargo" "$scratch/before" "$root/target/ci-test/limarepdf-
 export PATH="$scratch/bin:$PATH" CARGO_TARGET_DIR="$scratch/custom target"
 
 COMPARE_CLI_OUT="$scratch/same" bash "$tools/compare-cli.sh" "$scratch/before" > "$scratch/same.log"
-if COMPARE_CLI_OUT="$scratch/different" AFTER_INFO_STATUS=7 \
-    bash "$tools/compare-cli.sh" "$scratch/before" "$scratch/extra.pdf" > "$scratch/diff.log" 2>&1; then
-    echo "Compare succeeded despite the new CLI exiting 7" >&2
-    exit 1
-fi
+# A folder the script made is emptied and used again.
+COMPARE_CLI_OUT="$scratch/same" bash "$tools/compare-cli.sh" "$scratch/before" > "$scratch/same.log"
+status=0
+COMPARE_CLI_OUT="$scratch/different" AFTER_INFO_STATUS=7 \
+    bash "$tools/compare-cli.sh" "$scratch/before" "$scratch/extra.pdf" > "$scratch/diff.log" 2>&1 || status=$?
+test "$status" -eq 1
 grep -q 'exit 7' "$scratch/different/info-diff.txt"
+grep -qF "== $(realpath "$scratch/extra.pdf") with after" "$scratch/different/summary.txt"
 
 mkdir "$scratch/existing"
 echo keep > "$scratch/existing/marker"
@@ -49,7 +51,14 @@ exit 2
 STUB
 chmod +x "$scratch/bin/diff"
 status=0
-COMPARE_CLI_OUT="$scratch/broken-diff" bash "$tools/compare-cli.sh" "$scratch/before"     > "$scratch/broken-diff.log" 2>&1 || status=$?
+COMPARE_CLI_OUT="$scratch/broken-diff" bash "$tools/compare-cli.sh" "$scratch/before" > "$scratch/broken-diff.log" 2>&1 || status=$?
 test "$status" -eq 2
 grep -q 'Could not compare verify logs' "$scratch/broken-diff.log"
+
+# A build that names no executable stops the comparison with 2, not 1.
+printf '#!/usr/bin/env bash\n' > "$scratch/bin/cargo"
+status=0
+COMPARE_CLI_OUT="$scratch/no-cli" bash "$tools/compare-cli.sh" "$scratch/before" > "$scratch/no-cli.log" 2>&1 || status=$?
+test "$status" -eq 2
+grep -q 'did not report a limarepdf-cli executable' "$scratch/no-cli.log"
 echo "compare-cli checks passed"

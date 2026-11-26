@@ -1,31 +1,42 @@
 #!/usr/bin/env bash
 # Compares this tree's limarepdf-cli with an earlier build over every PDF in tests/data (the
-# committed ones, and the render corpus and dss/ samples when fetched), plus any extra PDFs.
-# See docs/developer/testing.md.
+# committed ones, and the render corpus and dss/ samples when fetched), to see what a change does
+# to real files (docs/developer/testing.md). Builds this tree's CLI (ci-test profile, two jobs) and
+# takes the executable Cargo reports, then for each file runs `verify` with both and diffs the
+# outputs and exit codes, counts the exit codes of the signed files, and runs `info` with both,
+# comparing the notes on stderr and the exit codes and timing each pass. PDFs given after the base
+# CLI (crafted attack files, say) are compared too, and shown in full.
 #
-# Usage: bash crates/limarepdf-core/tools/compare-cli.sh BASE-CLI [PDF...]
-# Build BASE-CLI before the change (cargo build --profile ci-test -p limarepdf-cli) and copy it
-# out of target. Reports go to a new directory under target/tmp, or to COMPARE_CLI_OUT if set.
-set -euo pipefail
+# Usage, from anywhere: bash crates/limarepdf-core/tools/compare-cli.sh BASE-CLI [PDF...]
+# For BASE-CLI, build the CLI before the change (`cargo build --profile ci-test -p
+# limarepdf-cli`) and copy it out of the target folder. The outputs and summary.txt go to
+# target/tmp/compare-cli (COMPARE_CLI_OUT), emptied first if this script made it; a folder it
+# didn't make is refused. Exits 0 when nothing differs, 1 when something does, and 2 when the
+# comparison couldn't be made.
+set -Eeuo pipefail
+# A step that fails exits 2: 1 is for differences found.
+trap 'exit 2' ERR
 base=$(realpath "${1:?usage: compare-cli.sh BASE-CLI [PDF...]}")
 shift
 extra=()
 for f in "$@"; do extra+=("$(realpath "$f")"); done
 cd "$(dirname "$0")/../../.."
-if [ -n "${COMPARE_CLI_OUT:-}" ]; then
-    out=$COMPARE_CLI_OUT
-    mkdir -p "$(dirname "$out")"
-    mkdir "$out" || { echo "compare-cli needs a new output directory: $out" >&2; exit 2; }
-else
-    mkdir -p target/tmp
-    out=$(mktemp -d target/tmp/compare-cli.XXXXXX)
+out=${COMPARE_CLI_OUT:-target/tmp/compare-cli}
+# Only a folder this script made, with its marker, is emptied.
+if [ -e "$out" ]; then
+    if [ ! -f "$out/.compare-cli" ]; then
+        echo "compare-cli didn't make $out and won't empty it" >&2
+        exit 2
+    fi
+    rm -rf "$out"
 fi
-mkdir "$out"/verify-before "$out"/verify-after "$out"/info-before "$out"/info-after
+mkdir -p "$out"/verify-before "$out"/verify-after "$out"/info-before "$out"/info-after
+touch "$out/.compare-cli"
 
 cargo build -j2 --profile ci-test -p limarepdf-cli --message-format=json-render-diagnostics \
     > "$out/build.jsonl" 2> "$out/build.log" || { tail "$out/build.log" >&2; exit 2; }
 # Cargo reports the executable path even when the target directory or target triple is configured.
-built=$(python3 - "$out/build.jsonl" <<'PY'
+built=$(python3 -I - "$out/build.jsonl" <<'PY'
 import json
 import sys
 
@@ -80,7 +91,10 @@ info() { # cli outdir pass
         o="$2/$(printf '%s' "$f" | tr / _).txt"
         status=0
         timeout 60 "$1" info "$f" < /dev/null > /dev/null 2> "$out/info-stderr.txt" || status=$?
-        grep -v '^[[:space:]]*$' "$out/info-stderr.txt" >> "$o" || [ "$?" -eq 1 ]
+        # The notes once, from the second pass, and each pass's exit code.
+        if [ "$3" = 2 ]; then
+            grep -v '^[[:space:]]*$' "$out/info-stderr.txt" >> "$o" || [ "$?" -eq 1 ]
+        fi
         echo "pass $3: exit $status" >> "$o"
     done < "$out/all.txt"
     info_seconds=$(awk -v a="$t0" -v b="$(date +%s.%N)" 'BEGIN { printf "%.1f", b - a }')
@@ -120,6 +134,16 @@ done
     echo "info: notes before: $(note_count "$out/info-before"), after: $(note_count "$out/info-after")"
     echo "info: diff before after: $(wc -l < "$out/info-diff.txt") lines"
     cat "$out/verify-diff.txt" "$out/info-diff.txt"
+    # The extra PDFs in full: a failure both builds share shows no difference.
+    if [ "$#" -gt 0 ]; then
+        for f in "${extra[@]}"; do
+            o=$(printf '%s' "$f" | tr / _).txt
+            for side in before after; do
+                echo "== $f with $side"
+                cat "$out/verify-$side/$o" "$out/info-$side/$o"
+            done
+        done
+    fi
 } > "$out/summary.txt"
 cat "$out/summary.txt"
 echo "Reports: $out"
