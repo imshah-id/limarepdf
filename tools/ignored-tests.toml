@@ -428,6 +428,14 @@ group = "G6"
 needs = ["pdftoppm"]
 
 [[test]]
+name = "cross_check_page_sizes_with_poppler"
+crate = "limarepdf-core"
+target = "--test import"
+file = "crates/limarepdf-core/tests/import.rs"
+group = "G6"
+needs = ["pdfinfo"]
+
+[[test]]
 name = "cross_check_links_with_poppler"
 crate = "limarepdf-core"
 target = "--test links"
@@ -448,6 +456,14 @@ name = "cross_check_flattening_past_those_shown_with_poppler"
 crate = "limarepdf-core"
 target = "--test many_annotations"
 file = "crates/limarepdf-core/tests/many_annotations.rs"
+group = "G6"
+needs = ["pdftotext"]
+
+[[test]]
+name = "cross_check_accented_text_layer_with_poppler"
+crate = "limarepdf-core"
+target = "--test ocr"
+file = "crates/limarepdf-core/tests/ocr.rs"
 group = "G6"
 needs = ["pdftotext"]
 
@@ -514,6 +530,14 @@ target = "--test redact"
 file = "crates/limarepdf-core/tests/redact.rs"
 group = "G6"
 needs = ["pdftoppm", "pdftotext"]
+
+[[test]]
+name = "cross_check_a_fax_picture_redacted_either_way_with_poppler"
+crate = "limarepdf-core"
+target = "--test redact"
+file = "crates/limarepdf-core/tests/redact.rs"
+group = "G6"
+needs = ["pdftoppm"]
 
 [[test]]
 name = "cross_check_a_letter_whose_width_is_taken_back_with_poppler"
@@ -602,6 +626,14 @@ target = "--test scan"
 file = "crates/limarepdf-core/tests/scan.rs"
 group = "G6"
 needs = ["pdfimages"]
+
+[[test]]
+name = "poppler_shows_a_fax_scan_as_it_was_whichever_way_its_black_is_stored"
+crate = "limarepdf-core"
+target = "--test scan"
+file = "crates/limarepdf-core/tests/scan.rs"
+group = "G6"
+needs = ["pdftoppm"]
 
 [[test]]
 name = "poppler_shows_a_profiled_scan_as_it_was"
@@ -698,6 +730,22 @@ target = "--test unicode_text"
 file = "crates/limarepdf-core/tests/unicode_text.rs"
 group = "G6"
 needs = ["gs", "pdffonts", "pdftotext"]
+
+[[test]]
+name = "app::tests::organise::cross_check_typing_moved_with_its_page_with_poppler"
+crate = "limarepdf-gui"
+target = "--bin limarepdf"
+file = "crates/limarepdf-gui/src/app/tests/organise.rs"
+group = "G6"
+needs = ["pdftotext"]
+
+[[test]]
+name = "app::tests::redact_marks::cross_check_redactions_applied_as_a_save_ended_with_poppler"
+crate = "limarepdf-gui"
+target = "--bin limarepdf"
+file = "crates/limarepdf-gui/src/app/tests/redact_marks.rs"
+group = "G6"
+needs = ["pdftotext"]
 
 [[test]]
 name = "page_text::tests::cross_check_word_starts_with_pdftotext"

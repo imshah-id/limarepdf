@@ -87,15 +87,20 @@ To move pages a long way, or into another document, cut them and paste them wher
    selected, in one step that Undo takes back.
 
 Esc takes the cut back, and the pages stay selected; Esc again lets go of them. Pasting with no new place chosen
-changes nothing, and a message says what to do.
+changes nothing, and a message says what to do. Paste waits while a task is under way, such as recognising text:
+it is greyed, and Ctrl+V pastes nothing and says so.
 
 To paste them into another document, go to its tab and paste there: the pages are added there and taken out of
-the document they were cut from, each change one step for Undo in its own document. Cutting every page of a
-document copies them instead, because a document needs at least one page, and a message says so.
+the document they were cut from, each change one step for Undo in its own document. Text you were still typing on
+them goes with them. Cutting every page of a document copies them instead, because a document needs at least one
+page, and a message says so. Pages LimarePDF can't take out of their document are copied too, and a message says
+why: for example, when a drawing on a page that stays can't be read.
 
 To have pages twice, copy them: select them and press Ctrl+C (or **Edit > Copy**, or **Copy** in the right-click
 menu), then paste in this document or another as above. The pages you copied stay as they are. Each paste adds
 another copy, selected, in one step that Undo takes back.
+[Draft replies](comments-and-markup.md#see-every-comment-and-reply) are added to the document first, as saving adds
+them, so the copies have those on their pages.
 
 Copying or cutting something else in LimarePDF, text or pages, replaces the pages copied or cut, as in a word
 processor; pages that were cut stay where they are. Copying in another app doesn't replace them. The clipboard
@@ -105,7 +110,8 @@ into another app.
 Pasting pages that come from a password-protected document makes the document you paste into protected too:
 LimarePDF keeps no recovery copies of it. Pages with form fields are asked about first, as when you
 [add pages from a file](#when-the-files-added-have-form-fields): the fields are drawn onto the pages with their
-answers and can't be filled in afterwards.
+answers and can't be filled in afterwards. If the document they were cut from changes, or is closed or reloaded,
+before you answer, nothing is pasted; cut them again.
 
 ## Rotate, delete and extract pages
 
@@ -169,8 +175,10 @@ them the same way ([Pages](cli.md#pages)).
 
 Files are numbered after the document, such as `book-001.pdf`; split at bookmarks, they are named after their
 bookmark too, such as `book-002 Introduction.pdf`, and the pages before the first bookmark get a file of their
-own. Each file is written as soon as its part is made, so a large document split into many files needs little
-more memory than the document itself. Splitting doesn't change the document.
+own. Every part is made and checked before any file is written, so a part that can't be made writes no files at
+all. The parts are then made again and written, several at once, each let go once its file is written, so they
+aren't all held in memory together. If a file can't be written, the message says how many were written before
+it. Splitting doesn't change the document.
 
 If files with the same names are already in the folder, LimarePDF asks once, saying how many, before writing
 anything: **Replace** replaces them, **Cancel** writes no files at all.
@@ -232,6 +240,11 @@ Pages that are deleted, or left out when extracting or splitting, leave nothing 
 named destinations, links, the opening view, form fields and tags stop referring to them, so their content isn't
 kept.
 
+A digitally signed document is the exception for deleting: saving it adds the changes after what was signed, so
+the pages deleted stay in the version that was signed, and anyone with the file can open that version
+([The version that was signed](signatures-in-depth.md#the-version-that-was-signed)). To remove them for good, use
+Redact or Remove hidden information, which write the whole file and break the signatures.
+
 - A link to such a page goes nowhere, and a form field whose boxes were all on those pages leaves the form.
 - Tags with content on those pages lose their alternative text (also when they have content on kept pages too),
   and so do the tags above them.
@@ -240,6 +253,9 @@ kept.
   its page went.
 - A form nested more than 32 deep can't be followed to its end, so deleting, extracting or splitting stops with a
   message saying why, changing nothing.
+- When the file still holds something of the pages that go another way, as when a tagged document's tags point at
+  it, or a page that stays has a drawing that can't be read, deleting, extracting or splitting stops with a
+  message saying why, changing nothing; Split then writes no file.
 
 ## From the command line
 

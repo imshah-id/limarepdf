@@ -5,8 +5,8 @@ It organises, edits, annotates, fills in, signs, stamps, redacts, secures, scans
 line.
 This is a from-scratch implementation (with AI assistance): it contains no other product's code, strings, stamps, fonts or other assets.
 
-It runs on Windows 10 and 11 (x64), macOS 11 or later (Apple Silicon and Intel), and 64-bit Linux with glibc 2.43 or
-later. Support for each is provisional until the release checks by hand have passed there ([requirements](docs/install.md#requirements)).
+It runs on Windows 10 and 11 (x64) and Windows 11 on Arm, macOS 11 or later (Apple Silicon and Intel), and 64-bit
+Linux (x86_64 and Arm64) with glibc 2.39 or later. Support for each system is provisional until the release checks by hand have passed on each system; refer to the [requirements](docs/install.md#requirements).
 
 ![The LimarePDF window: the commands under the document's tab, page thumbnails on the left, a report with a highlight, a note, a pen tick and an arrow with a text box in the middle, and the inspector on the right](docs/images/limarepdf.png)
 

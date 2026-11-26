@@ -22,10 +22,17 @@ To check that a download really comes from this project, see [Checking a downloa
 The desktop app needs a working Vulkan or OpenGL graphics driver and an X11 or Wayland desktop session. Start
 `limarepdf` from a terminal to see why it stopped, and [report it](#reporting-a-problem) with that message.
 
+### The AppImage says "Cannot mount AppImage"
+
+The AppImage runs through FUSE, and the system doesn't have it: install your system's `fuse3` package. Or run it
+with `--appimage-extract-and-run` first, which works without FUSE but leaves an unpacked copy (about 100 MB) in
+`/tmp`. See [AppImage](install.md#appimage).
+
 ### The window has a plain icon on Linux
 
 Wayland desktops take a window's icon from its menu entry. The packages install one; for the archive, see
-[Menu entry and icon on Linux](install.md#menu-entry-and-icon-on-linux).
+[Menu entry and icon on Linux](install.md#menu-entry-and-icon-on-linux), and for the AppImage,
+[AppImage](install.md#appimage).
 
 ## Opening documents
 
@@ -181,8 +188,9 @@ settings, then press Try again in Print. Printing on paper has only been tried o
 
 ### Print says the printing service didn't answer
 
-LimarePDF waits 10 seconds for the system to list the printers. On Linux, check that CUPS is running (for example
-with `systemctl status cups`), then press Try again.
+LimarePDF gives each question to the printing service 10 seconds; on Linux and macOS it asks several in turn, so
+the message can take longer than that to show. On Linux, check that CUPS is running (for example with
+`systemctl status cups`), then press Try again.
 
 ### "The printer didn't take the document" or "the printing service didn't confirm the job"
 

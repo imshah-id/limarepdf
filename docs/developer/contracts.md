@@ -30,7 +30,9 @@ where its code is, in [How it is built](architecture.md).
 - A save never replaces, unasked, a file changed since LimarePDF read or saved it. The app checks before saving,
   and once more at the replacement boundary: the new file written and synced, just before it is renamed into
   place. That last check compares the bytes, so a change that kept the file's size, time and inode is seen too
-  (PB-28 (2)).
+  (PB-28 (2)). A file gone from the name, or one LimarePDF can't read, is nothing to compare and counts as
+  unchanged at both checks (`atomic.rs`'s `replace`): a file put at the name meanwhile is refused at the boundary
+  when LimarePDF can read it, and replaced when it can't but its folder lets LimarePDF rename over it.
 - A digital ID is never written over another: two stored at once under one name are both kept, the second under
   the next free name (PB-134).
 - App-owned private files (digital IDs, the trust list, recovery copies, remembered signature pictures) are for

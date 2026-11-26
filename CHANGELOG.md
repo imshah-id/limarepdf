@@ -2,6 +2,60 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- LimarePDF isn't on the AUR, though 0.14.1's notes said it was: the AUR isn't taking new accounts for now. On Arch
+  Linux, x86_64, install the release's `limarepdf-<version>-1-x86_64.pkg.tar.zst` with `sudo pacman -U`
+  ([Install](docs/install.md#arch-linux)).
+- Recognised text no longer splits lines of old print and of large scans into pieces: a letter broken in two, or a
+  word whose letters barely touch, made part of a line read as a line of its own.
+
+### Changed
+
+- Text recognition reads accented letters: French, Spanish, German, Polish, Czech, Hungarian and the other languages
+  written in Latin letters, and signs such as €, £, ° and ©. Before, they came out as `?`. With this and the fix
+  above, the character errors on pages of old French books fell from 12–26% to 1–4%, and old Spanish and German
+  pages read as well. English reads about as well as before on average, but not on every page: some faxes and
+  office and flatbed scans read worse, greyscale scans at 150 dpi by about a tenth of their words. The recognition
+  model is now PaddleOCR's PP-OCRv6 small (Apache 2.0) in place of the ocrs project's (CC BY-SA 4.0), and the
+  programs are about 11 MB larger ([Scans and OCR](docs/scanning-and-ocr.md#recognising-text-ocr)).
+- The guide says what text recognition reads and how well, measured on real scans: office, flatbed and phone scans,
+  faxes and old French, Spanish and German books, with advice for tilted pages, small print and faxes
+  ([Scans and OCR](docs/scanning-and-ocr.md#getting-good-results)).
+
+## [0.14.1] - 2026-11-25
+
+### Added
+
+- LimarePDF for Arm64 computers: Linux (a `.deb`, an `.rpm` and a `.tar.gz`) and Windows 11 on Arm (an installer
+  and a `.zip`), built and tested like the x86_64 ones. The package repository carries both, and picks the right
+  one itself; the Arm64 installer replaces an x64 LimarePDF of the same version or older ([Install](docs/install.md)).
+- An AppImage for Linux, x86_64 and Arm64, for systems the `.deb` and `.rpm` don't cover: one file holding the
+  desktop app and the command-line tool (give it `limarepdf-cli` as its first argument). Like the packages, it needs
+  glibc 2.39 or later; it doesn't need libfuse2 ([Install](docs/install.md#appimage)).
+- Packages for Arch Linux on the AUR, x86_64 and aarch64: `limarepdf`, built from source on your computer, and
+  `limarepdf-bin`, the release's programs ([Install](docs/install.md#arch-linux)).
+- Each release has its source as a signed archive, `limarepdf-<version>-source.tar.gz`, which the AUR's
+  `limarepdf` builds from, and that package built for x86_64, for `sudo pacman -U`
+  ([Install](docs/install.md#arch-linux)).
+- LimarePDF in winget (`winget install ClaytonCornell.LimarePDF`, the installer) and in its own Scoop bucket (the
+  `.zip`), for x64 and Arm64 Windows, so either keeps it up to date ([Install](docs/install.md#winget-and-scoop)).
+
+### Changed
+
+- The Linux builds, the `.deb` and the `.rpm` need glibc 2.39 or later again, as in 0.13.0 (0.14.0 needed 2.43),
+  so they install on Ubuntu 24.04, Debian 13, Red Hat Enterprise Linux 10 and the systems built from it (AlmaLinux,
+  Rocky Linux), openSUSE Leap 16 and Fedora. The package repository works there too: on Red Hat Enterprise Linux,
+  AlmaLinux and Rocky Linux, add it with `sudo dnf config-manager --add-repo
+  https://smaug42.github.io/limarepdf/rpm/limarepdf.repo` ([Install](docs/install.md#linux-packages)).
+- [Install](docs/install.md#linux-packages) gives each Linux system its own commands, as Debian and Ubuntu had. On
+  Fedora, Red Hat Enterprise Linux and the systems built from it, and openSUSE, they import the project's signing
+  key first: openSUSE then installs without asking about the key, and dnf asks once, with the fingerprint to
+  check. A downloaded `.rpm`'s signature is checked with `rpm --checksig`.
+- The libraries LimarePDF is built from are updated to their latest versions.
+
+## [0.14.0] - 2026-11-24
+
 ### Added
 
 - The About window has a Support LimarePDF line under its other links, with **Patreon** and **Buy Me a
@@ -609,6 +663,45 @@
 - A damaged PNG whose palette of colours ends partway through a colour is refused, saying it is damaged, wherever
   a picture is read, as libpng (which many apps read PNGs with) refuses it. Before, the PNG library LimarePDF uses
   failed on it with an internal error, which closed LimarePDF when making a PDF from images.
+- A `limarepdf-cli` command whose output stops being read, as `limarepdf-cli remove-blank in.pdf -o out.pdf | head`
+  stops reading it, leaves out the rest of what it prints, runs to its end and exits with its own status. Before,
+  it stopped at the next line it printed with status 0: `remove-blank` and `optimize-scans`, which list what they
+  did before saving, saved nothing, and `save-images` said nothing of pictures it couldn't save.
+- `limarepdf-cli verify --signed-version` with `--require-trusted` is refused (status 2), writing nothing. Before,
+  `--require-trusted` was ignored there: the signed version was saved with status 0, trusted or not.
+- Text still being typed on a page that is cut and pasted into another document goes with the page. Before, the
+  page was pasted without it, and the text was taken out with the page from its own document.
+- Ctrl+V waits while a task is under way, as Paste in the band does, and says so. Before, it pasted pages cut or
+  copied while the task ran.
+- Pages with form fields cut in one document and pasted into another are pasted only if the document they were
+  cut from is as it was when you answer the question about their fields; if not, nothing is pasted, and a message
+  says why. Before, when it was reloaded meanwhile, the pages were pasted and stayed in it too, with nothing said.
+- Pages cut and pasted into another document that can't be taken out of their own are copied, and a message says
+  so and why. Before, they stayed in both documents with nothing said.
+- Apply redactions and Remove hidden information, answered while the document is being saved, run once the save
+  ends. Before, a save ending between the answer and the removal cancelled it, saying the document had changed
+  while the question was open.
+- Draft replies are added to the document before pages are copied, as before cutting or saving, so the copies have
+  them, and adding them leaves what is selected as it was. Before, copies left them out, and with a draft left, a
+  command on the pages selected selected the draft's comment instead: Cut did nothing, Delete, Rotate and Extract
+  acted on the page in view, and Print offered every page.
+- A name chosen without its extension in Save As, signing, saving the selection or a picture, exporting text, or
+  exporting a digital ID or its certificate never writes over a file that already has that name with the extension
+  LimarePDF adds: nothing is saved, and a message says why. Choosing the full name replaces it. Before, that file
+  was replaced, though the file chooser never asked about it.
+- On the command line, a resolution of 0, below 0 or not a number is refused before anything is written, as is
+  one out of range: `images` and `insert-images` take `--dpi` and `--fallback-dpi` from 10 to 10,000,
+  `optimize-scans` takes `--max-dpi` from 10 to 10,000, and `render` takes `--dpi` from 36 to 1152, as the app's
+  Export does. Before, `images --dpi 0` made a PDF that couldn't be opened again, `optimize-scans --max-dpi 0`
+  replaced each scan with a picture of one pixel, and `render` drew at 1152 dpi when asked for more and at 3.6 when
+  asked for less. The `--quality` of `render` and `optimize-scans` is refused outside 1 to 100, where before 0 was
+  taken as 1 and anything above 100 as 100.
+- On the command line, `form fill --values` takes back the values `form list --json` prints, edited, when the form
+  has a read-only field: that field's value, unchanged, is left as it is, and the report says how many were.
+  Before, filling stopped at the read-only field and wrote nothing. Any other value for a read-only field is still
+  refused.
+- Optimise scanned pages keeps a black-and-white scan stored as a fax picture (CCITT Group 4) that marks its black
+  as 1, as some scanners write it, black on white. Before, such pages came out as a negative, white on black.
 
 ### Changed
 

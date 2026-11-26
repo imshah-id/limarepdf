@@ -92,7 +92,9 @@ Help and **Settings…**, where what is set for every document is in one place.
   **Save** them, **Discard** them or **Cancel**; with several documents unsaved, quitting offers **Review…** to
   ask about each in turn. Save asks first when another app changed the file since you opened it.
 - While you work, LimarePDF keeps a private **recovery copy** of each document with unsaved changes. If the app
-  stops unexpectedly, the next start offers them back ([Recovery copies](gui.md#recovery-copies)).
+  stops unexpectedly, the next start offers them back ([Recovery copies](gui.md#recovery-copies)). A
+  password-protected document, or one you add a protected document's pages to, gets no copy, and none are kept
+  while recovery copies are turned off in Settings.
 - In a question, a **red button** means a choice to be sure of: it removes or discards something, replaces a file,
   or breaks a document's digital signatures. Some can be undone while the document stays open: Undo brings back
   what applying redactions removed, until you close the document, though a file you saved meanwhile no longer

@@ -1,11 +1,11 @@
 use anyhow::{anyhow, bail, Context, Result};
 
-/// println! that returns from the function when the output can't be written: see [`unwritten`].
+/// println! that returns from the function when the output can't be written, and writes nothing
+/// once its reader has gone: see [`report`].
 macro_rules! out {
-    ($($t:tt)*) => {{
-        use std::io::Write;
-        writeln!(std::io::stdout(), $($t)*).map_err(unwritten)?;
-    }};
+    ($($t:tt)*) => {
+        report(format_args!($($t)*))?
+    };
 }
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use limarepdf_core::{display_line, DigitalId, IdStore, NewId, SignPlace, SignRequest};
@@ -166,11 +166,12 @@ enum Cmd {
         pages: String,
         #[arg(long, value_enum, default_value = "auto")]
         mode: ScanModeArg,
-        /// Greyscale and colour images above this resolution are downsampled to it
-        #[arg(long, default_value_t = 200.0)]
+        /// Greyscale and colour images above this resolution are downsampled to it, 10 to
+        /// 10000
+        #[arg(long, default_value_t = 200.0, value_parser = parse_picture_dpi)]
         max_dpi: f32,
         /// JPEG quality for greyscale and colour images, 1 to 100
-        #[arg(long, default_value_t = 75)]
+        #[arg(long, default_value_t = 75, value_parser = clap::value_parser!(u8).range(1..=100))]
         quality: u8,
         /// Do not straighten tilted pages
         #[arg(long)]
@@ -195,7 +196,7 @@ enum Cmd {
         jpeg_quality: Option<u8>,
     },
     /// Recognise text on pages that have none (scans) and add it as an invisible,
-    /// searchable layer. Latin script only
+    /// searchable layer. Reads languages written in Latin letters, accents included
     Ocr {
         #[command(flatten)]
         io: Io,
@@ -420,7 +421,12 @@ enum Cmd {
         require_trusted: bool,
         /// Save the version signature N (numbered as listed) signed, instead of the
         /// results
-        #[arg(long, value_name = "N", requires = "output")]
+        #[arg(
+            long,
+            value_name = "N",
+            requires = "output",
+            conflicts_with = "require_trusted"
+        )]
         signed_version: Option<usize>,
         /// Where to save the signed version
         #[arg(short, long, requires = "signed_version")]
@@ -615,13 +621,13 @@ enum Cmd {
         input: PathBuf,
         #[arg(long, default_value = "all")]
         pages: String,
-        /// Resolution, at most 1152
-        #[arg(long, default_value_t = 150.0)]
+        /// Resolution, 36 to 1152
+        #[arg(long, default_value_t = 150.0, value_parser = parse_render_dpi)]
         dpi: f32,
         #[arg(long, value_enum, default_value_t = FormatArg::Png)]
         format: FormatArg,
         /// JPEG quality, 1 to 100
-        #[arg(long, default_value_t = 90)]
+        #[arg(long, default_value_t = 90, value_parser = clap::value_parser!(u8).range(1..=100))]
         quality: u8,
         #[arg(long)]
         out_dir: PathBuf,
@@ -972,12 +978,34 @@ fn kb(bytes: usize) -> String {
 /// Page size for imported images.
 #[derive(Args, Clone)]
 struct ImageSize {
-    /// Resolution in dots per inch, overriding the one stored in the files
-    #[arg(long)]
+    /// Resolution in dots per inch, overriding the one stored in the files, 10 to 10000
+    #[arg(long, value_parser = parse_picture_dpi)]
     dpi: Option<f32>,
-    /// Resolution assumed for files that state none
-    #[arg(long, default_value_t = 150.0)]
+    /// Resolution assumed for files that state none, 10 to 10000
+    #[arg(long, default_value_t = 150.0, value_parser = parse_picture_dpi)]
     fallback_dpi: f32,
+}
+
+/// A resolution in dots per inch, one of `range`.
+fn parse_dpi(s: &str, range: std::ops::RangeInclusive<f32>) -> std::result::Result<f32, String> {
+    match s.trim().parse::<f32>() {
+        Ok(d) if range.contains(&d) => Ok(d),
+        _ => Err(format!(
+            "expected a resolution from {} to {} dpi",
+            range.start(),
+            range.end()
+        )),
+    }
+}
+
+/// A resolution pictures are sized from, or scans brought down to.
+fn parse_picture_dpi(s: &str) -> std::result::Result<f32, String> {
+    parse_dpi(s, limarepdf_core::USABLE_DPI)
+}
+
+/// A resolution pages are rendered at.
+fn parse_render_dpi(s: &str) -> std::result::Result<f32, String> {
+    parse_dpi(s, render::MIN_DPI..=render::MAX_DPI)
 }
 
 impl ImageSize {
@@ -1366,7 +1394,8 @@ fn form_fill(io: &Io, set: &[String], values: &Option<PathBuf>, flatten: bool) -
             None => pdf.form_field(name),
         }
     };
-    let mut todo: Vec<(String, FieldValue)> = Vec::new();
+    // Each value, and whether its field is read-only.
+    let mut todo: Vec<(String, FieldValue, bool)> = Vec::new();
     if let Some(path) = values {
         not_an_input(&[path], &io.output)?;
         let text = std::fs::read_to_string(path)
@@ -1380,32 +1409,41 @@ fn form_fill(io: &Io, set: &[String], values: &Option<PathBuf>, flatten: bool) -
             );
         };
         for (name, v) in &map {
-            todo.push((name.clone(), value_from_json(&field(name)?, v)?));
+            let f = field(name)?;
+            todo.push((name.clone(), value_from_json(&f, v)?, f.read_only));
         }
     }
     for s in set {
         let Some((name, v)) = s.split_once('=') else {
             bail!("--set takes NAME=VALUE, not \"{s}\"");
         };
-        todo.push((name.to_string(), value_from_text(&field(name)?, v)?));
+        let f = field(name)?;
+        todo.push((name.to_string(), value_from_text(&f, v)?, f.read_only));
     }
     if todo.is_empty() {
         bail!("nothing to fill in: give --set NAME=VALUE or --values FILE");
     }
-    for (name, v) in &todo {
+    for (name, v, _) in &todo {
         pdf.set_field(name, v.clone())?;
     }
     if flatten {
         pdf.flatten_form(None)?;
     }
     save_edited(io, &mut pdf, &original, false)?;
+    // A read-only field's value is taken only when it is the one it holds, and left.
+    let left = todo.iter().filter(|t| t.2).count();
     out!(
-        "filled {} field(s){}; wrote {}",
-        todo.len(),
+        "filled {} field(s){}{}; wrote {}",
+        todo.len() - left,
         if flatten {
             " and flattened the form"
         } else {
             ""
+        },
+        if left > 0 {
+            format!("; left {left} read-only field(s) as they were")
+        } else {
+            String::new()
         },
         io.output.display()
     );
@@ -3011,18 +3049,10 @@ fn saved<T>(r: Result<T>) -> Result<T> {
     r
 }
 
-/// The reader of the output went away, as with `limarepdf-cli text file.pdf | head`: the
-/// command stops quietly, with the status it would have had otherwise (decision D5).
-#[derive(Debug)]
-struct Closed;
-
-impl std::fmt::Display for Closed {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        f.write_str("the output was closed")
-    }
-}
-
-impl std::error::Error for Closed {}
+/// Set once the reader of the output went away, as with `limarepdf-cli text file.pdf | head`:
+/// the rest of the report is skipped, and the command runs to its end, saving what it would
+/// have saved, with the status it would have had (decision D5, PB-203).
+static CLOSED: AtomicBool = AtomicBool::new(false);
 
 /// The output couldn't be written for another reason, such as a full disk.
 #[derive(Debug)]
@@ -3036,12 +3066,24 @@ impl std::fmt::Display for Unwritten {
 
 impl std::error::Error for Unwritten {}
 
-/// The error for output that couldn't be written (audit R15).
-fn unwritten(e: std::io::Error) -> anyhow::Error {
-    if e.kind() == std::io::ErrorKind::BrokenPipe {
-        Closed.into()
-    } else {
-        Unwritten(e).into()
+/// Writes `line` to the output, for [`out!`], unless its reader has gone.
+fn report(line: std::fmt::Arguments) -> Result<()> {
+    use std::io::Write;
+    if CLOSED.load(Ordering::Relaxed) {
+        return Ok(());
+    }
+    written(writeln!(std::io::stdout(), "{line}"))
+}
+
+/// `r`, a write to the output: a reader that went away is noted ([`CLOSED`]); any other
+/// failure is an error (audit R15).
+fn written(r: std::io::Result<()>) -> Result<()> {
+    match r {
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {
+            CLOSED.store(true, Ordering::Relaxed);
+            Ok(())
+        }
+        r => r.map_err(|e| Unwritten(e).into()),
     }
 }
 
@@ -3056,14 +3098,11 @@ fn main() -> Result<()> {
     }
     let done = guard(|| run(cli.cmd)).and_then(|()| {
         use std::io::Write;
-        std::io::stdout().flush().map_err(unwritten)
+        written(std::io::stdout().flush())
     });
     let Err(e) = done else {
         return Ok(());
     };
-    if e.is::<Closed>() {
-        return Ok(());
-    }
     // The file is in place, so never "nothing was written" (decision D7).
     if let Some(n) = e.downcast_ref::<limarepdf_core::NotConfirmed>() {
         return Err(anyhow!(
@@ -3731,21 +3770,13 @@ fn run(cmd: Cmd) -> Result<()> {
                 }
                 return Ok(());
             }
-            let shown = (|| -> Result<()> {
-                if json {
-                    out!("{}", serde_json::to_string_pretty(&verify_json(&rep))?);
-                } else {
-                    print_verify(&input, &rep)?;
-                }
-                Ok(())
-            })();
-            // A reader that went away doesn't change the verdict's status (decision D5).
-            match shown {
-                Err(e) if !e.is::<Closed>() => return Err(e),
-                _ if !rep.all_ok() || (require_trusted && !rep.all_trusted()) => {
-                    std::process::exit(1)
-                }
-                shown => shown?,
+            if json {
+                out!("{}", serde_json::to_string_pretty(&verify_json(&rep))?);
+            } else {
+                print_verify(&input, &rep)?;
+            }
+            if !rep.all_ok() || (require_trusted && !rep.all_trusted()) {
+                std::process::exit(1)
             }
         }
         Cmd::Trust { cmd } => run_trust(cmd)?,

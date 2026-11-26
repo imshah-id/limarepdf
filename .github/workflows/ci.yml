@@ -38,13 +38,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
         with:
           toolchain: stable
       # A set version, so a new cargo-deny can't change the check unseen; releasing.md says
       # when to move it.
       - name: Install cargo-deny
-        run: cargo install cargo-deny --locked --version 0.20.2
+        run: cargo install cargo-deny --locked --version 0.22.1
       - name: cargo deny
         run: cargo deny --locked check
       - name: cargo deny on fuzz/
@@ -58,7 +58,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
         with:
           toolchain: stable
           components: clippy, rustfmt
@@ -68,7 +68,8 @@ jobs:
       # relative links and anchors; the signing secrets only in release-signing jobs that no pull
       # request starts; every ignored test listed once in tools/ignored-tests.toml, with its
       # group. Each tool's self-test first, so a broken tool can't pass. The package check's
-      # self-test is here too; the packages themselves are checked where they're built.
+      # self-test is here too; the packages themselves are checked where they're built. So is the
+      # OCR measure's, which needs scans and a release build to run.
       - name: Repository checks
         run: |
           python3 -I tools/check-scratch.py --self-test
@@ -80,6 +81,7 @@ jobs:
           python3 -I tools/check-ignored-tests.py --self-test
           python3 -I tools/check-ignored-tests.py
           python3 -I packaging/check-package.py --self-test
+          python3 -I tools/ocr-accuracy.py --self-test
       - name: Formatting
         run: cargo fmt --all --check
       # Each platform in turn, all of them reported even when one fails.
@@ -103,7 +105,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
@@ -120,7 +122,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
@@ -131,19 +133,26 @@ jobs:
           RUSTFLAGS: --cfg fuzzing -D warnings
         run: cargo check --manifest-path fuzz/Cargo.toml --locked --bins
 
+  # Each build is native, on a runner of its architecture; `target` is what its packages are
+  # checked against (packaging/check-package.py), so programs an emulated toolchain builds for
+  # the runner's other architecture can't ship.
+  # Linux is built on Ubuntu 24.04, not ubuntu-latest: the binaries need the glibc they were
+  # built against, and 24.04's, 2.39, is the floor docs/install.md names.
   build:
     strategy:
       fail-fast: false
       matrix:
         include:
-          - { os: ubuntu-latest,  name: linux-x86_64 }
-          - { os: windows-latest, name: windows-x86_64 }
-          - { os: macos-latest,   name: macos-arm64 }
-          - { os: macos-15-intel, name: macos-x86_64 }
+          - { os: ubuntu-24.04,     name: linux-x86_64,   target: x86_64-unknown-linux-gnu }
+          - { os: ubuntu-24.04-arm, name: linux-arm64,    target: aarch64-unknown-linux-gnu }
+          - { os: windows-latest,   name: windows-x86_64, target: x86_64-pc-windows-msvc }
+          - { os: windows-11-arm,   name: windows-arm64,  target: aarch64-pc-windows-msvc }
+          - { os: macos-latest,     name: macos-arm64,    target: aarch64-apple-darwin }
+          - { os: macos-15-intel,   name: macos-x86_64,   target: x86_64-apple-darwin }
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
@@ -170,50 +179,18 @@ jobs:
       - name: Install cargo-about
         run: cargo install cargo-about --locked --version 0.9.3 --features cli
       # One archive per platform, made here because artifacts lose Unix file permissions:
-      # a folder limarepdf-<version>-<platform> holding the binaries, the docs and the licences.
+      # a folder limarepdf-<version>-<platform> holding the binaries, the docs and the licences
+      # (packaging/package-archive.sh, which the Arch package built from source uses too).
       - name: Package
         shell: bash
         run: |
           version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
           name="limarepdf-$version-${{ matrix.name }}"
-          dir="dist/$name"
-          mkdir -p "$dir"
-          ext=""; [ "${{ runner.os }}" = "Windows" ] && ext=".exe"
-          cp target/release/limarepdf-cli$ext target/release/limarepdf$ext "$dir/"
-          cp README.md CHANGELOG.md SECURITY.md LICENSE-MIT LICENSE-APACHE "$dir/"
-          # The README links to docs/, so the docs travel with each version.
-          cp -r docs "$dir/docs"
-          # Attribution and licence for the OCR model built into the binaries.
-          cp crates/limarepdf-core/models/README.md "$dir/OCR-MODEL.md"
-          # Licences for the Inter and Phosphor (icons) fonts built into limarepdf.
-          cp crates/limarepdf-gui/assets/fonts/OFL.txt "$dir/FONT-LICENSE-Inter.txt"
-          cp crates/limarepdf-gui/assets/fonts/LICENSE-Phosphor.txt "$dir/FONT-LICENSE-Phosphor.txt"
-          # Licences for the fonts built into limarepdf-core: Liberation (text typed on the
-          # page, and embedded in PDFs) and the handwriting fonts (typed signatures).
-          for f in OFL-Liberation OFL-Caveat OFL-CedarvilleCursive LICENSE-HomemadeApple OFL-Zeyada; do
-            cp "crates/limarepdf-core/assets/fonts/$f.txt" "$dir/FONT-LICENSE-${f#*-}.txt"
-          done
-          # Notices and licences for the spelling dictionaries built into limarepdf-core
-          # (SCOWL's English, Grammalecte's French) and the MPL-2.0, the French one's and the
-          # spellbook crate's.
-          cp crates/limarepdf-core/assets/dictionaries/README_en_CA.txt "$dir/DICTIONARY-LICENSE-English.txt"
-          cp crates/limarepdf-core/assets/dictionaries/README_dict_fr.txt "$dir/DICTIONARY-LICENSE-French.txt"
-          cp crates/limarepdf-core/assets/dictionaries/LICENSE-MPL-2.0.txt "$dir/LICENSE-MPL-2.0.txt"
-          # The licences and notices of the crates built in, this platform's (cargo-about), and on
-          # Linux the licence of the font that draws the window title bars under Wayland.
-          bash packaging/package-notices.sh
-          cp target/package-notices/THIRD-PARTY-LICENSES.html "$dir/"
-          if [ "${{ runner.os }}" = "Linux" ]; then
-            cp packaging/linux/FONT-LICENSE-Cantarell.txt "$dir/"
-          fi
-          # Linux desktop entry and icon; docs/install.md says where they go.
-          if [ "${{ runner.os }}" = "Linux" ]; then
-            cp crates/limarepdf-gui/assets/io.github.smaug42.limarepdf.desktop "$dir/"
-            cp docs/images/icon.png "$dir/io.github.smaug42.limarepdf.png"
-          fi
-          # Every file it should hold there, and every link in its docs working.
+          bash packaging/package-archive.sh "dist/$name"
+          # Every file it should hold there, every link in its docs working, and the programs
+          # built for this target.
           py=python3; [ "${{ runner.os }}" = "Windows" ] && py=python
-          $py packaging/check-package.py "$dir"
+          $py packaging/check-package.py --target "${{ matrix.target }}" "dist/$name"
           cd dist
           if [ "${{ runner.os }}" = "Windows" ]; then
             7z a -tzip "$name.zip" "$name" > /dev/null
@@ -232,6 +209,7 @@ jobs:
           cargo generate-rpm -p crates/limarepdf-gui --output dist/
       # Each package's files as installed, and the glibc it asks for: the rpm names it by hand
       # (Cargo.toml), so it must match what the binaries use; the deb's is worked out by cargo-deb.
+      # A mismatch means the floor moved: releasing.md says what to change, not only the rpm.
       - name: Check the Linux packages
         if: runner.os == 'Linux'
         run: |
@@ -240,19 +218,30 @@ jobs:
           rpm -qlp dist/*.rpm
           mkdir -p "$RUNNER_TEMP/deb" "$RUNNER_TEMP/rpm"
           dpkg-deb -x dist/*.deb "$RUNNER_TEMP/deb"
-          python3 packaging/check-package.py "$RUNNER_TEMP/deb"
+          python3 packaging/check-package.py --target "${{ matrix.target }}" "$RUNNER_TEMP/deb"
           rpm2cpio "$PWD"/dist/*.rpm | (cd "$RUNNER_TEMP/rpm" && cpio -idm --quiet)
-          python3 packaging/check-package.py "$RUNNER_TEMP/rpm"
+          python3 packaging/check-package.py --target "${{ matrix.target }}" "$RUNNER_TEMP/rpm"
           need=$(objdump -T target/release/limarepdf target/release/limarepdf-cli \
             | grep -o 'GLIBC_[0-9][0-9.]*' | sort -uV | tail -1)
           asked=$(rpm -qp --requires dist/*.rpm | sed -n 's/^libc\.so\.6(\(GLIBC_[0-9.]*\))(64bit).*/\1/p')
           echo "The binaries need $need; the rpm asks for $asked; the deb: $(dpkg-deb -f dist/*.deb Depends | grep -o 'libc6 ([^)]*)')"
           if [ "$need" != "$asked" ]; then
-            echo "Set the rpm's GLIBC_ requirement in crates/limarepdf-gui/Cargo.toml to $need"; exit 1
+            echo "::error::The binaries need $need, the rpm asks for $asked: see releasing.md's Linux packages"; exit 1
           fi
+      # The AppImage from the archive just made (packaging/linux/make-appimage.sh), its runtime and
+      # appimagetool at set versions; appimagetool checks the desktop entry with desktop-file-validate.
+      # Then checked here, through FUSE (fuse3), as packaging/linux/check-appimage.sh says.
+      - name: AppImage
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get install -y desktop-file-utils fuse3 > /dev/null
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          bash packaging/linux/make-appimage.sh "dist/limarepdf-$version-${{ matrix.name }}.tar.gz" dist
+          bash packaging/linux/check-appimage.sh dist/*.AppImage "${{ matrix.target }}"
       # The MSI from packaging/windows/limarepdf.wxs, with the crates' licences from the Package step.
       # WiX is pinned to 5 (open source, no EULA step).
-      # Two later versions of it, for the upgrade checks below, go to the runner's temporary folder.
+      # Two later versions of it, for the upgrade checks below, go to the runner's temporary folder;
+      # on Arm, an x64 one of the same version too.
       - name: Windows installer
         if: runner.os == 'Windows'
         shell: bash
@@ -262,16 +251,23 @@ jobs:
           wix extension add --global WixToolset.UI.wixext/5.0.2
           bash packaging/package-docs.sh
           version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          name="${{ matrix.name }}"
+          arch=x64; [ "${{ runner.arch }}" = ARM64 ] && arch=arm64
           build() {
-            wix build packaging/windows/limarepdf.wxs -arch x64 -ext WixToolset.UI.wixext \
-              -loc packaging/windows/limarepdf.wxl -culture en-US -d Version=$1 -o "$2"
+            wix build packaging/windows/limarepdf.wxs -arch "$1" -ext WixToolset.UI.wixext \
+              -loc packaging/windows/limarepdf.wxl -culture en-US -d Version="$2" -o "$3"
           }
-          build "$version" "dist/limarepdf-$version-x86_64.msi"
-          build 255.0.0 "$RUNNER_TEMP/upgrade-1.msi"
-          build 255.0.1 "$RUNNER_TEMP/upgrade-2.msi"
+          build "$arch" "$version" "dist/limarepdf-$version-${name#windows-}.msi"
+          build "$arch" 255.0.0 "$RUNNER_TEMP/upgrade-1.msi"
+          build "$arch" 255.0.1 "$RUNNER_TEMP/upgrade-2.msi"
+          if [ "$arch" = arm64 ]; then
+            build x64 "$version" "$RUNNER_TEMP/same-version-x64.msi"
+          fi
       # Installs the MSI without its screens, as a silent install would: the files and Start menu
       # shortcut, and the desktop shortcut option left out, asked for, kept by an upgrade and turned
-      # off by one; then uninstalls. The screens themselves are checked by hand (docs/developer/testing.md).
+      # off by one; then uninstalls. On Arm, which runs x64 programs too, an x64 LimarePDF of the
+      # same version is replaced by the Arm64 one, not kept beside it. The screens themselves are
+      # checked by hand (docs/developer/testing.md).
       - name: Check the Windows installer
         if: runner.os == 'Windows'
         shell: pwsh
@@ -281,6 +277,7 @@ jobs:
           $menu = "$env:ProgramData\Microsoft\Windows\Start Menu\Programs\LimarePDF.lnk"
           $desktop = "$env:PUBLIC\Desktop\LimarePDF.lnk"
           $log = "$env:RUNNER_TEMP\msiexec.log"
+          $uninstall = 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*'
           function Run($what) {
             Write-Output "msiexec $what"
             $p = Start-Process msiexec -ArgumentList "$what /qn /l*v `"$log`"" -Wait -PassThru
@@ -292,10 +289,17 @@ jobs:
           function Expect($path, $there) {
             if ((Test-Path $path) -ne $there) { throw "$path is $(if ($there) { 'missing' } else { 'still there' })" }
           }
+          function Installed($count) {
+            $found = @(Get-ItemProperty $uninstall -ErrorAction SilentlyContinue | Where-Object DisplayName -eq 'LimarePDF')
+            if ($found.Count -ne $count) { throw "$($found.Count) LimarePDF installed, not $count" }
+          }
           Run "/i `"$msi`""
           Expect "$folder\limarepdf.exe" $true; Expect $menu $true; Expect $desktop $false
-          python packaging\check-package.py $folder
+          python packaging\check-package.py --target "${{ matrix.target }}" $folder
           if ($LASTEXITCODE -ne 0) { throw "The installed folder has problems" }
+          # Its icon and name, which a failed resource compile leaves out with only a build warning.
+          $about = (Get-Item "$folder\limarepdf.exe").VersionInfo.FileDescription
+          if ($about -ne 'LimarePDF') { throw "limarepdf.exe has no icon and name (FileDescription: '$about')" }
           Run "/x `"$msi`""
           Expect $folder $false; Expect $menu $false
           Run "/i `"$msi`" DESKTOPSHORTCUT=1"
@@ -306,6 +310,15 @@ jobs:
           Expect $desktop $false; Expect $menu $true
           Run "/x `"$env:RUNNER_TEMP\upgrade-2.msi`""
           Expect $folder $false; Expect $menu $false; Expect $desktop $false
+          Installed 0
+          if ($env:RUNNER_ARCH -eq 'ARM64') {
+            Run "/i `"$env:RUNNER_TEMP\same-version-x64.msi`""
+            Installed 1
+            Run "/i `"$msi`""
+            Installed 1
+            Run "/x `"$msi`""
+            Installed 0; Expect $folder $false; Expect $menu $false
+          }
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: limarepdf-${{ matrix.name }}
@@ -314,6 +327,7 @@ jobs:
             dist/*.zip
             dist/*.deb
             dist/*.rpm
+            dist/*.AppImage
             dist/*.msi
 
   # A universal LimarePDF.app (Apple Silicon and Intel) in a .dmg; packaging/macos/make-dmg.sh.
@@ -322,7 +336,7 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
         with:
           toolchain: stable
           targets: aarch64-apple-darwin, x86_64-apple-darwin
@@ -363,6 +377,131 @@ jobs:
           name: limarepdf-macos-dmg
           path: dist/*.dmg
 
+  # The .deb and .rpm installed, each in a clean container, on the oldest systems docs/install.md
+  # names and a current Fedora, then removed, and the AppImage run there on the libraries the
+  # package brought: packaging/check-linux-install.sh. Both architectures', each on a runner of
+  # its own. A release waits for it, so packages these systems refuse never ship.
+  linux-install:
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x86_64, arm64]
+        image:
+          - docker.io/library/ubuntu:24.04
+          - docker.io/library/debian:13
+          - docker.io/library/fedora:latest
+          - docker.io/library/almalinux:10
+          - registry.opensuse.org/opensuse/leap:16.0
+    runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: limarepdf-linux-${{ matrix.arch }}
+          path: dist
+      - name: Install, load and remove
+        env:
+          IMAGE: ${{ matrix.image }}
+        run: docker run --rm -v "$PWD:/w:ro" -w /w "$IMAGE" bash packaging/check-linux-install.sh dist
+
+  # The release's source archive (git archive), and from it the AUR's limarepdf built as an Arch
+  # Linux user's makepkg builds it, while the other platforms build: packaging/arch/check-arch.sh's
+  # first run. Both go in the release, and the package to the arch job's checks.
+  arch-source:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Source archive
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          mkdir dist
+          git archive --prefix="limarepdf-$version/" HEAD | gzip -n > "dist/limarepdf-$version-source.tar.gz"
+      - name: Build limarepdf
+        run: |
+          docker run --rm -v "$PWD:/w:ro" -v "$PWD/dist:/dist" -w /w docker.io/library/archlinux:base-devel \
+            bash packaging/arch/check-arch.sh source /dist
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: limarepdf-source
+          path: dist/*-source.tar.gz
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: limarepdf-arch
+          path: dist/*.pkg.tar.zst
+
+  # The AUR's limarepdf-bin built from the Linux archives for both architectures, and both packages
+  # checked, then installed, upgraded, replaced and removed on x86_64, the programs at work after each
+  # step: check-arch.sh's second run. A release waits for it, so the AUR's PKGBUILDs are known to
+  # build from its files before they are made.
+  arch:
+    needs: [build, arch-source]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: limarepdf-linux-*
+          path: dist
+          merge-multiple: true
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: limarepdf-source
+          path: dist
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: limarepdf-arch
+          path: dist
+      - name: Build, check, install and remove
+        run: docker run --rm -v "$PWD:/w:ro" -w /w docker.io/library/archlinux:base-devel bash packaging/arch/check-arch.sh dist
+
+  # The winget and Scoop manifests written from the MSIs and zips as for a release, with msitools reading
+  # the MSIs' codes (packaging/windows/update.sh), then checked by winget-scoop-check.
+  winget-scoop:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: limarepdf-windows-*
+          path: dist
+          merge-multiple: true
+      - name: Write the manifests
+        run: |
+          sudo apt-get install -y msitools > /dev/null
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          bash packaging/windows/update.sh "$version" manifests dist
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: winget-scoop
+          path: manifests
+
+  # On Windows x64 and Arm64, with the files served on the runner in place of the release: winget
+  # validates its manifests, installs LimarePDF from them and removes it, then Scoop does the same
+  # (packaging/windows/check-manifests.ps1). A release waits for it.
+  winget-scoop-check:
+    needs: [build, winget-scoop]
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, windows-11-arm]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: limarepdf-windows-*
+          path: dist
+          merge-multiple: true
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: winget-scoop
+          path: manifests
+      - name: Install from the manifests, and remove
+        shell: pwsh
+        run: packaging/windows/check-manifests.ps1 manifests dist
+
   # On a version tag (v0.3.0): a draft GitHub Release with the archives, their checksums,
   # GPG signatures, build attestations and this version's section of CHANGELOG.md.
   # Publish it on GitHub. The release key is only in the release-signing environment, so the
@@ -370,7 +509,7 @@ jobs:
   # stops before anything is signed or attested. It waits for the deny job, so it never
   # starts after a known advisory.
   release:
-    needs: [deny, build, macos-dmg]
+    needs: [deny, build, macos-dmg, linux-install, arch, winget-scoop-check]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     environment: release-signing
@@ -403,8 +542,10 @@ jobs:
             printf '\n**All changes:** https://github.com/%s/compare/%s...%s\n' \
               "$GITHUB_REPOSITORY" "$prev" "$tag" >> notes.md
           fi
+      # The release's files: the artifacts named limarepdf-*.
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
+          pattern: limarepdf-*
           path: assets
           merge-multiple: true
       # The rpm's own signature, SHA256SUMS, and a detached signature (.asc) for it and for every
@@ -433,13 +574,14 @@ jobs:
   # published key must still be able to sign for 60 days. The files themselves get SHA256SUMS
   # only and are uploaded as release-dry-run-unsigned. Like a release, it waits for the deny job.
   dry-run:
-    needs: [deny, build, macos-dmg]
+    needs: [deny, build, macos-dmg, linux-install, arch, winget-scoop-check]
     if: inputs.dry_run && !startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
+          pattern: limarepdf-*
           path: assets
           merge-multiple: true
       - name: The release key's expiry

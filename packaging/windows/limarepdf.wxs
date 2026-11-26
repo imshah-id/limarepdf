@@ -1,18 +1,21 @@
 <!--
   The Windows installer, built in CI with WiX 5 from the repository root:
     wix build packaging/windows/limarepdf.wxs -arch x64 -d Version=<version> -o limarepdf-<version>-x86_64.msi
-  (with -ext WixToolset.UI.wixext -loc packaging/windows/limarepdf.wxl -culture en-US; the .wxl holds the
-  Welcome screen's licence summary and the shortcut option's label), after packaging/package-docs.sh and
-  packaging/package-notices.sh.
+  or, on Arm, -arch arm64 and limarepdf-<version>-arm64.msi (with -ext WixToolset.UI.wixext
+  -loc packaging/windows/limarepdf.wxl -culture en-US; the .wxl holds the Welcome screen's licence summary and
+  the shortcut option's label), after packaging/package-docs.sh and packaging/package-notices.sh.
   Installs for all users, by default in Program Files\LimarePDF, with a Start menu shortcut, a desktop
   shortcut if asked for, LimarePDF under "Open with" for PDFs (and in Settings > Default apps), and
   limarepdf-cli.exe on the PATH. The UpgradeCode must never change: it is how a newer LimarePDF replaces
-  an older one.
+  an older one. Both architectures share it, and a LimarePDF of the same version is replaced too, so on Arm,
+  which runs x64 programs as well, the Arm64 installer takes the place of an x64 LimarePDF rather than
+  installing a second one beside it.
 -->
 <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs" xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui">
   <Package Name="LimarePDF" Manufacturer="Clayton Cornell" Version="$(var.Version)"
            UpgradeCode="59D37102-94EF-4ADF-BBC4-BC3B5D763CEB" Scope="perMachine">
-    <MajorUpgrade DowngradeErrorMessage="A newer version of LimarePDF is already installed." />
+    <MajorUpgrade AllowSameVersionUpgrades="yes"
+                  DowngradeErrorMessage="A newer version of LimarePDF is already installed." />
     <MediaTemplate EmbedCab="yes" />
 
     <!-- Installer screens: welcome, install folder with the desktop shortcut option, ready, progress,

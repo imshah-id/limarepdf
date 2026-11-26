@@ -145,11 +145,11 @@ assets = [
 ]
 
 # Library sonames rather than package names, so the same rpm works on Fedora and openSUSE.
-# The GLIBC_ entry is the newest glibc version the binaries use (built on ubuntu-latest); CI
-# fails if it differs from what they use.
+# The GLIBC_ entry is the newest glibc version the binaries use (built on ubuntu-24.04), the
+# floor docs/install.md names; CI fails if it differs from what they use.
 [package.metadata.generate-rpm.requires]
 "libc.so.6()(64bit)" = "*"
-"libc.so.6(GLIBC_2.43)(64bit)" = "*"
+"libc.so.6(GLIBC_2.39)(64bit)" = "*"
 "libm.so.6()(64bit)" = "*"
 "libgcc_s.so.1()(64bit)" = "*"
 "libdbus-1.so.3()(64bit)" = "*"

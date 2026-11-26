@@ -38,8 +38,8 @@ impl Pdf {
 
     /// A new document with `text` set in 11-point Helvetica on pages of `size` (width and
     /// height in points), wrapped within the margins, or in its embedded face when the text
-    /// needs it. Line breaks are kept. Characters neither can write (beyond Latin, Greek
-    /// and Cyrillic) come out as `?`.
+    /// needs it, a character neither has in an installed font that has it (`layout.rs`'s
+    /// fallbacks). Line breaks are kept. Characters no font can write come out as `?`.
     pub fn from_text(text: &str, size: (f32, f32)) -> Result<Pdf> {
         if text.trim().is_empty() {
             bail!("there is no text");

@@ -121,6 +121,9 @@ struct CutFrom {
     tab: u64,
     /// The pages, by object, as they were cut.
     pages: Vec<(u32, u16)>,
+    /// The tab's name, and its history ([`Tab::history`]) as they were copied out of it.
+    name: String,
+    history: (u64, usize, usize),
 }
 
 /// Pages copied to paste in any tab (PF-48): a document of them, as Extract makes, kept
@@ -767,6 +770,9 @@ const SPLIT_JOB: &str = "Split into files";
 
 /// Title of Replace all's review and messages (NEW-04b).
 const REPLACE_ALL: &str = "Replace all";
+
+/// Said when something is pasted while a task is under way.
+const PASTE_WAITS: &str = "Paste waits until the task under way finishes";
 
 /// Ends what a job wrote, printed or failed with when its tab was closed meanwhile (PB-87).
 fn closed_meanwhile(name: &str) -> String {
@@ -1775,14 +1781,19 @@ impl App {
         if let Some(dir) = t.path.as_ref().and_then(|p| p.parent()) {
             d = d.set_directory(dir);
         }
-        let Some(mut out) = Self::save_as(d) else {
+        let Some(chosen) = Self::save_as(d) else {
             return;
         };
-        if out.extension().is_none() {
-            out.set_extension("pdf");
-        }
-        // Never over another tab's file or one being written (S1-03), nor over this tab's
-        // own when something else changed it since (BUG-06).
+        // Never over a file the chooser didn't ask about (PB-205), another tab's file or one
+        // being written (S1-03), nor over this tab's own when something else changed it
+        // since (BUG-06).
+        let out = match Self::with_extension(chosen, "pdf") {
+            Ok(out) => out,
+            Err(why) => {
+                w.error = Some(why);
+                return;
+            }
+        };
         if let Some((_, why)) = self.conflict(&out, w.tab, true) {
             w.error = Some(why);
             return;
@@ -2641,15 +2652,23 @@ impl App {
         if let Some(dir) = Self::start_folder(Some(t), self.settings.folder.as_deref()) {
             d = d.set_directory(dir);
         }
-        let Some(mut path) = Self::save_as(d) else {
+        let Some(chosen) = Self::save_as(d) else {
             return;
         };
-        // The kind's own extension, added to a name without it.
-        let given = path.extension().map(|e| e.to_string_lossy().to_lowercase());
+        // The kind's own extension, added to a name without it, never over a file the
+        // chooser didn't ask about (PB-205).
+        let given = chosen
+            .extension()
+            .map(|e| e.to_string_lossy().to_lowercase());
+        let mut path = chosen.clone();
         if !given.is_some_and(|e| kinds.contains(&e.as_str())) {
             let mut named = path.into_os_string();
             named.push(format!(".{ext}"));
             path = named.into();
+        }
+        if let Some(why) = Self::added_name_taken(&chosen, &path) {
+            self.dialog = Dialog::Message("Already there".into(), why);
+            return;
         }
         self.spawn_job(ctx, "Save image as", vec![path.clone()], move |p| {
             let (_, bytes) = p.picture_file(page, id)?;
@@ -2757,16 +2776,20 @@ impl App {
             );
             return;
         }
-        let Some(mut path) = Self::save_as(
+        let Some(chosen) = Self::save_as(
             rfd::FileDialog::new()
                 .add_filter("Text", &["txt"])
                 .set_file_name(format!("{}.txt", t.stem("document"))),
         ) else {
             return;
         };
-        if path.extension().is_none() {
-            path.set_extension("txt");
-        }
+        let path = match Self::with_extension(chosen, "txt") {
+            Ok(path) => path,
+            Err(why) => {
+                self.dialog = Dialog::Message("Already there".into(), why);
+                return;
+            }
+        };
         if let Some((title, why)) = self.conflict(&path, self.tabs[self.active].id, false) {
             self.dialog = Dialog::Message(title.into(), why);
             return;
@@ -2793,16 +2816,20 @@ impl App {
             dlg::Layout::TextFile => ("Text", "txt"),
             _ => ("PDF", "pdf"),
         };
-        let Some(mut path) = Self::save_as(
+        let Some(chosen) = Self::save_as(
             rfd::FileDialog::new()
                 .add_filter(filter, &[ext])
                 .set_file_name(format!("{} (selection).{ext}", t.stem("document"))),
         ) else {
             return;
         };
-        if path.extension().is_none() {
-            path.set_extension(ext);
-        }
+        let path = match Self::with_extension(chosen, ext) {
+            Ok(path) => path,
+            Err(why) => {
+                self.dialog = Dialog::Message("Already there".into(), why);
+                return;
+            }
+        };
         if let Some((title, why)) = self.conflict(&path, self.tabs[self.active].id, false) {
             self.dialog = Dialog::Message(title.into(), why);
             return;
@@ -2940,11 +2967,16 @@ impl App {
     }
 
     /// Where to save the tab: its file, or one the user picks (for Save as, or a document
-    /// with no file yet).
-    fn save_path(tab: &Tab, as_new: bool, folder: Option<&Path>) -> Option<PathBuf> {
+    /// with no file yet); `Err`, saying why, for a name picked that the added extension
+    /// makes one already there ([`Self::with_extension`]).
+    fn save_path(
+        tab: &Tab,
+        as_new: bool,
+        folder: Option<&Path>,
+    ) -> Option<Result<PathBuf, String>> {
         if !as_new {
             if let Some(p) = &tab.path {
-                return Some(p.clone());
+                return Some(Ok(p.clone()));
             }
         }
         let mut d = Self::pdf_dialog();
@@ -2956,11 +2988,7 @@ impl App {
         if let Some(dir) = Self::start_folder(Some(tab), folder) {
             d = d.set_directory(dir);
         }
-        let mut p = Self::save_as(d)?;
-        if p.extension().is_none() {
-            p.set_extension("pdf");
-        }
-        Some(p)
+        Self::save_as(d).map(|p| Self::with_extension(p, "pdf"))
     }
 
     /// The folder a file chooser starts in, as word processors start Save As: beside the
@@ -2992,6 +3020,39 @@ impl App {
         tests::SAVE_AS.with(std::cell::Cell::take)
     }
 
+    /// The file to write for `chosen`, picked in a save chooser: with `.{ext}` added to a
+    /// name without an extension. `Err`, saying why, when that adds a name already there
+    /// ([`Self::added_name_taken`]).
+    pub(crate) fn with_extension(chosen: PathBuf, ext: &str) -> Result<PathBuf, String> {
+        if chosen.extension().is_some() {
+            return Ok(chosen);
+        }
+        let path = chosen.with_extension(ext);
+        match Self::added_name_taken(&chosen, &path) {
+            Some(why) => Err(why),
+            None => Ok(path),
+        }
+    }
+
+    /// Why nothing is written to `path`, the file `chosen` in a save chooser with an
+    /// extension added after it: something is there, a link too, and the chooser asked
+    /// about replacing `chosen` alone (PB-205). Choosing that name itself replaces it.
+    pub(crate) fn added_name_taken(chosen: &Path, path: &Path) -> Option<String> {
+        if chosen == path || std::fs::symlink_metadata(path).is_err() {
+            return None;
+        }
+        let name = path
+            .file_name()
+            .unwrap_or(path.as_os_str())
+            .to_string_lossy();
+        let ext = path.extension().unwrap_or_default().to_string_lossy();
+        Some(format!(
+            "\"{name}\" is already there, and the file chooser didn't ask about replacing it: \
+             LimarePDF added \".{ext}\" to the name chosen. Choose \"{name}\" itself to replace \
+             it, or choose another name. Nothing was saved."
+        ))
+    }
+
     /// The file the user picks to open in the chooser `d`, if any.
     #[cfg(not(test))]
     fn pick_file(d: rfd::FileDialog) -> Option<PathBuf> {
@@ -3005,12 +3066,19 @@ impl App {
     }
 
     /// Where to save the active tab (see [`Self::save_path`]), with the version of the file
-    /// there the save may replace (see [`Self::stale`]); `None`, saying why, for a file open
-    /// in another tab or being written (S1-03), or one another app or tab changed since this
-    /// tab last read or saved it, until the user says to replace it (BUG-06).
+    /// there the save may replace (see [`Self::stale`]); `None`, saying why, for a name
+    /// whose added extension makes one already there (PB-205), a file open in another tab or
+    /// being written (S1-03), or one another app or tab changed since this tab last read or
+    /// saved it, until the user says to replace it (BUG-06).
     fn save_target(&mut self, as_new: bool) -> Option<(PathBuf, Option<disk::Version>)> {
         let t = self.tabs.get(self.active)?;
-        let path = Self::save_path(t, as_new, self.settings.folder.as_deref())?;
+        let path = match Self::save_path(t, as_new, self.settings.folder.as_deref())? {
+            Ok(path) => path,
+            Err(why) => {
+                self.dialog = Dialog::Message("Already there".into(), why);
+                return None;
+            }
+        };
         if let Some((title, why)) = self.conflict(&path, t.id, true) {
             self.dialog = Dialog::Message(title.into(), why);
             return None;
@@ -4680,9 +4748,13 @@ impl App {
     }
 
     /// Copies the pages selected in the tab in front (PF-48): a document of them is kept to
-    /// paste in any tab, and the system's clipboard gets their names, as Cut gives it.
+    /// paste in any tab, and the system's clipboard gets their names, as Cut gives it. What
+    /// is typed but not yet kept, such as a draft reply, is kept first, as Cut keeps it.
     fn copy_pages(&mut self, ctx: &egui::Context) {
         let t = &mut self.tabs[self.active];
+        if !t.keep_typing(ctx) {
+            return;
+        }
         let chosen: Vec<usize> =
             (t.ed.selection.pages()).map_or(Vec::new(), |s| s.iter().copied().collect());
         let doc = match t.pdf.extract(&chosen) {
@@ -4723,22 +4795,40 @@ impl App {
     /// ([`Tab::insert_at`]), in one step, selected (PF-48): pages cut in it move; pages cut
     /// in another tab are added, then taken out of their own, as text cut in one document
     /// and pasted in another moves; pages copied are added, each time. Pages with form
-    /// fields are asked about first, as Append PDFs asks.
+    /// fields are asked about first, as Append PDFs asks. Like the band's Paste, it waits
+    /// for the task under way.
     fn paste_pages(&mut self, ctx: &egui::Context) {
         let i = self.active;
         let t = &mut self.tabs[i];
+        if self.busy {
+            t.info = Some(PASTE_WAITS.into());
+            return;
+        }
         if t.has_cut() {
             if let Some(said) = t.paste_pages(ctx) {
                 t.info = Some(said.into());
             }
             return;
         }
-        let (doc, name, protected, cut_from) = match self.tabs.iter().find(|t| t.has_cut()) {
+        let (doc, name, protected, cut_from) = match self.tabs.iter().position(|t| t.has_cut()) {
             Some(s) => {
+                // What is typed in their tab, not yet kept, goes with them (PB-204): it is
+                // kept first, as before any command that uses the document.
+                let src = &mut self.tabs[s];
+                if !src.keep_typing(ctx) {
+                    let (name, why) = (src.name(), src.error.clone().unwrap_or_default());
+                    self.tabs[i].error = Some(format!(
+                        "Nothing was pasted: what is typed in “{name}” couldn't be kept: {why}"
+                    ));
+                    return;
+                }
+                let s = &self.tabs[s];
                 let pages: Vec<usize> = s.cut_pages().into_iter().collect();
                 let from = CutFrom {
                     tab: s.id,
                     pages: s.cut_ids().to_vec(),
+                    name: s.name(),
+                    history: s.history(),
                 };
                 match s.pdf.extract(&pages) {
                     Ok(doc) => (doc, s.name(), s.is_protected(), Some(from)),
@@ -4779,7 +4869,8 @@ impl App {
 
     /// Takes pages cut in one tab out of it once they are pasted in another (PF-48), in
     /// one step there. When they are all its pages it keeps them, as a document needs at
-    /// least one: the paste was a copy, and the tab in front says so.
+    /// least one: the paste was a copy, and the tab in front says so; and so when they
+    /// can't be taken out, with why.
     fn take_out_cut(&mut self, ctx: &egui::Context, from: Option<CutFrom>) {
         let Some(from) = from else {
             return;
@@ -4801,9 +4892,45 @@ impl App {
             ));
             return;
         }
-        if !pages.is_empty() && src.arrange(ctx, &[], |p| p.delete_pages(&pages)) {
-            self.status = format!("Moved {} from “{name}”.", pages_said(pages.len()));
+        if pages.is_empty() {
+            return;
         }
+        if src.arrange(ctx, &[], |p| p.delete_pages(&pages)) {
+            self.status = format!("Moved {} from “{name}”.", pages_said(pages.len()));
+        } else {
+            // Said where the pages went, not in their tab, behind.
+            let why = src.error.take().unwrap_or_default();
+            self.tabs[self.active].info = Some(format!(
+                "Pasted a copy: the pages couldn't be taken out of “{name}”: {why}"
+            ));
+        }
+    }
+
+    /// Whether the tab pages were cut from is still open and unchanged since they were
+    /// copied out of it to paste ([`CutFrom`]), as [`App::still`] asks of the tab they go
+    /// to. If not, nothing is pasted, and a message says why.
+    fn cut_still(&mut self, from: Option<&CutFrom>) -> bool {
+        let Some(from) = from else {
+            return true;
+        };
+        let found = self.tabs.iter().find(|t| t.id == from.tab);
+        if found.is_some_and(|t| t.history() == from.history) {
+            return true;
+        }
+        let what = if found.is_some() {
+            "changed"
+        } else {
+            "was closed or reloaded"
+        };
+        self.dialog = Dialog::Message(
+            "Nothing was done".into(),
+            format!(
+                "“{}”, where the pages were cut, {what} while the question was open, so \
+                 nothing was pasted. Cut them again if you still want to move them.",
+                from.name
+            ),
+        );
+        false
     }
 
     /// Removes the kinds of hidden information `what` from the active tab, once its
@@ -5944,7 +6071,7 @@ impl App {
                     .file(file),
                 ) {
                     Outcome::Apply => {
-                        if self.still(&q.asked) {
+                        if self.still(&q.asked) && self.cut_still(q.cut_from.as_ref()) {
                             let mut docs = std::mem::take(&mut q.docs);
                             let drawn = docs
                                 .iter_mut()
@@ -6378,7 +6505,7 @@ impl App {
             if t.organising() {
                 t.info = Some("To paste the picture, go back to the page view first".into());
             } else if busy {
-                t.info = Some("Paste waits until the task under way finishes".into());
+                t.info = Some(PASTE_WAITS.into());
             } else {
                 // The clipboard holds one thing: a picture copied after pages replaces them.
                 self.let_go_of_pages();
@@ -11346,9 +11473,13 @@ mod tests {
         let named = |tree: &TreeUpdate, label: &str| {
             tree.nodes.iter().any(|(_, n)| n.label() == Some(label))
         };
+        // The inspector's Bold, the one with a state: the floating bar's is a command.
         let bold = |tree: &TreeUpdate| {
-            let n = tree.nodes.iter().find(|(_, n)| n.label() == Some("Bold"));
-            n.and_then(|(_, n)| n.toggled()) == Some(Toggled::True)
+            let n = tree
+                .nodes
+                .iter()
+                .find(|(_, n)| n.label() == Some("Bold") && n.toggled().is_some());
+            n.expect("the inspector's Bold").1.toggled() == Some(Toggled::True)
         };
         let mut tree = frame(&mut app, vec![]);
         for _ in 0..4 {
@@ -17051,6 +17182,21 @@ mod tests {
     /// The tab's document as it would be saved now, read back from its bytes.
     fn saved_pdf(t: &Tab) -> Pdf {
         Pdf::from_bytes(&t.pdf.clone().snapshot().unwrap(), None).unwrap()
+    }
+
+    /// The text of each page of the file at `path`, as Poppler's `pdftotext` reads it.
+    fn poppler_pages(path: &Path) -> Vec<String> {
+        let out = limarepdf_core::child_seam::output(
+            std::process::Command::new("pdftotext").args([path.as_os_str(), "-".as_ref()]),
+        )
+        .expect("pdftotext (Poppler) installed");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "pdftotext: {err}");
+        // Each page ends with a form feed.
+        let text = String::from_utf8_lossy(&out.stdout);
+        let mut pages: Vec<String> = text.split('\u{c}').map(str::to_string).collect();
+        pages.pop();
+        pages
     }
 
     /// The first page's rotation in the tab's document as it would be saved now.

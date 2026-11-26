@@ -5,12 +5,12 @@
 #   tools/docshots/docshots.sh OUT try FILE STEP...   one run, to find click points: OUT/try.png
 #
 # Build first (`cargo build --release`); B and C name other app and command-line binaries. Needs Xvfb
-# (xvfb-run), xdotool and ImageMagick 7. The made-up report (mkreport.py) goes into OUT/fix. Each run starts
-# its own display, and the app with settings and recovery folders of its own (OUT/cfg-*, removed after):
-# the light theme, LimarePDF's teal, "Pat Example" as the name for comments, and Sam Lee's typed
-# signatures and initials saved. Only the Digital signatures picture has digital IDs (made-up ones, in
-# OUT/signed-cfg). The window is 1000 x 660 points at scale 2 (2000 x 1320 pixels); the guide shows
-# each picture at half its width, so it displays at scale 1's size.
+# (xvfb-run), xdotool and ImageMagick 7. The made-up report and form (mkreport.py) go into OUT/fix. Each
+# run starts its own display, and the app with settings and recovery folders of its own (OUT/cfg-*,
+# removed after): the light theme, LimarePDF's teal, "Pat Example" as the name for comments, and Sam
+# Lee's typed signatures and initials saved. Only the Digital signatures picture has digital IDs
+# (made-up ones, in OUT/signed-cfg). The window is 1000 x 660 points at scale 2 (2000 x 1320 pixels);
+# the guide shows each picture at half its width, so it displays at scale 1's size.
 #
 # Look at each picture before copying it into docs/images: when a control moves, so does its click point
 # (find the new one with `try` and s: steps). The dates the app writes are the computer's.
@@ -40,6 +40,15 @@ mkdir -p "$OUT/fix" "$OUT/raw" "$OUT/cfg/limarepdf"
 python3 -I "$HERE/mkreport.py" "$OUT/fix/field-report.pdf"
 python3 -I "$HERE/mkreport.py" "$OUT/fix/plain.pdf" --plain
 python3 -I "$HERE/mkreport.py" "$OUT/fix/review.pdf" --review
+python3 -I "$HERE/mkreport.py" "$OUT/fix/form.pdf" --form
+# organise.pdf: 12 pages, the plain report, the one with comments, then the plain one twice. form-filled.pdf:
+# the site visit request filled in but for Notes.
+"$C" merge "$OUT/fix/plain.pdf" "$OUT/fix/field-report.pdf" "$OUT/fix/plain.pdf" "$OUT/fix/plain.pdf" \
+  -o "$OUT/fix/organise.pdf" >/dev/null
+"$C" form fill "$OUT/fix/form.pdf" -o "$OUT/fix/form-filled.pdf" --set "name=Pat Example" \
+  --set "organisation=Riverside Field Studies Centre" --set "email=pat@example.org" \
+  --set "station=Station 7 (below the weir)" --set date=2026-11-12 --set visitors=4 --set safety=on \
+  --set samples=on >/dev/null
 printf 'theme = light\naccent_colour = limarepdf\ncomment_name = Pat Example\n' > "$OUT/cfg/limarepdf/settings.txt"
 printf 'signature = type 1 Sam Lee\nsignature = type 4 Sam Lee\ninitials = type 1 SL\n' \
   > "$OUT/cfg/limarepdf/signatures.txt"
@@ -156,10 +165,23 @@ take() {
         p:0.5 c:720,960 p:0.8 c:536,224 p:0.6 c:556,418 p:0.5 c:1030,1135 p:0.8 c:536,224 p:0.6 c:590,606 \
         p:0.5 c:1000,846 p:0.8 c:1950,124 p:0.8 h:1000,40 p:0.5
       crop fill-and-sign 1670x1004+330+228 ;;
+    # The site visit request filled in but for Notes; the form notice closed, Notes clicked and typed into.
+    # The full stop is typed last: the text cursor blinks from the last change, so the picture, about 1.2
+    # seconds later, catches it on.
+    forms)
+      shot "$OUT/raw/forms.png" "$OUT/fix/form-filled.pdf" p:2 c:1503,342 p:1 c:1060,1187 p:0.8 \
+        "t:We will arrive by minibus at about 10:00" p:0.5 h:1000,40 p:0.5 k:period
+      crop forms 1260x968+330+282 ;;
     # The report's "Peak after the August storms" text box selected, its options in the inspector.
     inspector)
       shot "$OUT/raw/inspector.png" "$OUT/fix/field-report.pdf" p:1.5 c:1232,976 p:0.5
       crop inspector 1000x820+1000+282 ;;
+    # Organise pages from the status bar on the 12-page document, the cards a step smaller (four to a row),
+    # and pages 2 and 4 ticked.
+    organise)
+      shot "$OUT/raw/organise.png" "$OUT/fix/organise.pdf" p:2 c:1450,1290 p:1.5 k:ctrl+minus p:1 c:477,794 \
+        p:0.5 c:1173,794 p:0.5 h:1000,40 p:0.5
+      crop organise 1532x970+58+280 ;;
     # Protect; "twelve monitoring stations" selected and Mark redaction > Mark for redaction; then Mark
     # redaction and a box dragged over the header's "Northern Water Survey" (left selected); the toast
     # left to go.
@@ -177,7 +199,7 @@ take() {
   esac
 }
 
-ALL="comments fill-and-sign inspector redaction signatures-panel"
+ALL="comments fill-and-sign forms inspector organise redaction signatures-panel"
 for name in ${@:-$ALL}; do
   take "$name"
   echo "$OUT/$name.png"

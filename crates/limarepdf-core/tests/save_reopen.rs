@@ -24,13 +24,17 @@
 //! [`MEMORY_MB`] of memory on Linux, so a file that takes longer than [`TIMEOUT`] or needs
 //! more memory stops only its own check, and is stopped. Those files, and files
 //! LimarePDF can't open or draw at all, are counted and listed as skipped, not checked:
-//! `render_compare.rs` covers them. Every difference is
-//! listed in `target/tmp/save-reopen/index.html`, with pictures of pages that draw differently;
-//! `summary.txt` has one line per file. The counts of files checked, the same, different,
-//! skipped and not downloaded are printed. The test fails on a difference that isn't in
-//! `tools/save-reopen-known.txt` (the known limits: each names a file, the text of its
-//! difference and the reason, so another difference in the same file still fails), and when
-//! it checks nothing or, from [`MIN_FILES`] files, skips more than a tenth of them.
+//! `render_compare.rs` covers them. A page drawn neither before nor after saving can't be
+//! compared: it is listed and counted, and its file is `undrawn` in summary.txt, not
+//! different. Every difference is listed in `target/tmp/save-reopen/index.html`, with
+//! pictures of pages that draw differently, with every page not drawn and, for a signed file,
+//! each save that wrote the whole file instead of adding a revision; `summary.txt` has one
+//! line per file. The counts of files checked, the same, different, skipped and not
+//! downloaded, of pages compared and not drawn, and of signed files written whole are printed.
+//! The test fails on a difference that isn't in `tools/save-reopen-known.txt` (the known
+//! limits: each names a file, the text of its difference and the reason, so another
+//! difference in the same file still fails), and when it compares no page or, from
+//! [`MIN_FILES`] files, more than a tenth of them are skipped or have no page compared.
 //! `SAVE_REOPEN_ONLY` limits the run to files whose name contains it.
 
 mod common;
@@ -71,10 +75,31 @@ struct Finding {
     picture: Option<String>,
 }
 
+/// A page drawn neither before nor after saving, so not compared.
+struct Undrawn {
+    check: &'static str,
+    page: usize,
+    why: String,
+}
+
+/// How a signed document's save added a revision; any other way says why.
+const APPENDED: &str = "a revision added";
+
+/// What checking a file found.
+#[derive(Default)]
+struct Checked {
+    found: Vec<Finding>,
+    undrawn: Vec<Undrawn>,
+    /// Pages drawn before and after saving and compared, in both checks.
+    compared: usize,
+    /// A signed document's saves: each check's, and how it saved.
+    signed: Vec<(&'static str, String)>,
+}
+
 enum Outcome {
     /// Not checked, and why.
     Skipped(String),
-    Checked(Vec<Finding>),
+    Checked(Checked),
 }
 
 /// Runs `f`, turning a panic into an error naming `step`.
@@ -107,14 +132,20 @@ fn draw(p: &mut Pdf, first: usize, last: usize, scale: f32) -> Result<Vec<(usize
 
 /// `p` saved as the app saves it: a signed document by adding its edits after `original`,
 /// unless it was repaired or that can't be done, and then, as any other document, by writing
-/// the whole file.
-fn save(p: &mut Pdf, original: &[u8], signed: bool) -> Result<Vec<u8>, String> {
-    if signed && !p.repaired() {
-        if let Ok(a) = append_edits(original, p) {
-            return Ok(a.bytes);
+/// the whole file. For a signed document, also how it was saved.
+fn save(p: &mut Pdf, original: &[u8], signed: bool) -> Result<(Vec<u8>, Option<String>), String> {
+    let how = if !signed {
+        None
+    } else if p.repaired() {
+        Some("written whole: it was repaired".to_string())
+    } else {
+        match append_edits(original, p) {
+            Ok(a) => return Ok((a.bytes, Some(APPENDED.into()))),
+            Err(e) => Some(format!("written whole: adding a revision fails: {e:#}")),
         }
-    }
-    p.to_bytes().map_err(|e| format!("{e:#}"))
+    };
+    let bytes = p.to_bytes().map_err(|e| format!("{e:#}"))?;
+    Ok((bytes, how))
 }
 
 /// The saved copy opened again, which must need no repair.
@@ -126,7 +157,8 @@ fn reopen(bytes: &[u8]) -> Result<Pdf, String> {
     Ok(p)
 }
 
-/// The differences between `before` and `after`, drawn, for the pages `which` picks.
+/// The differences between `before` and `after`, drawn, for the pages `which` picks, added to
+/// `c` with the pages compared and those drawn neither time.
 fn compare_pages(
     s: &Sample,
     check: &'static str,
@@ -134,10 +166,10 @@ fn compare_pages(
     after: &[(usize, Drawn)],
     which: impl Fn(usize) -> bool,
     out: &Path,
-) -> Vec<Finding> {
-    let mut found = Vec::new();
+    c: &mut Checked,
+) {
     let mut add = |what: String, picture| {
-        found.push(Finding {
+        c.found.push(Finding {
             check,
             what,
             picture,
@@ -151,13 +183,22 @@ fn compare_pages(
     }
     for ((n, a), (_, b)) in before.iter().zip(after).filter(|((n, _), _)| which(*n)) {
         match (a, b) {
-            (Drawn::Failed(_), Drawn::Failed(_)) => {}
+            (Drawn::Failed(a), Drawn::Failed(b)) => c.undrawn.push(Undrawn {
+                check,
+                page: *n,
+                why: if a == b {
+                    a.clone()
+                } else {
+                    format!("before: {a}; after: {b}")
+                },
+            }),
             (Drawn::Failed(e), Drawn::Ok(_)) => add(
                 format!("page {n} drew only after saving (before: {e})"),
                 None,
             ),
             (Drawn::Ok(_), Drawn::Failed(e)) => add(format!("page {n} no longer draws: {e}"), None),
             (Drawn::Ok(a), Drawn::Ok(b)) => {
+                c.compared += 1;
                 if (a.width, a.height) != (b.width, b.height) {
                     add(
                         format!(
@@ -183,12 +224,11 @@ fn compare_pages(
             }
         }
     }
-    found
 }
 
-/// Both checks of one file, on the calling thread.
-fn check(s: &Sample, out: &Path, scale: f32) -> Outcome {
-    let original = match std::fs::read(s.path()) {
+/// Both checks of the file at `path`, `s`, on the calling thread.
+fn check(s: &Sample, path: &Path, out: &Path, scale: f32) -> Outcome {
+    let original = match std::fs::read(path) {
         Ok(b) => b,
         Err(e) => return Outcome::Skipped(format!("can't be read: {e}")),
     };
@@ -212,7 +252,7 @@ fn check(s: &Sample, out: &Path, scale: f32) -> Outcome {
         Ok(f) => f,
         Err(e) => return Outcome::Skipped(format!("LimarePDF can't read it: {e}")),
     };
-    let mut found = Vec::new();
+    let mut c = Checked::default();
     let failed = |check, what| Finding {
         check,
         what,
@@ -221,28 +261,22 @@ fn check(s: &Sample, out: &Path, scale: f32) -> Outcome {
 
     // 1. Saved unchanged.
     let unchanged = guarded("saving unchanged", || {
-        let saved =
+        let (saved, how) =
             save(&mut base.clone(), &original, signed).map_err(|e| format!("saving fails: {e}"))?;
         let mut again = reopen(&saved).map_err(|e| format!("the saved copy: {e}"))?;
         let drawn = draw(&mut again, s.first, s.last, scale)
             .map_err(|e| format!("the saved copy can't be drawn: {e}"))?;
-        Ok((Facts::of(&again), drawn))
+        Ok((Facts::of(&again), drawn, how))
     });
     match unchanged {
-        Ok((facts, drawn)) => {
+        Ok((facts, drawn, how)) => {
+            c.signed.extend(how.map(|h| ("unchanged", h)));
             for d in base_facts.differences(&facts) {
-                found.push(failed("unchanged", d));
+                c.found.push(failed("unchanged", d));
             }
-            found.extend(compare_pages(
-                s,
-                "unchanged",
-                &base_drawn,
-                &drawn,
-                |_| true,
-                out,
-            ));
+            compare_pages(s, "unchanged", &base_drawn, &drawn, |_| true, out, &mut c);
         }
-        Err(e) => found.push(failed("unchanged", e)),
+        Err(e) => c.found.push(failed("unchanged", e)),
     }
 
     // 2. Page 1 turned and a comment added.
@@ -254,7 +288,8 @@ fn check(s: &Sample, out: &Path, scale: f32) -> Outcome {
             .map_err(|e| format!("adding a comment fails: {e:#}"))?;
         let facts = Facts::of(&p);
         let drawn = draw(&mut p, s.first, s.last, scale)?;
-        let saved = save(&mut p, &original, signed).map_err(|e| format!("saving fails: {e}"))?;
+        let (saved, how) =
+            save(&mut p, &original, signed).map_err(|e| format!("saving fails: {e}"))?;
         let mut again = reopen(&saved).map_err(|e| format!("the saved copy: {e}"))?;
         let turned = match (base.page_size(0), again.page_size(0)) {
             (Ok((w, h)), Ok(after)) => (w - after.1).abs() < 0.01 && (h - after.0).abs() < 0.01,
@@ -265,45 +300,48 @@ fn check(s: &Sample, out: &Path, scale: f32) -> Outcome {
             .is_ok_and(|a| a.iter().any(|a| a.contents == NOTE));
         let again_drawn = draw(&mut again, s.first, s.last, scale)
             .map_err(|e| format!("the saved copy can't be drawn: {e}"))?;
-        Ok((facts, drawn, Facts::of(&again), again_drawn, turned, noted))
+        Ok((
+            facts,
+            drawn,
+            Facts::of(&again),
+            again_drawn,
+            turned,
+            noted,
+            how,
+        ))
     });
     match edited {
-        Ok((facts, drawn, again, again_drawn, turned, noted)) => {
+        Ok((facts, drawn, again, again_drawn, turned, noted, how)) => {
+            c.signed.extend(how.map(|h| ("edited", h)));
             if !turned {
-                found.push(failed(
+                c.found.push(failed(
                     "edited",
                     "page 1 isn't turned in the saved copy".into(),
                 ));
             }
             if !noted {
-                found.push(failed(
+                c.found.push(failed(
                     "edited",
                     "the comment isn't on page 1 in the saved copy".into(),
                 ));
             }
             for d in facts.differences(&again) {
-                found.push(failed("edited", d));
+                c.found.push(failed("edited", d));
             }
-            found.extend(compare_pages(
-                s,
-                "edited",
-                &drawn,
-                &again_drawn,
-                |n| n == 1,
-                out,
-            ));
-            found.extend(compare_pages(
+            compare_pages(s, "edited", &drawn, &again_drawn, |n| n == 1, out, &mut c);
+            compare_pages(
                 s,
                 "edited",
                 &base_drawn,
                 &again_drawn,
                 |n| n > 1,
                 out,
-            ));
+                &mut c,
+            );
         }
-        Err(e) => found.push(failed("edited", e)),
+        Err(e) => c.found.push(failed("edited", e)),
     }
-    Outcome::Checked(found)
+    Outcome::Checked(c)
 }
 
 /// Marks the lines a child process reports its outcome in.
@@ -318,19 +356,69 @@ fn child(name: &str, out: &Path, scale: f32) {
         .find(|s| s.name == name)
         .expect("a listed file");
     let out = out.to_path_buf();
-    let outcome = apart::on_big_stack(move || check(&s, &out, scale))
+    let outcome = apart::on_big_stack(move || check(&s, &s.path(), &out, scale))
         .unwrap_or_else(|| Outcome::Skipped("the check panicked".into()));
-    let line = apart::field;
-    match outcome {
-        Outcome::Skipped(why) => println!("{REPORT}skipped|{}", line(&why)),
-        Outcome::Checked(found) => {
-            for f in found {
-                let picture = f.picture.unwrap_or_default();
-                println!("{REPORT}found|{}|{}|{picture}", f.check, line(&f.what));
+    for l in lines(&outcome) {
+        println!("{REPORT}{l}");
+    }
+}
+
+/// The lines a child process reports `o` in, as [`outcome`] reads them.
+fn lines(o: &Outcome) -> Vec<String> {
+    let field = apart::field;
+    let c = match o {
+        Outcome::Skipped(why) => return vec![format!("skipped|{}", field(why))],
+        Outcome::Checked(c) => c,
+    };
+    let mut l = Vec::new();
+    for f in &c.found {
+        let picture = f.picture.as_deref().unwrap_or_default();
+        l.push(format!("found|{}|{}|{picture}", f.check, field(&f.what)));
+    }
+    for u in &c.undrawn {
+        l.push(format!("undrawn|{}|{}|{}", u.check, u.page, field(&u.why)));
+    }
+    for (check, how) in &c.signed {
+        l.push(format!("signed|{check}|{}", field(how)));
+    }
+    l.push(format!("checked|{}", c.compared));
+    l
+}
+
+/// The outcome a child process reported in `lines`, unless it was stopped first.
+fn outcome<'a>(lines: impl IntoIterator<Item = &'a str>) -> Option<Outcome> {
+    // The check a line names, as `Finding` and `Undrawn` hold it.
+    let named = |check| {
+        if check == "edited" {
+            "edited"
+        } else {
+            "unchanged"
+        }
+    };
+    let mut c = Checked::default();
+    for l in lines {
+        let f: Vec<&str> = l.split('|').collect();
+        match f[..] {
+            ["skipped", why] => return Some(Outcome::Skipped(why.to_string())),
+            ["found", check, what, picture] => c.found.push(Finding {
+                check: named(check),
+                what: what.to_string(),
+                picture: (!picture.is_empty()).then(|| picture.to_string()),
+            }),
+            ["undrawn", check, page, why] => c.undrawn.push(Undrawn {
+                check: named(check),
+                page: page.parse().unwrap_or_default(),
+                why: why.to_string(),
+            }),
+            ["signed", check, how] => c.signed.push((named(check), how.to_string())),
+            ["checked", compared] => {
+                c.compared = compared.parse().unwrap_or_default();
+                return Some(Outcome::Checked(c));
             }
-            println!("{REPORT}checked");
+            _ => {}
         }
     }
+    None
 }
 
 /// Checks `s` in a child process (this test run again for that file alone), so that a file
@@ -348,26 +436,9 @@ fn check_apart(s: &Sample, dpi: u32) -> Outcome {
         }
         apart::Ran::NotStarted(e) => return Outcome::Skipped(format!("no child process: {e}")),
     };
-    let mut found = Vec::new();
-    for l in apart::reports(&text, REPORT) {
-        let f: Vec<&str> = l.split('|').collect();
-        match f[..] {
-            ["skipped", why] => return Outcome::Skipped(why.to_string()),
-            ["found", check, what, picture] => found.push(Finding {
-                check: if check == "edited" {
-                    "edited"
-                } else {
-                    "unchanged"
-                },
-                what: what.to_string(),
-                picture: (!picture.is_empty()).then(|| picture.to_string()),
-            }),
-            ["checked"] => return Outcome::Checked(found),
-            _ => {}
-        }
-    }
     // No outcome: the child was stopped.
-    Outcome::Skipped(apart::why_stopped(status))
+    outcome(apart::reports(&text, REPORT))
+        .unwrap_or_else(|| Outcome::Skipped(apart::why_stopped(status)))
 }
 
 /// A known limit: a file, the text its difference contains, and the reason.
@@ -411,18 +482,113 @@ fn known() -> Vec<Known> {
         .collect()
 }
 
+/// A file's line in summary.txt: `same`, `undrawn` (the same, but for pages drawn neither
+/// before nor after saving), `differs` or `skipped`, its name, and what was found.
+fn summary_line(name: &str, o: &Outcome) -> String {
+    let c = match o {
+        Outcome::Skipped(why) => return format!("skipped   {name}  {why}"),
+        Outcome::Checked(c) => c,
+    };
+    let status = if !c.found.is_empty() {
+        "differs"
+    } else if !c.undrawn.is_empty() {
+        "undrawn"
+    } else {
+        "same"
+    };
+    let mut line = format!("{status:<10}{name}");
+    if !c.found.is_empty() {
+        let all: Vec<String> = c.found.iter().map(said).collect();
+        let _ = write!(line, "  {}", all.join("; "));
+    }
+    if !c.undrawn.is_empty() {
+        let all: Vec<String> = c
+            .undrawn
+            .iter()
+            .map(|u| format!("{}: page {} ({})", u.check, u.page, u.why))
+            .collect();
+        let _ = write!(
+            line,
+            "  not drawn before or after saving: {}",
+            all.join("; ")
+        );
+    }
+    if !c.signed.is_empty() {
+        let all: Vec<String> = c
+            .signed
+            .iter()
+            .map(|(check, how)| format!("{check}: {how}"))
+            .collect();
+        let _ = write!(line, "  signed: {}", all.join("; "));
+    }
+    line
+}
+
+/// What a run found, counted.
+#[derive(Default)]
+struct Counts {
+    checked: usize,
+    same: usize,
+    /// Files the same, but for pages drawn neither before nor after saving.
+    undrawn: usize,
+    differ: usize,
+    skipped: usize,
+    /// Pages drawn before and after saving and compared, in both checks.
+    compared: usize,
+    /// Pages drawn neither before nor after saving, each counted once in its file.
+    pages_undrawn: usize,
+    /// Files checked in which no page was compared.
+    none_compared: usize,
+    signed: usize,
+    /// Signed files a save wrote whole instead of adding a revision.
+    written_whole: usize,
+}
+
+impl Counts {
+    fn of(results: &[(String, Outcome)]) -> Counts {
+        let mut n = Counts::default();
+        for (_, o) in results {
+            let Outcome::Checked(c) = o else {
+                n.skipped += 1;
+                continue;
+            };
+            n.checked += 1;
+            if !c.found.is_empty() {
+                n.differ += 1;
+            } else if !c.undrawn.is_empty() {
+                n.undrawn += 1;
+            } else {
+                n.same += 1;
+            }
+            n.compared += c.compared;
+            let mut pages: Vec<usize> = c.undrawn.iter().map(|u| u.page).collect();
+            pages.sort_unstable();
+            pages.dedup();
+            n.pages_undrawn += pages.len();
+            n.none_compared += usize::from(c.compared == 0);
+            if !c.signed.is_empty() {
+                n.signed += 1;
+                n.written_whole += usize::from(c.signed.iter().any(|(_, how)| how != APPENDED));
+            }
+        }
+        n
+    }
+}
+
 fn escape(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
 }
 
-fn report(results: &[(String, Outcome)], known: &[Known], dpi: u32, missing: usize) -> String {
+fn report(
+    results: &[(String, Outcome)],
+    n: &Counts,
+    known: &[Known],
+    dpi: u32,
+    missing: usize,
+) -> String {
     let mut h = String::new();
-    let checked = results
-        .iter()
-        .filter(|(_, o)| matches!(o, Outcome::Checked(_)))
-        .count();
     let _ = write!(
         h,
         "<!doctype html><meta charset=utf-8><title>Save and reopen</title>\
@@ -430,19 +596,26 @@ fn report(results: &[(String, Outcome)], known: &[Known], dpi: u32, missing: usi
          img{{max-width:100%;border:1px solid #ccc}}section{{margin:24px 0}}\
          h2{{font-size:16px;margin:0 0 4px}}p{{margin:2px 0}}</style>\
          <h1>Saved and opened again</h1>\
-         <p>{checked} of {} files checked at {dpi} dpi, {} skipped (in summary.txt); \
-         {missing} listed files weren't downloaded. Each picture: before saving, after, \
-         differences in red.</p>",
+         <p>{} of {} files checked at {dpi} dpi, {} skipped (in summary.txt); {} pages \
+         compared, {} drawn neither before nor after saving and not compared; {} signed \
+         files, {} of them written whole; {missing} listed files weren't downloaded. Each \
+         picture: before saving, after, differences in red.</p>",
+        n.checked,
         results.len(),
-        results.len() - checked,
+        n.skipped,
+        n.compared,
+        n.pages_undrawn,
+        n.signed,
+        n.written_whole,
     );
     for (name, o) in results {
-        let Outcome::Checked(found) = o else { continue };
-        if found.is_empty() {
+        let Outcome::Checked(c) = o else { continue };
+        let whole: Vec<_> = c.signed.iter().filter(|(_, how)| how != APPENDED).collect();
+        if c.found.is_empty() && c.undrawn.is_empty() && whole.is_empty() {
             continue;
         }
         let _ = write!(h, "<section><h2>{}</h2>", escape(name));
-        for f in found {
+        for f in &c.found {
             let _ = write!(h, "<p>{}: {}</p>", f.check, escape(&f.what));
             if let Some(k) = known.iter().find(|k| k.covers(name, f)) {
                 let _ = write!(h, "<p><em>Known: {}</em></p>", escape(&k.why));
@@ -453,6 +626,18 @@ fn report(results: &[(String, Outcome)], known: &[Known], dpi: u32, missing: usi
                     "<a href=\"pages/{p}\"><img src=\"pages/{p}\" loading=lazy></a>"
                 );
             }
+        }
+        for u in &c.undrawn {
+            let _ = write!(
+                h,
+                "<p>{}: page {} drawn neither before nor after saving, not compared: {}</p>",
+                u.check,
+                u.page,
+                escape(&u.why)
+            );
+        }
+        for (check, how) in whole {
+            let _ = write!(h, "<p>{check}: signed, {}</p>", escape(how));
         }
         h.push_str("</section>");
     }
@@ -499,45 +684,43 @@ fn save_and_reopen_the_corpus() {
     });
     results.sort_by(|a, b| a.0.cmp(&b.0));
 
+    let n = Counts::of(&results);
     let mut summary = String::new();
-    let (mut skipped, mut differ) = (0, 0);
     let (mut unknown, mut seen) = (Vec::new(), vec![false; known.len()]);
     for (name, o) in &results {
-        let line = match o {
-            Outcome::Skipped(why) => {
-                skipped += 1;
-                format!("skipped   {name}  {why}")
-            }
-            Outcome::Checked(found) if found.is_empty() => format!("same      {name}"),
-            Outcome::Checked(found) => {
-                differ += 1;
-                // Each difference is known only if a line of the list names it.
-                for f in found {
-                    match known.iter().position(|k| k.covers(name, f)) {
-                        Some(i) => seen[i] = true,
-                        None => unknown.push(format!("{name}  {}", said(f))),
-                    }
+        if let Outcome::Checked(c) = o {
+            // Each difference is known only if a line of the list names it.
+            for f in &c.found {
+                match known.iter().position(|k| k.covers(name, f)) {
+                    Some(i) => seen[i] = true,
+                    None => unknown.push(format!("{name}  {}", said(f))),
                 }
-                let all: Vec<String> = found.iter().map(said).collect();
-                format!("differs   {name}  {}", all.join("; "))
             }
-        };
-        let _ = writeln!(summary, "{line}");
+        }
+        let _ = writeln!(summary, "{}", summary_line(name, o));
     }
     std::fs::write(out.join("summary.txt"), &summary).unwrap();
     std::fs::write(
         out.join("index.html"),
-        report(&results, &known, dpi, absent.len()),
+        report(&results, &n, &known, dpi, absent.len()),
     )
     .unwrap();
 
-    let checked = results.len() - skipped;
     println!(
-        "{} files in {:.0?}: {} the same, {differ} differ, {skipped} skipped; {} listed files \
-         weren't downloaded; see {}",
+        "{} files in {:.0?}: {} the same, {} the same but for pages drawn neither before nor \
+         after saving, {} differ, {} skipped; {} pages compared, {} drawn neither before nor \
+         after saving; {} signed, {} of them written whole; {} listed files weren't downloaded; \
+         see {}",
         results.len(),
         start.elapsed(),
-        checked - differ,
+        n.same,
+        n.undrawn,
+        n.differ,
+        n.skipped,
+        n.compared,
+        n.pages_undrawn,
+        n.signed,
+        n.written_whole,
         absent.len(),
         out.join("index.html").display()
     );
@@ -565,12 +748,93 @@ fn save_and_reopen_the_corpus() {
         out.join("summary.txt").display(),
         unknown.join("\n")
     );
-    // A run that skips most of its files says little: about 1 in 200 is skipped (files
-    // LimarePDF can't open; summary.txt says why).
+    // A run that skips most of its files, or compares no page in them, says little: about 1
+    // in 200 is skipped (files LimarePDF can't open; summary.txt says why).
+    let unseen = n.skipped + n.none_compared;
     assert!(
-        checked > 0 && (results.len() < MIN_FILES || skipped * 10 <= results.len()),
-        "{skipped} of {} files skipped, too many for the run to count (see {})",
+        n.compared > 0 && (results.len() < MIN_FILES || unseen * 10 <= results.len()),
+        "{} of {} files skipped and {} with no page compared, too many for the run to count \
+         (see {})",
+        n.skipped,
         results.len(),
+        n.none_compared,
         out.join("summary.txt").display()
     );
+}
+
+#[test]
+fn pages_not_drawn_are_counted() {
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("save-reopen-undrawn");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("pages")).unwrap();
+    // Page 2 is 10 million points a side, too large to draw at any scale.
+    let mut p = Pdf::new();
+    p.insert_blank(0, 300.0, 200.0).unwrap();
+    p.insert_blank(1, 300.0, 200.0).unwrap();
+    let page = p.page_ids()[1];
+    p.doc
+        .get_dictionary_mut(page)
+        .unwrap()
+        .set("MediaBox", vec![0.into(), 0.into(), 1e7.into(), 1e7.into()]);
+    let path = dir.join("huge.pdf");
+    std::fs::write(&path, p.to_bytes().unwrap()).unwrap();
+    let scale = 96.0 / 72.0;
+    let sample = |first, last| Sample {
+        name: "huge".into(),
+        first,
+        last,
+        password: None,
+    };
+
+    let o = check(&sample(1, 2), &path, &dir, scale);
+    let Outcome::Checked(c) = &o else {
+        panic!("skipped: {}", summary_line("huge", &o))
+    };
+    let found: Vec<String> = c.found.iter().map(said).collect();
+    assert!(found.is_empty(), "{found:?}");
+    let undrawn: Vec<_> = c.undrawn.iter().map(|u| (u.check, u.page)).collect();
+    assert_eq!(undrawn, [("unchanged", 2), ("edited", 2)]);
+    for u in &c.undrawn {
+        assert!(u.why.contains("too large"), "{}", u.why);
+    }
+    // Page 1, saved unchanged and turned.
+    assert_eq!(c.compared, 2);
+    let line = summary_line("huge", &o);
+    assert!(line.starts_with("undrawn   huge  "), "{line}");
+    // The parent reads the same outcome back from the child's lines.
+    let back = outcome(lines(&o).iter().map(String::as_str)).expect("an outcome");
+    assert_eq!(summary_line("huge", &back), line);
+    let n = Counts::of(&[("huge".into(), o)]);
+    assert_eq!(
+        (
+            n.same,
+            n.undrawn,
+            n.pages_undrawn,
+            n.compared,
+            n.none_compared
+        ),
+        (0, 1, 1, 2, 0)
+    );
+
+    // Only page 2 listed: no page compared, which counts toward the skip limit.
+    let o = check(&sample(2, 2), &path, &dir, scale);
+    let n = Counts::of(&[("huge".into(), o)]);
+    assert_eq!((n.undrawn, n.compared, n.none_compared), (1, 0, 1));
+
+    // A signed file saved by adding a revision, in both checks.
+    let signed =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/signatures/node-signpdf/signed.pdf");
+    let o = check(&sample(1, 1), &signed, &dir, scale);
+    let line = summary_line("signed", &o);
+    assert!(line.starts_with("same      signed  signed: "), "{line}");
+    let Outcome::Checked(c) = &o else {
+        unreachable!()
+    };
+    let appended = APPENDED.to_string();
+    assert_eq!(
+        c.signed,
+        [("unchanged", appended.clone()), ("edited", appended)]
+    );
+    let n = Counts::of(&[("signed".into(), o)]);
+    assert_eq!((n.same, n.signed, n.written_whole), (1, 1, 0));
 }

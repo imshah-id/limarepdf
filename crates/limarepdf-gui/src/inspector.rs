@@ -27,7 +27,7 @@ use crate::spin::Spin;
 use crate::tab::{Side, Stamp, StampForm, Tab};
 use crate::theme;
 use eframe::egui::{self, Ui};
-use limarepdf_core::render::{ImageFormat, MAX_DPI};
+use limarepdf_core::render::{ImageFormat, MAX_DPI, MIN_DPI};
 use limarepdf_core::{
     parse_page_range, Bates, Cipher, Encryption, HeaderFooter, Info, LabelRange, LabelStyle,
     OpenLayout, OpenPanel, Restrictions, ScanMode, ScanOptions, ViewPrefs, Watermark,
@@ -850,7 +850,7 @@ fn tool_ui(ui: &mut Ui, s: Section, f: &mut Forms, p: &Parts) -> Option<Apply> {
             stamp_change(ui, Stamp::HeaderFooter, press, p.hf_behind)
         }
         Section::Ocr => {
-            note(ui, "Pages without text, Latin script only.");
+            note(ui, "Pages without text, in Latin-script languages.");
             range_row(ui, &mut f.ocr);
             let run = egui::Button::new("Recognise");
             ui.add_enabled(!p.busy, run).clicked().then_some(Apply::Ocr)
@@ -1638,7 +1638,7 @@ fn export_ui(ui: &mut Ui, s: &mut Export, busy: bool) -> bool {
         });
         ui.end_row();
         row(ui, "Resolution", |ui| {
-            let dpi = Spin::new(&mut s.dpi, 36.0..=MAX_DPI).suffix(" dpi");
+            let dpi = Spin::new(&mut s.dpi, MIN_DPI..=MAX_DPI).suffix(" dpi");
             ui.add(dpi.name("Resolution"))
         });
         ui.label("JPEG quality");

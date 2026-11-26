@@ -742,7 +742,13 @@ impl Tab {
         let earlier = self.error.take();
         for &piece in pieces {
             while let Some(held) = self.ed.keep(piece) {
+                // A reply sent selects its comment; kept for a command, the selection stays,
+                // as the command may use it (pages copied or cut).
+                let selection = (piece == Typed::Reply).then(|| self.ed.selection.clone());
                 self.apply_actions(ctx);
+                if let Some(selection) = selection {
+                    self.ed.selection = selection;
+                }
                 if self.error.is_some() {
                     self.ed.put_back(held);
                     return false;

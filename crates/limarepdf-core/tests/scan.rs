@@ -755,7 +755,12 @@ fn colour_render(p: &mut Pdf, i: usize, scale: f32) -> RgbImage {
 
 /// Page 1 as poppler shows it (`pdftoppm`, 72 dots an inch).
 fn poppler_render(p: &mut Pdf) -> RgbImage {
-    let page = common::saved::tools::pdftoppm(&p.to_bytes().unwrap());
+    poppler_page(p, 0)
+}
+
+/// Page `i` as poppler shows it (`pdftoppm`, 72 dots an inch).
+fn poppler_page(p: &mut Pdf, i: usize) -> RgbImage {
+    let page = common::saved::tools::pdftoppm_page(&p.to_bytes().unwrap(), i + 1);
     RgbImage::from_raw(page.width as u32, page.height as u32, page.rgb).unwrap()
 }
 
@@ -945,4 +950,173 @@ fn a_cmyk_scan_keeps_its_colours() {
     s.compress().unwrap();
     let (r, delta) = colour_change(&mut p, ScanMode::Color);
     assert!(delta < 4.0, "{r:?}, mean difference {delta:.1}");
+}
+
+// ------------------------------------------------ largest resolution in range (PB-206)
+
+/// A largest resolution outside 10 to 10,000 dpi is refused before anything changes; at the
+/// ends of the range, a scan above it is brought down to it, and its page keeps its size.
+#[test]
+fn a_largest_resolution_out_of_range_is_refused() {
+    let mut p = scanned(DynamicImage::ImageLuma8(photo(600, 400)), 300.0);
+    let before = p.snapshot().unwrap();
+    let never = [
+        0.0,
+        -5.0,
+        f32::NAN,
+        f32::INFINITY,
+        f32::NEG_INFINITY,
+        1e-30,
+        9.9,
+        10_000.5,
+    ];
+    for d in never {
+        let o = ScanOptions {
+            mode: ScanMode::Gray,
+            max_dpi: d,
+            ..opts()
+        };
+        let e = p.optimize_scans(&[0], &o).unwrap_err();
+        assert!(e.to_string().contains("from 10 to 10000 dpi"), "{d}: {e}");
+    }
+    assert_eq!(p.snapshot().unwrap(), before);
+    for (d, width) in [(10.0, 20), (10_000.0, 600)] {
+        let mut p = scanned(DynamicImage::ImageLuma8(photo(600, 400)), 300.0);
+        let o = ScanOptions {
+            mode: ScanMode::Gray,
+            max_dpi: d,
+            ..opts()
+        };
+        optimize(&mut p, &o);
+        assert_eq!(width_on(&p, 0), width, "{d}");
+        assert_eq!(p.page_size(0).unwrap(), (144.0, 96.0), "{d}");
+    }
+}
+
+// ----------------------------------------------- fax scans storing black as 1 (PB-218)
+
+/// [`text_scan`] in black and white, with a black block holding single white pixels and
+/// single black specks below the text: despeckling takes the specks (so the scan is
+/// rewritten though no smaller), and would take the holes were black and white swapped.
+fn fax_text() -> GrayImage {
+    let text = text_scan(0.0);
+    GrayImage::from_fn(text.width(), text.height(), |x, y| {
+        let block = (100..300).contains(&x) && (700..800).contains(&y);
+        let hole = block && x % 20 == 10 && y % 20 == 10;
+        let speck = y == 850 && x % 50 == 25;
+        let ink = text.get_pixel(x, y).0[0] < 128;
+        Luma([if (ink || block || speck) && !hole {
+            0
+        } else {
+            255
+        }])
+    })
+}
+
+/// Add a page showing black-and-white `img` at 288 dpi (so drawn four times the size, the
+/// page matches it pixel for pixel), a Group 4 fax picture of its own. With `black_is_1` it
+/// is stored as some scanners store it (PDFBox's `2779.pdf` among them): the codes for
+/// black and white swapped and `/BlackIs1 true` said, so it shows the same.
+fn add_fax_page(p: &mut Pdf, img: &GrayImage, black_is_1: bool) {
+    use fax::{encoder::Encoder, Color, VecWriter};
+    let (w, h) = img.dimensions();
+    let mut enc = Encoder::new(VecWriter::new());
+    for row in img.rows() {
+        // The code's black is a 0 sample, black in grey; with `/BlackIs1 true` it is a 1.
+        let code = row.map(|q| {
+            if (q.0[0] == 0) != black_is_1 {
+                Color::Black
+            } else {
+                Color::White
+            }
+        });
+        enc.encode_line(code, w).unwrap();
+    }
+    let mut parms = dictionary! { "K" => -1, "Columns" => w as i64, "Rows" => h as i64 };
+    if black_is_1 {
+        parms.set("BlackIs1", true);
+    }
+    let im = p.doc.add_object(Stream::new(
+        dictionary! {
+            "Type" => "XObject", "Subtype" => "Image", "Width" => w as i64, "Height" => h as i64,
+            "ColorSpace" => "DeviceGray", "BitsPerComponent" => 1,
+            "Filter" => "CCITTFaxDecode", "DecodeParms" => parms,
+        },
+        enc.finish().unwrap().finish(),
+    ));
+    let (pw, ph) = (w as f32 / 4.0, h as f32 / 4.0);
+    let i = p.page_count();
+    p.insert_blank(i, pw, ph).unwrap();
+    let page = p.page_ids()[i];
+    let cs = p.doc.add_object(Stream::new(
+        Dictionary::new(),
+        format!("q {pw} 0 0 {ph} 0 0 cm /Im0 Do Q").into_bytes(),
+    ));
+    let d = p.doc.get_dictionary_mut(page).unwrap();
+    d.set("Contents", cs);
+    d.set(
+        "Resources",
+        dictionary! { "XObject" => dictionary! { "Im0" => im } },
+    );
+}
+
+/// Three pages of [`fax_text`]: its black stored as 1, the usual way, and as 1 again.
+fn fax_pages() -> (GrayImage, Pdf) {
+    let img = fax_text();
+    let mut p = Pdf::new();
+    for black_is_1 in [true, false, true] {
+        add_fax_page(&mut p, &img, black_is_1);
+    }
+    (img, p)
+}
+
+/// A fax scan whose black is stored as 1 shows as it did once optimised (as the app and
+/// the command line do it), saved and opened again, as one stored the usual way does; the
+/// page not chosen keeps its picture.
+#[test]
+fn a_fax_scan_shows_as_it_did_whichever_way_its_black_is_stored() {
+    let (img, mut p) = fax_pages();
+    let full = 4.0;
+    for i in 0..3 {
+        let f = differ(&img, &render_page(&mut p, i, full));
+        assert!(
+            f < 0.001,
+            "page {} as made: {:.2}% differ",
+            i + 1,
+            f * 100.0
+        );
+    }
+    let control = image_on(&p, 2);
+    let r = p.optimize_scans(&[0, 1], &ScanOptions::default()).unwrap();
+    for (i, r) in &r {
+        assert_eq!(optimized(r).0, ScanMode::BlackWhite, "page {}", i + 1);
+    }
+    let mut back = Pdf::from_bytes(&p.to_bytes().unwrap(), None).unwrap();
+    for i in 0..3 {
+        let f = differ(&img, &render_page(&mut back, i, full));
+        assert!(f < 0.001, "page {} saved: {:.2}% differ", i + 1, f * 100.0);
+    }
+    assert_eq!(image_on(&back, 2).1, control.1, "page 3's picture changed");
+}
+
+/// Poppler shows the optimised fax scans of
+/// [`a_fax_scan_shows_as_it_did_whichever_way_its_black_is_stored`] as it showed them before,
+/// white with dark text.
+#[test]
+#[ignore = "opt-in: needs poppler"]
+fn poppler_shows_a_fax_scan_as_it_was_whichever_way_its_black_is_stored() {
+    let (_, mut p) = fax_pages();
+    let before: Vec<RgbImage> = (0..3).map(|i| poppler_page(&mut p, i)).collect();
+    p.optimize_scans(&[0, 1], &ScanOptions::default()).unwrap();
+    let mut back = Pdf::from_bytes(&p.to_bytes().unwrap(), None).unwrap();
+    for (i, was) in before.iter().enumerate() {
+        let now = poppler_page(&mut back, i);
+        let light = now.as_raw().iter().map(|&v| v as f32).sum::<f32>() / now.as_raw().len() as f32;
+        let delta = mean_delta(was, &now);
+        assert!(
+            delta < 4.0 && light > 200.0,
+            "page {}: mean difference {delta:.1}, mean brightness {light:.0}",
+            i + 1
+        );
+    }
 }

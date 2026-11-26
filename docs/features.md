@@ -40,7 +40,7 @@ source.
 - **Headers, footers, watermarks and stamps:** page numbers, Bates numbers, DRAFT across every page, and stamps
   such as APPROVED.
 - **Make scans useful:** turn photos and scans into PDFs, straighten and shrink them, and make their text
-  searchable and copyable with built-in text recognition (for languages written in the Latin alphabet).
+  searchable and copyable with built-in text recognition (languages written in Latin letters, accents included).
 - **Redact for good:** remove text, pictures and drawings for real, not just cover them up, and strip hidden
   information such as metadata, scripts and attachments before you share a document.
 - **Protect documents:** add a password and choose what others may do with a document, or open a protected one.

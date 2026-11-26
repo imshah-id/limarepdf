@@ -1356,6 +1356,334 @@ fn pages_with_form_fields_are_asked_about_when_pasted() {
     assert!(t.pdf.form_fields().is_empty(), "the fields came too");
 }
 
+/// PB-204's move: the first of the pages "Seal one" and "Seal two" cut, new text "Walrus"
+/// typed on it and left open, then a tab of "Otter one" and "Otter two" opened in front and
+/// Ctrl+V pressed there. Each tab is then saved, the first as `seal.pdf` in `dir`, the
+/// second as `otter.pdf`, the second left in front.
+fn typed_on_and_moved(ctx: &egui::Context, ty: &Typist, dir: &Path) -> App {
+    let mut app = App::with(Settings::from_file(None), Recent::from_file(None));
+    text_tab(&mut app, ctx, &["Seal one", "Seal two"]);
+    app.tabs[0].ed.selection = Selection::pages_from([0].into());
+    copied_by(&mut app, ctx, vec![egui::Event::Cut]);
+    assert_eq!(cut(&app), [0]);
+    let before = app.tabs[0].history();
+    app.act(ctx, Act::Tool(Tool::Text));
+    let (min, k) = ty.page(&mut app);
+    ty.click(&mut app, min + egui::vec2(300.0, 400.0) * k);
+    ty.text(&mut app, "Walrus");
+    let t = &app.tabs[0];
+    assert!(t.ed.typing_id().is_some(), "not being typed");
+    assert_eq!(t.history(), before, "kept already");
+    assert_eq!(cut(&app), [0], "no longer cut");
+    text_tab(&mut app, ctx, &["Otter one", "Otter two"]);
+    ty.pause(&mut app);
+    paste_keys(&mut app, ty);
+    for (i, name) in [(0, "seal.pdf"), (1, "otter.pdf")] {
+        app.active = i;
+        SAVE_AS.with(|s| s.set(Some(dir.join(name))));
+        app.act(ctx, Act::SaveAs);
+        saves_done(&mut app, ctx);
+    }
+    app
+}
+
+/// PB-204: new text typed on a page cut, not yet kept, goes with the page pasted in another
+/// tab: it is kept in its own document first, as before any command that uses it. The page
+/// goes after the page being read there, the other pages as they were; its own tab no longer
+/// has it, and Undo there brings it back with the text. The files saved read the same.
+#[test]
+fn typing_on_a_page_cut_goes_with_it_to_another_tab() {
+    let ctx = test_ctx();
+    let ty = Typist::new(&ctx);
+    let dir = test_dir("cut-typed-on");
+    let mut app = typed_on_and_moved(&ctx, &ty, &dir);
+    fn texts(p: &Pdf) -> Vec<String> {
+        (0..p.page_count()).map(|i| p.page_text(i)).collect()
+    }
+    let read = |name: &str| texts(&Pdf::open(dir.join(name), None).expect(name));
+    let (now, saved) = (texts(&app.tabs[1].pdf), read("otter.pdf"));
+    for (when, otter) in [("now", now), ("saved", saved)] {
+        assert_eq!(otter.len(), 3, "{when}: {otter:?}");
+        let moved = otter[1].contains("Seal one") && otter[1].contains("Walrus");
+        assert!(moved, "{when}: moved without the typing: {otter:?}");
+        let others = otter[0].contains("Otter one") && otter[2].contains("Otter two");
+        assert!(others, "{when}: {otter:?}");
+        let once = otter.iter().filter(|p| p.contains("Walrus")).count() == 1;
+        assert!(once, "{when}: {otter:?}");
+    }
+    let (now, saved) = (texts(&app.tabs[0].pdf), read("seal.pdf"));
+    for (when, seal) in [("now", now), ("saved", saved)] {
+        assert_eq!(seal.len(), 1, "{when}: {seal:?}");
+        assert!(seal[0].contains("Seal two"), "{when}: {seal:?}");
+        assert!(!seal[0].contains("Walrus"), "{when}: {seal:?}");
+    }
+    app.active = 0;
+    assert_eq!(cut(&app), [0usize; 0], "still cut");
+    app.act(&ctx, Act::Undo);
+    let seal = texts(&app.tabs[0].pdf);
+    assert_eq!(seal.len(), 2, "Undo: {seal:?}");
+    let back = seal[0].contains("Seal one") && seal[0].contains("Walrus");
+    assert!(back, "Undo: {seal:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// PB-204, read by Poppler: the files [`typed_on_and_moved`] saves. Opt-in: `cargo test -p
+/// limarepdf-gui --bin limarepdf -- --ignored cross_check`.
+#[test]
+#[ignore]
+fn cross_check_typing_moved_with_its_page_with_poppler() {
+    let ctx = test_ctx();
+    let ty = Typist::new(&ctx);
+    let dir = test_dir("cut-typed-on-poppler");
+    typed_on_and_moved(&ctx, &ty, &dir);
+    let otter = poppler_pages(&dir.join("otter.pdf"));
+    assert_eq!(otter.len(), 3, "{otter:?}");
+    let moved = otter[1].contains("Seal one") && otter[1].contains("Walrus");
+    assert!(moved, "the page moved without the typing: {otter:?}");
+    let others = otter[0].contains("Otter one") && otter[2].contains("Otter two");
+    let alone = !otter[0].contains("Walrus") && !otter[2].contains("Walrus");
+    assert!(others && alone, "{otter:?}");
+    let seal = poppler_pages(&dir.join("seal.pdf"));
+    assert_eq!(seal.len(), 1, "{seal:?}");
+    let kept = seal[0].contains("Seal two") && !seal[0].contains("Walrus");
+    assert!(kept, "{seal:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A tab of two pages, 500 and 501 points wide, with a comment on the first, its reply
+/// "Walrus draft" typed and left as a draft, and then page `selected` selected.
+fn draft_left(ctx: &egui::Context, selected: usize) -> App {
+    let mut app = App::with(Settings::from_file(None), Recent::from_file(None));
+    let mut pdf = Pdf::new();
+    for i in 0..2 {
+        pdf.insert_blank(i, 500.0 + i as f32, 600.0).unwrap();
+    }
+    let yellow = [1.0, 1.0, 0.0];
+    let id = (pdf.add_note(0, (100.0, 100.0), yellow, "Walrus one", "Tester")).unwrap();
+    assert!(app.add_tab(ctx, pdf, None, None, false));
+    app.tabs[0].ed.selection = Selection::Annot { page: 0, id };
+    settle(&mut app, ctx);
+    click_named(&mut app, ctx, "Reply");
+    let typed = vec![egui::Event::Text("Walrus draft".into())];
+    window(&mut app, ctx, 1400.0, typed);
+    app.tabs[0].ed.selection = Selection::pages_from([selected].into());
+    settle(&mut app, ctx);
+    assert!(app.tabs[0].ed.pending(), "no draft");
+    app
+}
+
+/// The replies in `pdf`.
+fn replies(pdf: &Pdf) -> Vec<String> {
+    let all = pdf.annotations();
+    let notes = all.into_iter().filter(|a| a.reply_to.is_some());
+    notes.map(|a| a.contents).collect()
+}
+
+/// A reply written to a comment and left as a draft, then the comment's page selected and
+/// copied or cut: the reply is kept in its document first, the page still selected, and the
+/// page pasted in another tab has it, once. Before, Copy didn't keep it, and keeping it for
+/// Cut selected the comment instead, so nothing was cut.
+#[test]
+fn a_reply_left_as_a_draft_goes_with_its_page_copied_or_cut() {
+    let ctx = test_ctx();
+    let ty = Typist::new(&ctx);
+    for (key, cut_it) in [(egui::Event::Copy, false), (egui::Event::Cut, true)] {
+        let mut app = draft_left(&ctx, 0);
+        let page = app.tabs[0].ed.selection.clone();
+        copied_by(&mut app, &ctx, vec![key.clone()]);
+        let t = &app.tabs[0];
+        assert_eq!(replies(&t.pdf), ["Walrus draft"], "{key:?}: not kept");
+        assert_eq!(t.ed.selection, page, "{key:?}: the page no longer selected");
+        let held = match cut_it {
+            true => cut(&app).len(),
+            false => (app.copied_pages.as_ref()).map_or(0, |c| c.doc.page_count()),
+        };
+        assert_eq!(held, 1, "{key:?}: nothing to paste");
+        text_tab(&mut app, &ctx, &["Otter one"]);
+        ty.pause(&mut app);
+        paste_keys(&mut app, &ty);
+        let otter = &app.tabs[1];
+        assert_eq!(otter.page_count(), 2, "{key:?}: not pasted");
+        let got = replies(&otter.pdf);
+        assert_eq!(got, ["Walrus draft"], "{key:?}: pasted without it");
+        let seal = &app.tabs[0];
+        let left: Vec<String> = match cut_it {
+            true => vec![],
+            false => vec!["Walrus draft".into()],
+        };
+        let want = (2 - usize::from(cut_it), left);
+        assert_eq!((seal.page_count(), replies(&seal.pdf)), want, "{key:?}");
+    }
+}
+
+/// A reply left as a draft on the first page's comment, the second page selected, then
+/// Pages > Delete: the reply is kept first and the second page deleted. Before, keeping the
+/// reply selected its comment, and the page in view, the first, was deleted instead.
+#[test]
+fn a_reply_left_as_a_draft_leaves_the_pages_selected_to_delete() {
+    let ctx = test_ctx();
+    let mut app = draft_left(&ctx, 1);
+    app.act(&ctx, Act::Delete);
+    settle(&mut app, &ctx);
+    let t = &app.tabs[0];
+    assert_eq!(t.page_count(), 1, "nothing deleted");
+    assert_eq!(t.sizes[0].0, 500.0, "the page in view deleted");
+    assert_eq!(replies(&t.pdf), ["Walrus draft"], "not kept");
+}
+
+/// Ctrl+V waits for the task under way to paste pages, as the band's Paste (greyed then) and
+/// a picture pasted do: nothing is pasted or taken out, and it says why. Once the task has
+/// ended, Ctrl+V moves them.
+#[test]
+fn ctrl_v_pastes_pages_once_the_task_under_way_ends() {
+    let ctx = test_ctx();
+    let ty = Typist::new(&ctx);
+    let mut app = grid_tab(&ctx, 3);
+    app.tabs[0].ed.selection = Selection::pages_from([0].into());
+    copied_by(&mut app, &ctx, vec![egui::Event::Cut]);
+    text_tab(&mut app, &ctx, &["Otter one", "Otter two"]);
+    let (go, gate) = channel();
+    app.job_gate = Some(gate);
+    app.act(&ctx, Act::RemoveBlank);
+    assert!(app.busy, "no task under way");
+    paste_keys(&mut app, &ty);
+    assert_eq!(app.tabs[1].page_count(), 2, "pasted while the task ran");
+    let said = toast(&app).expect("nothing said");
+    let waits = "Paste waits until the task under way finishes";
+    assert!(said.contains(waits), "{said}");
+    assert_eq!(app.tabs[0].cut_pages().len(), 1, "no longer cut");
+    go.send(()).unwrap();
+    wait_for(&mut app, &ctx, |a| !a.busy);
+    app.dialog = Dialog::None;
+    paste_keys(&mut app, &ty);
+    assert_eq!(app.tabs[1].page_count(), 3, "not pasted once it ended");
+    assert_eq!(app.tabs[0].page_count(), 2, "not taken out");
+}
+
+/// Pages with form fields cut in one tab and pasted in another are asked about first. When
+/// the tab they were cut from is read again from its file while the question is open, the
+/// pages asked about are no longer its own: the answer pastes nothing, and says why.
+#[test]
+fn pages_asked_about_are_not_pasted_once_their_tab_is_read_again() {
+    let ctx = test_ctx();
+    let ty = Typist::new(&ctx);
+    let mut app = App::with(Settings::from_file(None), Recent::from_file(None));
+    let dir = test_dir("cut-read-again");
+    let file = dir.join("form.pdf");
+    let mut form = form_doc(&[("Name", 1)]);
+    form.insert_blank(1, 612.0, 792.0).unwrap();
+    std::fs::write(&file, form.clone().snapshot().unwrap()).unwrap();
+    assert!(app.add_tab(&ctx, form, None, None, false));
+    app.tabs[0].path = Some(file.clone());
+    app.tabs[0].ed.selection = Selection::pages_from([0].into());
+    copied_by(&mut app, &ctx, vec![egui::Event::Cut]);
+    // What Reload records as it starts reading the file (`App::reload`).
+    let into = Some((app.tabs[0].id, app.tabs[0].revision));
+    text_tab(&mut app, &ctx, &["Otter one"]);
+    paste_keys(&mut app, &ty);
+    assert!(
+        matches!(app.dialog, Dialog::ConfirmAppendForms(_)),
+        "not asked"
+    );
+    let pdf = Pdf::from_bytes(&std::fs::read(&file).unwrap(), None).unwrap();
+    let (path, version) = (file.clone(), disk::version(&file).unwrap());
+    let read = Loaded::Ok {
+        path,
+        pdf,
+        page: None,
+        signed: None,
+        version,
+        into,
+    };
+    app.tx.send(read).unwrap();
+    app.poll_loads(&ctx);
+    fn named<'a>(app: &'a App, name: &str) -> &'a Tab {
+        app.tabs.iter().find(|t| t.name() == name).expect(name)
+    }
+    let form = named(&app, "form.pdf");
+    assert_ne!(Some((form.id, form.revision)), into, "not read again");
+    click(&mut app, &ctx, "Add pages");
+    assert_eq!(named(&app, "Untitled").page_count(), 1, "pasted");
+    assert_eq!(named(&app, "form.pdf").page_count(), 2, "taken out");
+    let (title, text) = message(&app);
+    assert_eq!(title, "Nothing was done", "{text}");
+    assert!(text.contains("“form.pdf”"), "{text}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Pages "Seal one" and "Seal two" sharing their resources, the first drawing a form that
+/// can't be read, the second a form only it draws: the second can be copied out, but not
+/// removed, as the form that can't be read may draw what it drew.
+fn removal_refused() -> Pdf {
+    use lopdf::{dictionary, Object, Stream};
+    let mut p = Pdf::new();
+    for i in 0..2 {
+        p.insert_blank(i, 612.0, 792.0).unwrap();
+    }
+    let font = p.doc.add_object(dictionary! {
+        "Type" => "Font", "Subtype" => "Type1", "BaseFont" => "Helvetica",
+        "Encoding" => "WinAnsiEncoding",
+    });
+    let bbox = || Object::Array(vec![0.into(), 0.into(), 100.into(), 20.into()]);
+    let bad = p.doc.add_object(Stream::new(
+        dictionary! {
+            "Type" => "XObject", "Subtype" => "Form", "BBox" => bbox(),
+            "Filter" => "JBIG2Decode",
+        },
+        b"not a drawing".to_vec(),
+    ));
+    let own = p.doc.add_object(Stream::new(
+        dictionary! {
+            "Type" => "XObject", "Subtype" => "Form", "BBox" => bbox(),
+            "Resources" => dictionary! { "Font" => dictionary! { "F1" => font } },
+        },
+        b"BT /F1 8 Tf 2 5 Td (Seal form) Tj ET".to_vec(),
+    ));
+    let res = p.doc.add_object(dictionary! {
+        "Font" => dictionary! { "F1" => font },
+        "XObject" => dictionary! { "Bad" => bad, "Own" => own },
+    });
+    let contents = [
+        "q /Bad Do Q BT /F1 20 Tf 72 692 Td (Seal one) Tj ET",
+        "q /Own Do Q BT /F1 20 Tf 72 692 Td (Seal two) Tj ET",
+    ];
+    for (page, content) in p.page_ids().into_iter().zip(contents) {
+        let content = Stream::new(dictionary! {}, content.into());
+        let c = p.doc.add_object(content);
+        let page = p.doc.get_dictionary_mut(page).unwrap();
+        page.set("Resources", res);
+        page.set("Contents", c);
+    }
+    p
+}
+
+/// Pages cut in one tab and pasted in another that can't be taken out of their own are
+/// copied, and the paste says so and why, rather than leaving them in both unsaid.
+#[test]
+fn pages_cut_that_cant_be_taken_out_are_copied_and_it_says_why() {
+    let ctx = test_ctx();
+    let ty = Typist::new(&ctx);
+    let mut app = App::with(Settings::from_file(None), Recent::from_file(None));
+    let seal = removal_refused();
+    assert!(seal.extract(&[1]).is_ok(), "can't be copied out");
+    assert!(seal.clone().delete_pages(&[1]).is_err(), "can be taken out");
+    assert!(app.add_tab(&ctx, seal, None, None, false));
+    app.tabs[0].ed.selection = Selection::pages_from([1].into());
+    copied_by(&mut app, &ctx, vec![egui::Event::Cut]);
+    text_tab(&mut app, &ctx, &["Otter one"]);
+    paste_keys(&mut app, &ty);
+    let otter = &app.tabs[1];
+    assert_eq!(otter.page_count(), 2, "not pasted");
+    let text = otter.pdf.page_text(1);
+    assert!(text.contains("Seal two"), "not the page cut: {text:?}");
+    let said = toast(&app).expect("nothing said");
+    assert!(said.contains("Pasted a copy"), "{said}");
+    assert!(said.contains("couldn't be read"), "not why: {said}");
+    let seal = &app.tabs[0];
+    assert_eq!(seal.page_count(), 2, "taken out");
+    assert!(seal.cut_pages().is_empty(), "still cut");
+}
+
 /// A click between cards puts the insertion bar there, as a slide sorter's, letting go of
 /// the pages selected: the place new pages go. Insert blank page puts its page there, the
 /// size of the page before, selected, and the bar goes. A click before the first card puts

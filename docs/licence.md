@@ -53,10 +53,12 @@ LimarePDF is dual-licensed under MIT or Apache-2.0, at your option. See [LICENSE
   (about 1.1 MB) and unpack one, unchanged byte for byte, when its language is first checked.
   Release archives include the notices as `DICTIONARY-LICENSE-English.txt` and
   `DICTIONARY-LICENSE-French.txt`, and the MPL-2.0 as `LICENSE-MPL-2.0.txt`.
-- **OCR model:** the text recognition model by Robert Knight, from the
-  [ocrs](https://github.com/robertknight/ocrs) project, [CC BY-SA 4.0](https://creativecommons.org/licenses/by-sa/4.0/),
-  included unmodified; see `crates/limarepdf-core/models/README.md`, shipped as `OCR-MODEL.md` in release archives. With
-  its inference code it adds about 14 MB to each binary.
+- **OCR model:** PaddleOCR's text recognition model PP-OCRv6 small, by PaddlePaddle, with its list of characters,
+  [Apache 2.0](https://www.apache.org/licenses/LICENSE-2.0) (the licence's text is `LICENSE-APACHE`), included
+  unmodified; see `crates/limarepdf-core/models/README.md`, shipped as `OCR-MODEL.md` in release archives. It is run by
+  the [rten](https://github.com/robertknight/rten) crate, and the words found are grouped into lines by the
+  [ocrs](https://github.com/robertknight/ocrs) crate's layout analysis (both MIT OR Apache-2.0, used unmodified).
+  With its inference code it adds about 25 MB to each binary.
 
 ## Test data
 

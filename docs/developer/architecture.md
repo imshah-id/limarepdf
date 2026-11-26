@@ -30,21 +30,23 @@ It uses:
   to tear, which KWin allows only for a full-screen window it shows directly, with its tearing setting on (PB-66).
   The icons are the Phosphor fonts in `crates/limarepdf-gui/assets/fonts/`, by name in `src/icon.rs`;
 - [`skrifa`](https://crates.io/crates/skrifa) to read font programs and [`subsetter`](https://crates.io/crates/subsetter)
-  to cut embedded fonts down to the glyphs used; [`harfrust`](https://crates.io/crates/harfrust) 0.13.3 to shape
-  new text (batch 45; it reads fonts through `read-fonts` 0.43, the version `skrifa` 0.46 uses, so core keeps one
+  to cut embedded fonts down to the glyphs used; [`harfrust`](https://crates.io/crates/harfrust) 0.16.1 to shape
+  new text (batch 45; it reads fonts through `read-fonts` 0.47, the version `skrifa` 0.50 uses, so core keeps one
   font reader, while egui's `epaint` keeps its own `harfrust` 0.12),
   [`unicode-linebreak`](https://crates.io/crates/unicode-linebreak) 0.1.5 for line breaks (UAX #14),
-  [`unicode-script`](https://crates.io/crates/unicode-script) 0.5.8 for each character's script, and
+  [`unicode-script`](https://crates.io/crates/unicode-script) 0.5.9 for each character's script, and
   `unicode-segmentation` and `unicode-normalization` for words, grapheme clusters and NFC (the app uses both too,
   `unicode-normalization` since batch 45): the text pipeline below;
 - [`image`](https://crates.io/crates/image) for images;
-- [`url`](https://crates.io/crates/url) 2.5.8 for the addresses new links are written with (ENH-17: IDNA and
+- [`url`](https://crates.io/crates/url) 2.5.9 for the addresses new links are written with (ENH-17: IDNA and
   percent-encoding; already in the tree through `webbrowser`);
 - [`spellbook`](https://crates.io/crates/spellbook) 0.4.2 (MPL-2.0) for spelling, with Hunspell dictionaries, and
-  [`zip`](https://crates.io/crates/zip) 9.3 to read the dictionary extensions added (NEW-06; "Spelling" below);
+  [`zip`](https://crates.io/crates/zip) 9.8 to read the dictionary extensions added (NEW-06; "Spelling" below);
   the app asks the system's language of [`sys-locale`](https://crates.io/crates/sys-locale) 0.3;
-- [`ocrs`](https://github.com/robertknight/ocrs) for text recognition (see [Scans and OCR](../scanning-and-ocr.md));
-  the usual scanner and OCR libraries, SANE and Tesseract, are C/C++, so LimarePDF doesn't drive scanners;
+- [`rten`](https://github.com/robertknight/rten) to run the text recognition model, PaddleOCR's PP-OCRv6 small
+  (ONNX), and [`ocrs`](https://github.com/robertknight/ocrs)' layout analysis to group the words found into lines
+  (see [Scans and OCR](../scanning-and-ocr.md)); the usual scanner and OCR libraries, SANE and Tesseract, are
+  C/C++, so LimarePDF doesn't drive scanners;
 - [`serde_json`](https://crates.io/crates/serde_json) in the command line, for form values as JSON.
 
 Text strings in the file (properties, bookmarks, field names, values and descriptions, comments and their
@@ -3391,13 +3393,13 @@ from the RustCrypto project unless noted, all final releases:
 | --- | --- | --- |
 | `rsa` | 0.10.0 | RSA keys and signatures |
 | `pkcs1` | 0.8.0 | RSA key encoding |
-| `der`, `spki`, `x509-cert` | 0.8.3, 0.8.1, 0.3.0 | certificates; making self-signed ones |
+| `der`, `spki`, `x509-cert` | 0.8.3, 0.8.1, 0.3.1 | certificates; making self-signed ones |
 | `p256`, `p384` | 0.14.0 | ECDSA keys and signatures |
-| `sha1`, `sha2` | 0.11.0, 0.11.1 | digests |
+| `sha1`, `sha2` | 0.11.0, 0.11.2 | digests |
 | `hmac`, `pbkdf2` | 0.13.0 | ID file integrity checks and password stretching |
 | `aes`, `cbc` | 0.9.4, 0.2.1 | ID file encryption |
 | `des`, `rc2` | 0.9.0 | reading older ID files only (3DES, RC2) |
-| `zeroize`, `subtle` | 1.9.1, 2.6.1 | wiping secrets, constant-time comparison |
+| `zeroize`, `subtle` | 1.9.2, 2.6.1 | wiping secrets, constant-time comparison |
 | `getrandom` | 0.4.3 | random numbers from the operating system (also the AES-256 file key and a protected file's ID when it has none, through `pkcs12::random`) |
 | `rpassword` | 7.5.5 | asking for passwords without showing them (command line; not RustCrypto) |
 

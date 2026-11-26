@@ -2,7 +2,7 @@
 //! and Apply removing what is under them where they now are, with app.rs's helpers.
 
 use super::*;
-use limarepdf_core::{Annot, AnnotKind};
+use limarepdf_core::{commit_seam, Annot, AnnotKind};
 
 /// Over "Walrus one" in [`objects_tab`] (18 points high, its baseline at 92, from x 72),
 /// and 30 points lower, over "Walrus two" (baseline 122).
@@ -81,9 +81,74 @@ fn press_key(app: &mut App, ctx: &egui::Context, key: Key, held: egui::Modifiers
 /// later, as the window does once its busy sign is shown (PB-163).
 fn click_removing(app: &mut App, ctx: &egui::Context, label: &str) {
     click(app, ctx, label);
+    removal_frames(app, ctx);
+}
+
+/// The two frames after a removal is answered, in which it runs.
+fn removal_frames(app: &mut App, ctx: &egui::Context) {
     for _ in 0..2 {
-        let _ = ctx.run_ui(egui::RawInput::default(), |ui| app.remove_now(ui.ctx()));
+        let mut out = ctx.run_ui(egui::RawInput::default(), |ui| app.remove_now(ui.ctx()));
+        out.textures_delta.clear();
     }
+}
+
+/// PB-211's steps: [`marked`] over "Walrus one" saved as `marked.pdf` in `dir` with its
+/// mark, Apply redactions answered while the save is being written, the save finishing
+/// before the removal runs, then saved again. The app, and the file.
+fn applied_as_a_save_ended(ctx: &egui::Context, dir: &Path) -> (App, PathBuf) {
+    let (mut app, _) = marked(ctx, &[ONE]);
+    let path = dir.join("marked.pdf");
+    let hold = commit_seam::hold(dir);
+    SAVE_AS.with(|s| s.set(Some(path.clone())));
+    app.act(ctx, Act::SaveAs);
+    click(&mut app, ctx, "Save with marks");
+    hold.arrived();
+    app.act(ctx, Act::ApplyRedactions);
+    click(&mut app, ctx, "Apply redactions");
+    hold.release();
+    saves_done(&mut app, ctx);
+    drop(hold);
+    removal_frames(&mut app, ctx);
+    let (title, text) = message(&app);
+    assert_eq!(title, "Redactions applied", "{text}");
+    app.dialog = Dialog::None;
+    app.act(ctx, Act::Save);
+    saves_done(&mut app, ctx);
+    (app, path)
+}
+
+/// PB-211: a save of the tab finishing between Apply redactions answered and the removal
+/// it answers leaves the removal to run: the save didn't change the document, so it is as
+/// asked about. What was under the mark is gone, now and in the file saved after.
+#[test]
+fn a_save_ending_before_the_redactions_answered_are_applied_leaves_them_to_be() {
+    let ctx = test_ctx();
+    let dir = test_dir("saved-then-applied");
+    let (app, path) = applied_as_a_save_ended(&ctx, &dir);
+    let t = &app.tabs[0];
+    let marks = t.pdf.redaction_marks().unwrap();
+    assert!(marks.is_empty(), "the mark stays");
+    let text = t.pdf.page_text(0);
+    assert!(!text.contains("Walrus one"), "not applied: {text:?}");
+    let back = Pdf::open(&path, None).expect("the saved file");
+    let text = back.page_text(0);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(!text.contains("Walrus one"), "saved unapplied: {text:?}");
+    assert!(text.contains("Walrus two"), "{text:?}");
+}
+
+/// PB-211, read by Poppler: the file [`applied_as_a_save_ended`] saves. Opt-in: `cargo test
+/// -p limarepdf-gui --bin limarepdf -- --ignored cross_check`.
+#[test]
+#[ignore]
+fn cross_check_redactions_applied_as_a_save_ended_with_poppler() {
+    let ctx = test_ctx();
+    let dir = test_dir("saved-then-applied-poppler");
+    let (_, path) = applied_as_a_save_ended(&ctx, &dir);
+    let pages = poppler_pages(&path);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(!pages[0].contains("Walrus one"), "{pages:?}");
+    assert!(pages[0].contains("Walrus two"), "{pages:?}");
 }
 
 /// PF-37: a redaction mark selected with the read tool moves with a drag from inside it,

@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/limarepdf-core", "crates/limarepdf-cli", "crates/limarepdf-gui"]
 
 [workspace.package]
-version = "0.13.0"
+version = "0.14.1"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 # Released as programs and packages, never to crates.io (deny.toml relies on it).
@@ -43,6 +43,8 @@ opt-level = 3
 [profile.dev.package.rten-gemm]
 opt-level = 3
 [profile.dev.package.rten-imageproc]
+opt-level = 3
+[profile.dev.package.rten-onnx]
 opt-level = 3
 [profile.dev.package.rten-simd]
 opt-level = 3

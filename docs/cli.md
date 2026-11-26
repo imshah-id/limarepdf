@@ -41,8 +41,9 @@ On Linux and macOS a written file is then confirmed on disk, so a power cut can'
 confirm it, the file is in place all the same, and the command stops with status 1 and "*file* was saved, but your
 system couldn't confirm it is safely on disk (...). If the computer lost power just now, run the command again."
 Windows has no way to confirm this: there a power cut in the moment after a file is put in place can still lose it.
-When whatever reads the output stops early, as `limarepdf-cli text file.pdf | head` does, the command stops quietly
-with the status it would have had otherwise.
+When whatever reads the output stops early, as `limarepdf-cli text file.pdf | head` does, the rest of what the
+command prints is left out quietly: it still runs to its end, saving any file it would have saved, and exits with
+the status it would have had otherwise.
 
 ## Look at a document
 
@@ -52,7 +53,7 @@ with the status it would have had otherwise.
 | `limarepdf-cli text in.pdf --pages 1-2` | Print the text of pages |
 | `limarepdf-cli search in.pdf "invoice"` | Find text: one line a match, `page 3: …the words around it…`, then the count ("1 match", "12 matches", "No matches"); `--boxes` also prints where each match is on its page (`page 3 [x0 y0 x1 y1]`, points from the top left), a phrase running on to the next page on both. `--match-case`: capital and small letters must be as typed ("Walrus" doesn't find "walrus"); `--whole-words`: whole words only ("walrus" doesn't find "walruses"; [details](reading-and-finding.md#find-words)) |
 | `limarepdf-cli objects in.pdf --pages 1` | List the editable objects (text lines, images, paths) with their boxes; OCR text is marked "(hidden)", and a line in more than one font, size or colour shows its first part's, marked "mixed" |
-| `limarepdf-cli render in.pdf --dpi 150 --out-dir pngs` | Save pages as images, as the app shows them; `--format jpeg --quality 85` for JPEG. Images already there aren't replaced, and nothing is written, unless you add `--overwrite`; an image name that is a link to the input is refused even then. Filled form fields are drawn as the app draws them; a warning names any it can't draw, which come out empty, and another says what else the images lack (a picture it can't read, a font that isn't installed), as the app's notice does. A page past 65,280 pixels a side, or 268 million in all, at that resolution refuses the whole run; so does a file LimarePDF can't open ([details](export-and-printing.md#pages-as-images)) |
+| `limarepdf-cli render in.pdf --dpi 150 --out-dir pngs` | Save pages as images, as the app shows them, at 36 to 1152 dpi (150 by default); `--format jpeg --quality 85` for JPEG, quality 1 to 100. A value outside those is refused before anything is written. Images already there aren't replaced, and nothing is written, unless you add `--overwrite`; an image name that is a link to the input is refused even then. Filled form fields are drawn as the app draws them; a warning names any it can't draw, which come out empty, and another says what else the images lack (a picture it can't read, a font that isn't installed), as the app's notice does. A page past 65,280 pixels a side, or 268 million in all, at that resolution refuses the whole run; so does a file LimarePDF can't open ([details](export-and-printing.md#pages-as-images)) |
 | `limarepdf-cli annot list in.pdf` | List the annotations (comments, notes, highlights, drawings): number, page, type, author, date and comment, and which one a reply answers. `--pages 2-3` for some pages; links and form fields are left out. One annotation several pages have is listed once, under the first of them, and `--pages` naming any of them lists it. When the annotations are too many or too long to read (more than 16,777,216 steps), those past that are listed without their author or comment, marked "too large to show" |
 | `limarepdf-cli annot list in.pdf --json` | The same as a JSON array, with each annotation's colour, opacity and box on the page (points from the top left), and `"unread": true` for one too large to show |
 | `limarepdf-cli form list in.pdf` | List the form fields: name, kind, value, pages, and whether each is required or read-only, with a choice's options |
@@ -63,13 +64,14 @@ with the status it would have had otherwise.
 | Command | What it does |
 | --- | --- |
 | `limarepdf-cli form fill in.pdf -o out.pdf --set name=Ann --set agree=on` | Fill in fields. Checkboxes take `on` or `off`; a multi-select list takes its choices separated by `\|` |
-| `limarepdf-cli form fill in.pdf -o out.pdf --values values.json` | Fill in fields from a JSON object in the form `limarepdf-cli form list --json` prints, so you can list, edit and fill. A choice can be given by its export value or by the text shown for it. `--set` can be added and is applied after the file |
+| `limarepdf-cli form fill in.pdf -o out.pdf --values values.json` | Fill in fields from a JSON object in the form `limarepdf-cli form list --json` prints, so you can list, edit and fill. A read-only field given the value it holds, as listed, is left as it is, and the report says how many were. A choice can be given by its export value or by the text shown for it. `--set` can be added and is applied after the file |
 | `limarepdf-cli form reset in.pdf -o out.pdf` | Put every field back to its default value. Refuses a form whose fields are nested more than 32 levels deep, which LimarePDF can't follow to the end |
 | `limarepdf-cli form flatten in.pdf -o out.pdf` | Draw the fields into the pages as they look now and remove them, so they can no longer be filled in. `--pages 1-3` flattens only those pages; fields elsewhere stay fillable. Refuses, naming the fields, when a shown value has no drawing and LimarePDF can't draw it (Hebrew, Arabic and other right-to-left or shaped scripts, emoji made of several characters and characters no installed font has), rather than lose it, and refuses a form whose fields are nested more than 32 levels deep, which LimarePDF can't follow to the end |
 | `limarepdf-cli form fill in.pdf -o out.pdf --values values.json --flatten` | Fill in, then flatten |
 
-Filling checks every value first: an unknown field name, a read-only field, text too long for the field, a line
-break in a single-line field, or an option the field doesn't have stops it before anything is written. LimarePDF draws
+Filling checks every value first: an unknown field name, a read-only field given a value other than its own, text
+too long for the field, a line break in a single-line field, or an option the field doesn't have stops it before
+anything is written. LimarePDF draws
 each filled field itself, so the values show in every reader. Field text can be Latin, Greek, Cyrillic, Chinese,
 Japanese, Korean or single emoji; Hebrew, Arabic and other right-to-left or shaped scripts, emoji made of several
 characters and characters no installed font has are refused rather than written wrongly. When the field's own
@@ -136,7 +138,9 @@ warning: 2 annotation(s) LimarePDF can't draw were left as they were (pages 3, 7
 
 Pages that `delete` removes, or that `extract` and `split` leave out, leave nothing in the output: bookmarks,
 named destinations, links, form fields and tags stop referring to them, and tags with content on them (and the
-tags above those) lose their alternative text. A form nested more than 32 deep makes them stop with an error.
+tags above those) lose their alternative text. A form nested more than 32 deep makes them stop with an error,
+and so does a file that still holds something of the pages that go another way (a tagged document's tags
+pointing at it, say, or a page that stays with a drawing that can't be read); `split` then writes no file.
 `extract` and `split` keep the bookmarks to
 the pages they keep; `delete` keeps every bookmark, without a destination when its page went. `split` writes each
 file as soon as its part is made (several at once, one per core); if one can't be written, the error says how many
@@ -182,12 +186,12 @@ Bookmarks are numbered from 1 in the order `list` shows them, each followed by t
 
 | Command | What it does |
 | --- | --- |
-| `limarepdf-cli images scan.tif photo.jpg -o out.pdf` | One page per image (PNG, JPEG, TIFF; every page of a TIFF). `--dpi` overrides the resolution stored in the files |
-| `limarepdf-cli insert-images in.pdf -o out.pdf --after 2 --images a.png b.jpg` | Insert images as pages after page N |
-| `limarepdf-cli optimize-scans in.pdf -o out.pdf --mode auto --max-dpi 200 --quality 75` | Shrink and clean up scanned pages; also `--no-deskew`, `--no-despeckle` |
+| `limarepdf-cli images scan.tif photo.jpg -o out.pdf` | One page per image (PNG, JPEG, TIFF; every page of a TIFF). `--dpi` overrides the resolution stored in the files, and `--fallback-dpi` (150 by default) sizes those stating none, or one outside 10 to 10,000 dpi. Either option outside 10 to 10,000 is refused before anything is written |
+| `limarepdf-cli insert-images in.pdf -o out.pdf --after 2 --images a.png b.jpg` | Insert images as pages after page N; `--dpi` and `--fallback-dpi` as for `images` |
+| `limarepdf-cli optimize-scans in.pdf -o out.pdf --mode auto --max-dpi 200 --quality 75` | Shrink and clean up scanned pages; also `--no-deskew`, `--no-despeckle`. `--max-dpi` is 10 to 10,000 and `--quality` 1 to 100; a value outside is refused before anything is written |
 | `limarepdf-cli reduce in.pdf -o out.pdf --quality web` | Make the file smaller, as Word's Compress Pictures does: pictures above the quality's resolution scaled down and saved again (`hd` 330 pixels per inch, `print` 220, the default, `web` 150, `email` 96; `high-fidelity` keeps them as they are). Says what was made smaller, what was left and why, and the sizes before and after. Also `--pages`, `--jpeg-quality`. Refuses a signed document |
 | `limarepdf-cli save-images in.pdf --out-dir pictures` | Save every picture the pages show, as `in-page-003-image-2.jpg` and so on: a JPEG shown upright as it is, any other picture, or one turned or flipped, as a PNG as it shows. A picture shown on several pages is saved once. Writes nothing when files of those names are there, unless `--overwrite`, and nothing, even with it, when one of those names is a link to the input |
-| `limarepdf-cli ocr in.pdf -o out.pdf --pages all` | Add a searchable text layer to pages without text (Latin script) |
+| `limarepdf-cli ocr in.pdf -o out.pdf --pages all` | Add a searchable text layer to pages without text (languages written in Latin letters, accents included; see [Scans and OCR](scanning-and-ocr.md#recognising-text-ocr)) |
 
 See [Scans and OCR](scanning-and-ocr.md) for what these do.
 
@@ -242,7 +246,7 @@ See [Removing hidden information](redaction.md#removing-hidden-information).
 | --- | --- |
 | `limarepdf-cli verify in.pdf` | Check every digital signature: whether the signed part is unchanged, who signed by their certificate, when, and warnings; what changed after each signature and whether the signer allowed it; also lists signature fields not signed yet |
 | `limarepdf-cli verify in.pdf --json` | The same as JSON, for scripts |
-| `limarepdf-cli verify in.pdf --signed-version 1 -o signed.pdf` | Save the version signature 1 (numbered as `limarepdf-cli verify` lists them) signed: the file as it was when signed, without later changes. Refused for a broken signature |
+| `limarepdf-cli verify in.pdf --signed-version 1 -o signed.pdf` | Save the version signature 1 (numbered as `limarepdf-cli verify` lists them) signed: the file as it was when signed, without later changes. Refused for a broken signature, and with `--require-trusted` (status 2, nothing written) |
 | `limarepdf-cli verify in.pdf --require-trusted` | Also exit with status 1 unless the file has signatures and every signer, and every timestamp authority a signature carries, is trusted |
 | `limarepdf-cli verify in.pdf --trust-file team.txt` | Judge trust by this trust list instead of your own |
 | `limarepdf-cli trust list` | The certificates you trust, with their fingerprints (`--json` for scripts) |

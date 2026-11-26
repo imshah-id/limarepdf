@@ -25,8 +25,11 @@ mkdir -p "$site/apt" "$site/rpm"
 cp "$here/../docs/limarepdf-signing-key.asc" "$site/"
 cp "$here"/pages/* "$site/"
 
-# apt: a flat repository, used with "Suites: ./" in limarepdf.sources.
+# apt: a flat repository, used with "Suites: ./" in limarepdf.sources. Its Release file names
+# the architectures of the .deb files in it, so it describes them truly; apt (2.7 and 3.0)
+# takes a flat repository's packages whatever it says, and picks the system's own.
 cp "$src"/*.deb "$site/apt/"
+archs=$(for f in "$src"/*.deb; do dpkg-deb -f "$f" Architecture; done | sort -u | xargs)
 (
     cd "$site/apt"
     apt-ftparchive packages . > Packages
@@ -35,7 +38,7 @@ cp "$src"/*.deb "$site/apt/"
         -o APT::FTPArchive::Release::Origin=LimarePDF \
         -o APT::FTPArchive::Release::Label=LimarePDF \
         -o APT::FTPArchive::Release::Suite=stable \
-        -o APT::FTPArchive::Release::Architectures=amd64 \
+        -o "APT::FTPArchive::Release::Architectures=$archs" \
         release . > ../Release.tmp
     mv ../Release.tmp Release
     sign --clearsign --output InRelease Release

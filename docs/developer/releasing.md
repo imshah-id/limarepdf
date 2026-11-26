@@ -30,14 +30,21 @@ How a release is made, for maintainers.
      clarification's licence and checksum. A crate that brings new fonts or code under another licence needs a
      clarification there and a line in `check-package.py`'s `BUNDLED`, and its fonts named in the About window's
      credits and in licence.md. Move cargo-about to its latest release here, after reading its changelog: the
-     version is set in `package-notices.sh` and in `ci.yml`'s two Install cargo-about steps;
+     version is set in `package-notices.sh`, in `ci.yml`'s two Install cargo-about steps, and in
+     `packaging/arch/limarepdf/PKGBUILD` (`_about`, with the crate's checksum: `curl -fsSL
+     https://static.crates.io/crates/cargo-about/cargo-about-<version>.crate | sha256sum`);
+   - move the AppImage's runtime (`AppImage/type2-runtime`) and `appimagetool` (`AppImage/appimagetool`) to their
+     latest numbered releases (not `continuous`) in `packaging/linux/make-appimage.sh`, after reading their
+     changes, with each file's SHA-256 for both architectures from GitHub: `gh release view <tag> -R
+     AppImage/type2-runtime --json assets --jq '.assets[] | [.name, .digest] | @tsv'`, and the same for
+     appimagetool ([AppImage](#appimage));
    - merge or close Dependabot's open pull requests for the workflows' actions ([Pinned
      actions](#pinned-actions)), and check that `dtolnay/rust-toolchain` is at its `stable` branch's latest commit;
    - check that the user guide's screenshots (`docs/images/`) still show the app as it is, and retake any that
      don't: a 1000×660 window in the light theme under a virtual X server, made-up documents and digital IDs only,
      cut down to the part the page is about. `tools/docshots/docshots.sh` takes `comments`, `fill-and-sign`,
-     `inspector`, `redaction` and `signatures-panel` this way (its header says how).
-2. Open a pull request. CI builds, tests and packages all four platforms; check the archives in the run's artifacts.
+     `forms`, `inspector`, `organise`, `redaction` and `signatures-panel` this way (its header says how).
+2. Open a pull request. CI builds, tests and packages every platform; check the archives in the run's artifacts.
    Merge when it is green.
 3. On `main`, after pulling the merge, make a signed tag and push it:
 
@@ -54,15 +61,31 @@ How a release is made, for maintainers.
    new advisory published since the pull request stops the release: fix it (an update, or an `ignore` entry with
    its reason in `deny.toml`, and in `docs/signatures-in-depth.md` for a signing crate, when it doesn't apply), then delete the tag
    (`git push --delete origin vX.Y.Z`, `git tag -d vX.Y.Z`) and tag the fixed `main` again. The job then waits for
-   approval, since the signing key is only in the `release-signing` environment ([Signing key](#signing-key)): on
-   the run's page choose Review deployments, tick `release-signing` and approve. Before signing anything, it checks
-   that the tag matches `Cargo.toml`, takes the release notes from the matching `CHANGELOG.md` section, and ends
-   them with a link comparing the tag with the previous version tag. It then signs and creates a draft GitHub
-   Release with the four archives, `SHA256SUMS`, and a GPG signature (`.asc`) for each, and records a build
-   attestation for every file.
+   approval, since the signing key is only in the `release-signing` environment ([Signing key](#signing-key)).
+   Nothing else links to the approval: open the run itself (the repository's Actions tab, the `ci` run for the tag),
+   where a box says it is waiting for review; choose Review deployments, tick `release-signing`, then Approve and
+   deploy. From a terminal instead, with the run's number:
+
+   ```
+   gh api repos/smaug42/limarepdf/actions/runs/<run>/pending_deployments --jq '.[].environment.id'
+   gh api -X POST repos/smaug42/limarepdf/actions/runs/<run>/pending_deployments -F 'environment_ids[]=<id>' -f state=approved -f comment=X.Y.Z
+   ```
+
+   Before signing anything, the job checks that the tag matches `Cargo.toml`, takes the release notes from the
+   matching `CHANGELOG.md` section, and ends them with a link comparing the tag with the previous version tag. It
+   then signs and creates a draft GitHub Release with the archives, the source archive, the Linux packages and
+   AppImages, the Arch Linux package (x86_64, built from source), the MSIs and the dmg, `SHA256SUMS`, and a GPG
+   signature (`.asc`) for each, and records a build attestation for every file.
 5. On GitHub, open the draft under Releases, choose Edit, check the notes and files, and publish it. Publishing
    starts the `packages` workflow, which updates the apt and dnf repositories ([below](#package-repositories)); its
-   `sign` job waits for approval in the same way.
+   `sign` job waits for approval in the same way, on the `packages` run the release started.
+6. Update winget and Scoop ([winget and Scoop](#winget-and-scoop)): with the clones in `win/winget-pkgs` and
+   `win/scoop-limarepdf`, run `bash packaging/windows/update.sh X.Y.Z win`. It checks the published `SHA256SUMS`
+   against the release key, downloads the MSIs to read their codes, and writes winget's three manifests and Scoop's
+   `bucket/limarepdf.json`. In the bucket, read the change, commit it with the message `limarepdf: Update to version
+   X.Y.Z` and push. In winget-pkgs, on a new branch from the fork's updated `master`, commit the new folder with the
+   message `New version: ClaytonCornell.LimarePDF version X.Y.Z`, push it and open a pull request to
+   `microsoft/winget-pkgs`; its checks and a moderator's review take a day or more.
 
 Do not create the release on GitHub by hand, or the tag from GitHub's release form: the `release` job then finds a
 release already there and fails.
@@ -79,44 +102,72 @@ the licences. The archives are made on the runner because Actions artifacts lose
 Actions page each artifact therefore downloads as a zip with the archive inside. The Mac builds target macOS 11
 (`MACOSX_DEPLOYMENT_TARGET` at the top of the workflow; Rust's own default for Intel is 10.12).
 
+There are six platform jobs: Linux and Windows on x86_64 and on Arm64 (`ubuntu-24.04-arm`, `windows-11-arm`), and
+the two Macs. Each builds natively, on a runner of its own architecture, and gives its target triple (the matrix's
+`target`) to `check-package.py`, which checks that the programs' headers name that architecture: a runner's
+toolchain emulating its other architecture would build programs that run there, but aren't the package's.
+
 The packages and installers (deb, rpm, MSI, dmg) don't carry `docs/`: `packaging/package-docs.sh` writes their
 README, changelog and security notes into `target/package-docs/` with every relative link pointed at the version's
 tag on GitHub (pages under `blob/`, images under `raw/`), so those links work once the version is tagged.
-`packaging/check-package.py [--target TRIPLE]... <folder>` checks a layout as installed: the programs, the README,
-changelog, security notes, OCR model notes and every licence (the font ones and the crates' included) there, every
-relative link reaching a file and heading in the folder, every link to the version's tag reaching one in the
-repository, and the crates' licences matching the crates built ([below](#third-party-licences)). CI runs it on
-each archive before packing it, on the deb and rpm unpacked, on the MSI installed, and on the app in the mounted
+`packaging/check-package.py [--target TRIPLE]... <folder>` checks a layout as installed: the programs, built for the
+targets' architectures (each one's ELF, PE or Mach-O header says, universal or not), the README, changelog,
+security notes, OCR model notes and every licence (the font ones and the crates' included) there, every relative
+link reaching a file and heading in the folder, every link to the version's tag reaching one in the repository, and
+the crates' licences matching the crates built ([below](#third-party-licences)). CI runs it on each archive before
+packing it, on the deb, rpm, AppImage and Arch packages unpacked, on the MSI installed, and on the app in the mounted
 dmg; the logs list each package's files.
 
-The Linux job also makes `limarepdf_<version>-1_amd64.deb` and `limarepdf-<version>-1.x86_64.rpm` with `cargo-deb` and
+The Linux jobs also make `limarepdf_<version>-1_amd64.deb` and `limarepdf-<version>-1.x86_64.rpm` (on Arm,
+`limarepdf_<version>-1_arm64.deb` and `limarepdf-<version>-1.aarch64.rpm`) with `cargo-deb` and
 `cargo-generate-rpm`, from the `[package.metadata.deb]` and `[package.metadata.generate-rpm]` sections of
-`crates/limarepdf-gui/Cargo.toml`. Their dependency lists name the libraries limarepdf loads at run time; check them when
-eframe or rfd changes (`strings target/release/limarepdf | grep '\.so'` lists them). The rpm's glibc version
-(`libc.so.6(GLIBC_2.43)(64bit)`) is written by hand, since the automatic scan is off; the job fails, naming the
-version to set, when the binaries need a different one (`ubuntu-latest` moving to a newer Ubuntu would do it:
-then update the floor in install.md, the README and feature-status.md too). The deb's comes from `dpkg-shlibdeps`. A quick install test:
-`podman run --rm -v $PWD:/p:Z debian:stable bash -c 'apt-get update && apt-get install -y /p/limarepdf_*.deb && limarepdf-cli --version'`
-(and the same with `fedora` and `dnf install -y /p/*.rpm`).
+`crates/limarepdf-gui/Cargo.toml`. Their dependency lists, and the Arch packages' `depends`, name the libraries
+limarepdf loads at run time; check them when eframe or rfd changes (`strings target/release/limarepdf | grep
+'\.so'` lists them). The rpm's glibc version
+(`libc.so.6(GLIBC_2.39)(64bit)`) is written by hand, since the automatic scan is off; each job fails when the
+binaries need a different one. That version is the floor install.md names. The binaries need the glibc of the
+Ubuntu they were built on, so the Linux jobs run on `ubuntu-24.04` and `ubuntu-24.04-arm` (glibc 2.39), not
+`ubuntu-latest`, whose move to Ubuntu 26.04 raised the floor to 2.43 for 0.14.0 (for a few float functions alone).
+Raising the floor is a decision, not a fix for this check: when GitHub retires the `ubuntu-24.04` runners, or a
+library comes to need a newer glibc, change the runners, the rpm's version, the `linux-install` job's images and the
+floor in install.md, the README, feature-status.md, testing.md and `packaging/pages/index.html` together. The deb's
+comes from `dpkg-shlibdeps`.
+
+The `linux-install` job installs the deb and the rpm of each architecture, each in a clean container on a runner of
+that architecture, on the oldest systems install.md names (Ubuntu 24.04, Debian 13, AlmaLinux 10, openSUSE Leap 16)
+and on a current Fedora, with `packaging/check-linux-install.sh`: the system's package manager installs the package
+with the libraries it depends on from the system's own repositories (recommended packages left out), `ldd` finds
+every library and glibc version both programs need, `limarepdf-cli --version` runs, and removing the package leaves
+neither program behind. Before removing it, the script unpacks the AppImage ([below](#appimage)) there, checks with
+`ldd` that both programs load on the libraries the package brought (those a desktop has), and runs `limarepdf-cli
+--version` through the AppImage with `APPIMAGE_EXTRACT_AND_RUN=1`, since containers have no FUSE. The release and
+dry-run jobs wait for it. To run it locally, with the packages and the AppImage in `dist/`:
+`podman run --rm -v "$PWD:/w:ro" -w /w docker.io/library/ubuntu:24.04 bash packaging/check-linux-install.sh dist`,
+and the same with each of the job's other images.
 
 The `macos-dmg` job builds both Mac targets on one runner and runs `packaging/macos/make-dmg.sh`: it joins each
 binary with `lipo`, makes `LimarePDF.app` from `packaging/macos/Info.plist` (which registers LimarePDF for PDFs) and an icon made
 with `iconutil`, signs it ad hoc, and wraps it in `LimarePDF-<version>.dmg` with `hdiutil`. It then mounts the dmg,
 checks the app's files and that both halves of each binary say macOS 11.
 
-The Windows job also builds `limarepdf-<version>-x86_64.msi` from `packaging/windows/limarepdf.wxs` with WiX 5 (a .NET tool,
-pinned because later versions add an EULA step) and its UI extension, `WixToolset.UI.wixext` (the same version), for
-the installer screens. Its `UpgradeCode` must never change. The folder page is the installer's own (`LimareDirDlg`,
-written for LimarePDF rather than copied from WiX, whose source is under the MS-RL licence), laid out like the
-extension's pages and using its strings, with the desktop shortcut checkbox; two `Publish` lines route the
-extension's Welcome and Ready pages to it. The checkbox sets `DESKTOPSHORTCUT`, which can also be given to
-`msiexec`; the shortcut's registry value records the choice, and two property actions, run once before the
-screens (or before installing, without them), keep it at an upgrade unless `DESKTOPSHORTCUT` is given, and turn
-`DESKTOPSHORTCUT=0` into an unticked box. The job also builds the same installer as versions 255.0.0 and 255.0.1
-and then installs on the runner without the screens: the files, the Start menu shortcut and the installed folder's
-check; uninstalling; the desktop shortcut asked for, kept by an upgrade and removed by one with
-`DESKTOPSHORTCUT=0`; and uninstalling again, leaving nothing. The screens themselves are only checked by hand
-(testing.md's platform smoke checks).
+The Windows jobs also build `limarepdf-<version>-x86_64.msi`, and on Arm `limarepdf-<version>-arm64.msi` (`-arch
+arm64`), from `packaging/windows/limarepdf.wxs` with WiX 5 (a .NET tool, pinned because later versions add an EULA
+step) and its UI extension, `WixToolset.UI.wixext` (the same version), for the installer screens. Its
+`UpgradeCode` must never change; both architectures share it, and `MajorUpgrade` replaces a LimarePDF of the same
+version too (`AllowSameVersionUpgrades`), so the Arm64 installer takes the place of an x64 LimarePDF rather than
+installing a second one beside it. The folder page is the installer's own (`LimareDirDlg`, written for LimarePDF
+rather than copied from WiX, whose source is under the MS-RL licence), laid out like the extension's pages and
+using its strings, with the desktop shortcut checkbox; two `Publish` lines route the extension's Welcome and Ready
+pages to it. The checkbox sets `DESKTOPSHORTCUT`, which can also be given to `msiexec`; the shortcut's registry
+value records the choice, and two property actions, run once before the screens (or before installing, without
+them), keep it at an upgrade unless `DESKTOPSHORTCUT` is given, and turn `DESKTOPSHORTCUT=0` into an unticked box.
+The job also builds the same installer as versions 255.0.0 and 255.0.1 and then installs on the runner without the
+screens: the files, the Start menu shortcut and the installed folder's check; `limarepdf.exe`'s name in its version
+information (`FileDescription`), which `build.rs` embeds with the icon and a failed resource compile leaves out with
+only a build warning; uninstalling; the desktop shortcut asked for, kept by an upgrade and removed by one with
+`DESKTOPSHORTCUT=0`; and uninstalling again, leaving nothing. On Arm, which runs x64 programs too, it then installs
+an x64 MSI of the same version and the Arm64 one over it, and expects one LimarePDF installed, and none after
+uninstalling. The screens themselves are only checked by hand (testing.md's platform smoke checks).
 
 After the release build, the platform jobs and `macos-dmg` check that neither program has core's test seam (the
 `test-seams` feature, which only the app's and the CLI's tests turn on: architecture.md's "atomic.rs" paragraph),
@@ -139,10 +190,126 @@ change. The release job doesn't wait for it, since a lint doesn't change what is
 
 The `release` job runs only for a version tag, in the `release-signing` environment, once the maintainer approves
 it. After its checks of the tag and the notes, `packaging/import-signing-key.sh` imports the signing subkey (below)
-and `packaging/sign-release.sh` signs the rpm, writes `SHA256SUMS`, and signs it and every file with that subkey,
+and `packaging/sign-release.sh` signs the rpms, writes `SHA256SUMS`, and signs it and every file with that subkey,
 checking each signature against `docs/limarepdf-signing-key.asc` as rpm and gpgv will. The job then records build
 provenance with `actions/attest-build-provenance`, which users check with `gh attestation verify`. A tag run whose
 environment has no `GPG_SIGNING_KEY` fails at the signing step, with nothing signed or released.
+
+### AppImage
+
+After the deb and rpm, the Linux jobs make `LimarePDF-<version>-x86_64.AppImage` (on Arm,
+`LimarePDF-<version>-aarch64.AppImage`) from the archive with `packaging/linux/make-appimage.sh`. The AppImage holds
+the programs in `usr/bin`, the desktop entry and icon where a package puts them (and at the top, as an AppImage has
+them), the rest of the archive in `usr/share/doc/limarepdf`, and `packaging/linux/AppRun`. AppRun starts
+`limarepdf-cli` when the AppImage is started through a link of that name or given it as its first argument, and
+`limarepdf` otherwise. The runtime, the program at the front of the file that mounts the rest, is AppImage's static
+one: it needs no library, libfuse2 included, only `fusermount3` to mount itself, or nothing with
+`--appimage-extract-and-run`. The script downloads it and `appimagetool` at set versions, checking each by its
+SHA-256 (step 1 moves them). Nothing else is bundled: the programs load glibc and the desktop's libraries from the
+system, as the packages' do, so the AppImage has the same glibc floor. `appimagetool` runs `desktop-file-validate`
+on the desktop entry when it is installed, as the job installs it.
+
+`packaging/linux/check-appimage.sh` then checks that the runtime is static and built for the job's architecture, the
+files unpacked with `check-package.py`, AppRun with stand-ins for the programs (which one starts, by the name and by
+the first argument, with the arguments passed on unchanged), and `limarepdf-cli --version` through the AppImage
+both ways, with FUSE (`fuse3`). The `linux-install` job then runs the AppImage on each system
+([above](#what-ci-builds)). To make and check one locally, on Linux with FUSE, from the archive in `dist/`:
+
+```
+bash packaging/linux/make-appimage.sh dist/limarepdf-<version>-linux-x86_64.tar.gz dist
+bash packaging/linux/check-appimage.sh dist/LimarePDF-<version>-x86_64.AppImage x86_64-unknown-linux-gnu
+```
+
+### Arch Linux packages
+
+`packaging/arch/` holds the PKGBUILDs of two packages written for the AUR, each for x86_64 and aarch64:
+`limarepdf`, built from the release's source archive, and `limarepdf-bin`, from its Linux archives. Both install
+what the release archive holds: the programs in `/usr/bin`, the desktop entry and icon, the licences in
+`/usr/share/licenses/<package>`, and the rest in `/usr/share/doc/limarepdf`, with links there to the two licences
+the guide links to. `limarepdf` makes that archive with `packaging/package-archive.sh`, as the Linux jobs do, with
+cargo-about built at the version it names. makepkg's own link-time optimisation is off there (`!lto`): it builds C
+code (ring's, in cargo-about) as GCC LTO objects that Rust's linker can't read, and the release profile does Rust's
+own. Each package checks the release files' signatures against the release key (`validpgpkeys`).
+
+The PKGBUILDs here carry a placeholder version and checksums (`SKIP`). `packaging/arch/update.sh [--pkgrel N]
+<version> <out> [<dist>]` writes the AUR's copies into `<out>/limarepdf` and `<out>/limarepdf-bin`, each with the
+version, the checksums and its `.SRCINFO`: for a release, from its `SHA256SUMS` once the signature checks against
+`docs/limarepdf-signing-key.asc`; given `<dist>`, from the files there. `--pkgrel N` is for a changed PKGBUILD of a
+version already on the AUR (2, then 3).
+
+The `arch-source` job makes the release's source archive, `limarepdf-<version>-source.tar.gz` (`git archive`), and
+builds `limarepdf` from it in a current `archlinux:base-devel` container while the platforms build. Both go in the
+release, the package as `limarepdf-<version>-1-x86_64.pkg.tar.zst` for users who would rather not build it, and the
+package to the `arch` job's checks too. After the builds, the `arch` job builds `limarepdf-bin` for
+both architectures from the Linux archives, and one with pkgrel 0.1 to upgrade from, then checks the three packages:
+namcap (an error fails it; its warnings that the libraries the app loads at run time look unneeded are expected,
+and that `limarepdf-bin` should say `$CARCH` for the x86_64 in the archive's name, which is arm64 on aarch64),
+every file of the release archive in its place and nothing else, pacman's modes, no test seam, and
+`check-package.py`. On x86_64 it then installs the earlier `limarepdf-bin`, upgrades it, replaces it with
+`limarepdf` and removes that. After each step: `pacman -Qkk`, the command line rotating a document, and the app's
+window open on it under X11 (Xvfb, found by its title) and Wayland (headless Weston: the title set and the window's
+surface drawn, read from `WAYLAND_DEBUG`); after removing, nothing left, and the user's files unchanged throughout.
+The Arm64 package is built and checked but not installed, as there is no official Arch Linux image for Arm64
+(testing.md's platforms). Both jobs run `packaging/arch/check-arch.sh`, which signs the files with a key made for the
+run, and the release and dry-run jobs wait for `arch`. To run it locally, with the linux-x86_64 and linux-arm64
+archives in `dist/`:
+
+```
+git archive --prefix="limarepdf-<version>/" HEAD | gzip -n > dist/limarepdf-<version>-source.tar.gz
+podman run --rm -v "$PWD:/w:ro" -v "$PWD/dist:/dist" -w /w docker.io/library/archlinux:base-devel bash packaging/arch/check-arch.sh source /dist
+podman run --rm -v "$PWD:/w:ro" -w /w docker.io/library/archlinux:base-devel bash packaging/arch/check-arch.sh dist
+```
+
+The packages aren't on the AUR: it isn't taking new accounts for now (found 2026-11-25), so the release's x86_64
+`limarepdf` is how users install them, with `pacman -U` (#319). When it takes new accounts again, set up once: an
+account on aur.archlinux.org with the maintainer's SSH key, then `git clone
+ssh://aur@aur.archlinux.org/limarepdf.git aur/limarepdf`, and the same for `limarepdf-bin`. A name not yet taken
+clones empty, and the first push makes the package. Then, after each release is published, on Arch Linux: `bash
+packaging/arch/update.sh X.Y.Z aur` checks the published `SHA256SUMS` against the release key and writes each
+package's `PKGBUILD` and `.SRCINFO`; read the changes (`git -C aur/limarepdf diff`), then in each repository commit
+both files with the message `X.Y.Z` and push. After the first push, this becomes a release step again, and
+install.md's Arch Linux section names the AUR.
+
+### winget and Scoop
+
+`packaging/windows/` holds the templates of winget's three manifests for `ClaytonCornell.LimarePDF` (`winget/`:
+version, installer and the en-US locale), which install the x64 and Arm64 MSIs, and of Scoop's manifest
+(`scoop/limarepdf.json`), which unpacks the Windows zip of the computer's architecture. Each fill-in is written
+`@NAME@`. `packaging/windows/update.sh <version> <out> [<dist>]` fills them in: the version, the checksums (for a
+release, from its `SHA256SUMS` once the signature checks against `docs/limarepdf-signing-key.asc`; given `<dist>`,
+from the files there), and each MSI's product code with the upgrade code, publisher and name they share, read with
+msitools' `msiinfo`. It fails when an MSI doesn't match `SHA256SUMS`, isn't for the version, or the two differ in
+those, and when a fill-in is left. It writes winget's into
+`<out>/winget-pkgs/manifests/c/ClaytonCornell/LimarePDF/<version>/` and Scoop's into
+`<out>/scoop-limarepdf/bucket/limarepdf.json`.
+
+After the builds, the `winget-scoop` job writes the manifests from the MSIs and zips, and `winget-scoop-check` checks
+them on Windows x64 and Arm64 with `packaging/windows/check-manifests.ps1 <manifests> <dist>`. Every download address
+in them must be the release's, for one of the four files; copies then point at the files served on the runner
+(Python's `http.server`) in place of the release. winget validates its manifests as written, installs LimarePDF from
+the copies and removes it again; Scoop then installs it from its copy and removes it. After each install, the
+programs are the same as in the architecture's zip and `limarepdf-cli --version` names the version (through Scoop's
+shim, for Scoop), with Scoop's Start menu shortcut there; after each removal, nothing is left. A runner's winget
+older than 1.28, which can't read the manifests' schema, or none (the Arm64 runner's) is replaced by the release
+the script names, and Scoop is installed with its installer at the commit the script names, each checked against
+the checksum written there; update them there by hand. The release and dry-run jobs wait for
+`winget-scoop-check`. To run it on a Windows computer, as an administrator, with the Windows files in `dist\` and
+the manifests written from them (`update.sh` on Linux): `pwsh packaging/windows/check-manifests.ps1 manifests dist`.
+It installs LimarePDF and removes it, and installs Scoop.
+
+Set up once: a repository `smaug42/scoop-limarepdf` holding `bucket/limarepdf.json` and a README with the two
+commands in install.md, cloned into `win/scoop-limarepdf`; and a fork of `microsoft/winget-pkgs`, which is large,
+cloned sparse:
+
+```
+gh repo fork microsoft/winget-pkgs --clone=false
+git clone --filter=blob:none --sparse https://github.com/smaug42/winget-pkgs win/winget-pkgs
+git -C win/winget-pkgs sparse-checkout set manifests/c/ClaytonCornell
+```
+
+Before each version, bring the fork up to date (`gh repo sync smaug42/winget-pkgs`, then `git -C win/winget-pkgs
+pull`). The first pull request asks for Microsoft's contributor licence agreement to be signed. Once the first
+version is in winget (Scoop's bucket has had it since 0.14.1), remove install.md's "Not in winget yet" line.
 
 ### Third-party licences
 
@@ -183,7 +350,7 @@ signs and attests nothing for real:
 - the files themselves get `SHA256SUMS` only, and are uploaded unsigned as the `release-dry-run-unsigned` artifact,
   with a notice on the run and its summary saying so.
 
-Like a release, it waits for the `deny` job: the run's graph shows `dry-run` after `deny`, `build` and `macos-dmg`,
+Like a release, it waits for the `deny` job: the run's graph shows `dry-run` after `deny`, `build`, `macos-dmg`, `linux-install`, `arch` and `winget-scoop-check`,
 and a failed `deny` skips it. What it can't try is the release key itself in CI (the environment's secrets and the
 approval): a tag run, or `packages.yml`'s `sign` job, is the first to use them.
 
@@ -203,7 +370,9 @@ action is added pinned the same way: `gh api repos/OWNER/REPO/commits/vX.Y.Z --j
 
 `.github/workflows/packages.yml` runs when a release is published. Its `build` job downloads the `.deb` and `.rpm`
 files of the last three published releases, builds a flat apt repository and a dnf repository with
-`packaging/build-repos.sh`, signed with a key made for the run alone, and checks the signatures against that key.
+`packaging/build-repos.sh` (each holding both architectures' packages, from which apt and dnf pick the system's
+own; the apt one's `Release` names the architectures of its debs), signed with a key made for the run alone, and
+checks the signatures against that key.
 Its `sign` job imports the release key with `packaging/import-signing-key.sh`, builds them again from the same
 packages, signed with that key (`InRelease`, `Release.gpg`, `repomd.xml.asc`), and checks the signatures against
 `docs/limarepdf-signing-key.asc`; like the tag's `release` job, it runs in the `release-signing` environment and
