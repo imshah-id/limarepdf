@@ -43,8 +43,10 @@ It uses:
 - [`spellbook`](https://crates.io/crates/spellbook) 0.4.2 (MPL-2.0) for spelling, with Hunspell dictionaries, and
   [`zip`](https://crates.io/crates/zip) 9.8 to read the dictionary extensions added (NEW-06; "Spelling" below);
   the app asks the system's language of [`sys-locale`](https://crates.io/crates/sys-locale) 0.3;
-- [`ocrs`](https://github.com/robertknight/ocrs) for text recognition (see [Scans and OCR](../scanning-and-ocr.md));
-  the usual scanner and OCR libraries, SANE and Tesseract, are C/C++, so LimarePDF doesn't drive scanners;
+- [`rten`](https://github.com/robertknight/rten) to run the text recognition model, PaddleOCR's PP-OCRv6 small
+  (ONNX), and [`ocrs`](https://github.com/robertknight/ocrs)' layout analysis to group the words found into lines
+  (see [Scans and OCR](../scanning-and-ocr.md)); the usual scanner and OCR libraries, SANE and Tesseract, are
+  C/C++, so LimarePDF doesn't drive scanners;
 - [`serde_json`](https://crates.io/crates/serde_json) in the command line, for form values as JSON.
 
 Text strings in the file (properties, bookmarks, field names, values and descriptions, comments and their

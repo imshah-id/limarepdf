@@ -8,14 +8,20 @@
   Linux, x86_64, install the release's `limarepdf-<version>-1-x86_64.pkg.tar.zst` with `sudo pacman -U`
   ([Install](docs/install.md#arch-linux)).
 - Recognised text no longer splits lines of old print and of large scans into pieces: a letter broken in two, or a
-  word whose letters barely touch, made part of a line read as a line of its own. On pages of old French books,
-  the character errors fell from 12–26% to 4–7%.
+  word whose letters barely touch, made part of a line read as a line of its own.
 
 ### Changed
 
-- The guide says what text recognition reads today: letters without accents, so an accented letter comes out as
-  `?`. Its accuracy is measured on real scans: office, flatbed and phone scans, faxes and old French books, with
-  advice for tilted pages, small print and faxes ([Scans and OCR](docs/scanning-and-ocr.md#getting-good-results)).
+- Text recognition reads accented letters: French, Spanish, German, Polish, Czech, Hungarian and the other languages
+  written in Latin letters, and signs such as €, £, ° and ©. Before, they came out as `?`. With this and the fix
+  above, the character errors on pages of old French books fell from 12–26% to 1–4%, and old Spanish and German
+  pages read as well. English reads about as well as before on average, but not on every page: some faxes and
+  office and flatbed scans read worse, greyscale scans at 150 dpi by about a tenth of their words. The recognition
+  model is now PaddleOCR's PP-OCRv6 small (Apache 2.0) in place of the ocrs project's (CC BY-SA 4.0), and the
+  programs are about 11 MB larger ([Scans and OCR](docs/scanning-and-ocr.md#recognising-text-ocr)).
+- The guide says what text recognition reads and how well, measured on real scans: office, flatbed and phone scans,
+  faxes and old French, Spanish and German books, with advice for tilted pages, small print and faxes
+  ([Scans and OCR](docs/scanning-and-ocr.md#getting-good-results)).
 
 ## [0.14.1] - 2026-11-25
 

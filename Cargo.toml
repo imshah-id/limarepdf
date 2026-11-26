@@ -44,6 +44,8 @@ opt-level = 3
 opt-level = 3
 [profile.dev.package.rten-imageproc]
 opt-level = 3
+[profile.dev.package.rten-onnx]
+opt-level = 3
 [profile.dev.package.rten-simd]
 opt-level = 3
 [profile.dev.package.rten-tensor]

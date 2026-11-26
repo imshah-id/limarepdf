@@ -25,7 +25,7 @@ Scores, per page:
   CER       edit distance over the true text's length, after NFC, ligatures expanded, line-end
             hyphens joined and spaces collapsed
   CER(f)    the same with accents and typographic signs folded to ASCII: what's misread beyond
-            the letters the model can't write (signs with no ASCII form still count)
+            accents and signs such as curly quotes (signs with no ASCII form still count)
   words     the share of the true words found, in any order, ignoring case; (f) folded
   s/page    the OCR command's time over its pages, start-up included
 With --tesseract, Tesseract reads the same pages rendered as the OCR renders them, in the case's

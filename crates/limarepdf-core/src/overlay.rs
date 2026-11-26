@@ -217,17 +217,11 @@ impl HeaderFooter {
     }
 }
 
-/// Prefix of the page resource name given to the Helvetica of headers, footers and OCR text
+/// Prefix of the page resource names given to the fonts of headers, footers and OCR text
 /// (`LimareF1`, or the next number free on the page).
 pub(crate) const FONT_PREFIX: &str = "LimareF";
 
 impl Pdf {
-    pub(crate) fn make_font(&mut self) -> ObjectId {
-        self.doc.add_object(dictionary! {
-            "Type" => "Font", "Subtype" => "Type1", "BaseFont" => "Helvetica", "Encoding" => "WinAnsiEncoding",
-        })
-    }
-
     fn make_gs(&mut self, alpha: f32) -> ObjectId {
         let a = alpha.clamp(0.0, 1.0);
         self.doc.add_object(dictionary! {
